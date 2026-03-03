@@ -1,17 +1,21 @@
 # mcrepo
 
-`mcrepo` is an AI-agent-first Meta-Context-Repository approach.
+`mcrepo` is an AI-agent-first Meta-Context-Repository approach for MacOS and Linux.
 It lets you work across many independent Git repositories in one local context, without migrating them into a monorepo.
 
-## Install
+## Install & Setup
 
-Quick one-liner (download, make executable, initialize):
+- Create an empty repository
+- Open it in VSCode (optional)
+- Open Terminal
+
+Excute one-liner in empty repository:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/GeektankLabs/mcrepo/main/mcrepo.sh -o ./mcrepo.sh && chmod +x ./mcrepo.sh && ./mcrepo.sh init
 ```
 
-After `init`, open a new shell (or source your rc file once), then use:
+After `init`, close terminal and open a new one:
 
 ```bash
 mcrepo help
