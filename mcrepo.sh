@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.1"
+MCREPO_VERSION="0.2.0"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -22,6 +22,22 @@ log() {
 
 warn() {
   printf 'Warning: %s\n' "$*" >&2
+}
+
+supports_color() {
+  [ -t 1 ] || return 1
+  case "${TERM:-}" in
+    ''|dumb) return 1 ;;
+  esac
+  return 0
+}
+
+log_yellow() {
+  if supports_color; then
+    printf '\033[33m%s\033[0m\n' "$*"
+  else
+    log "$*"
+  fi
 }
 
 die() {
@@ -162,8 +178,8 @@ notify_if_new_version_available() {
   fi
 
   if version_greater_than "$remote_version" "$MCREPO_VERSION"; then
-    log "New version available: $MCREPO_VERSION -> $remote_version"
-    log "Run 'mcrepo update' to update this script."
+    log_yellow "New version available: $MCREPO_VERSION -> $remote_version"
+    log_yellow "Run 'mcrepo update' to update this script."
   fi
 }
 
@@ -1191,8 +1207,9 @@ cmd_init() {
   log "Multi-Context repo initialized."
   if [ "${#REPO_NAMES[@]}" -eq 0 ]; then
     log "No repos configured yet."
-    log "Next steps - add all relevant repostories:"
+    log "Next steps:"
     log "  ./mcrepo.sh add <git-url>"
+    log "  ./mcrepo.sh write <name> | ./mcrepo.sh read <name> | ./mcrepo.sh sleep <name>"
   fi
 }
 
