@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.1"
+MCREPO_VERSION="0.2.2"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -1779,18 +1779,17 @@ cmd_export_patch() {
   printf '2. Open this URL: %s\n' "$issues_url"
   printf '3. Set issue title to: `%s`\n' "$issue_title"
   printf '4. Paste the issue body below and submit\n'
-  printf '5. Ask maintainer to add label `patch submission` and assign the issue to Copilot coding agent\n\n'
+  printf '\n'
 
   if [ "$prompt_for_title" -eq 1 ]; then
     printf 'Press Enter to show issue content... ' >&2
     IFS= read -r _
-    printf '\n' >&2
+    printf '\n%s\n\n' '----------------------------------------' >&2
   fi
 
   printf '# Issue Title\n\n'
   printf '%s\n\n' "$issue_title"
   printf '# Issue Body\n\n'
-  printf 'Maintainer: please add label `patch submission` and assign this issue to Copilot coding agent.\n\n'
   printf '## Contributor Metadata\n\n'
   printf -- '- Local mcrepo version: `%s`\n' "$MCREPO_VERSION"
   printf -- '- Upstream mcrepo version: `%s`\n' "$remote_version"

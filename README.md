@@ -136,7 +136,6 @@ You can keep component repositories public/open-source while keeping the `mcrepo
   - issue title
   - full issue body with embedded `mcrepo.sh` patch against canonical upstream
 - Open a new issue, use title prefix `[PATCH SUBMISSION]`, paste the printed issue body, and submit.
-- Ask maintainers to add label `patch submission` and assign the issue to Copilot coding agent to turn it into a PR.
 
 ## Platforms
 
