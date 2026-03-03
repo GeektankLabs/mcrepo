@@ -27,11 +27,7 @@ Add repositories to your meta context:
 mcrepo add <git-url>
 ```
 
-Update to the latest script version when available:
-
-```bash
-mcrepo update
-```
+If you added all repositories to your Meta-Context-Repository then run the suggested prompt it your local AI agent tool of choice.
 
 ## Modes and Visibility
 
