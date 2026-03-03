@@ -44,8 +44,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh open <repo-name>                    # Open a write-mode repository in VS Code
   ./mcrepo.sh status                              # Show list output plus clean/dirty working tree state
   ./mcrepo.sh update                              # Update mcrepo.sh from canonical upstream when newer version is available
-  ./mcrepo.sh export-patch [topic]                # Print a ready-to-submit GitHub issue body (with embedded patch) to stdout
-  ./mcrepo.sh create-patch [topic]                # Alias for export-patch
+  ./mcrepo.sh create-patch [topic]                # Print a ready-to-submit GitHub issue body (with embedded patch) to stdout
   ./mcrepo.sh help                                # Print this help text
 EOF
 }
