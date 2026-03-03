@@ -44,7 +44,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh open <repo-name>                    # Open a write-mode repository in VS Code
   ./mcrepo.sh status                              # Show list output plus clean/dirty working tree state
   ./mcrepo.sh update                              # Update mcrepo.sh from canonical upstream when newer version is available
-  ./mcrepo.sh create-patch [topic]                # Print a ready-to-submit GitHub issue body (with embedded patch) to stdout
+  ./mcrepo.sh create-patch [--strategy intent|legacy] [topic] # Print a ready-to-submit GitHub issue body (with embedded patch) to stdout
   ./mcrepo.sh help                                # Print this help text
 EOF
 }
@@ -124,6 +124,70 @@ fetch_remote_script_to_file() {
   else
     curl --fail --silent --show-error --location --max-time 4 "$source_url" >"$target_file"
   fi
+}
+
+source_url_for_ref() {
+  local ref="$1"
+  printf 'https://raw.githubusercontent.com/%s/%s/%s' "$MCREPO_UPDATE_REPO" "$ref" "$MCREPO_UPDATE_SCRIPT_PATH"
+}
+
+fetch_remote_script_ref_to_file() {
+  local ref="$1"
+  local target_file="$2"
+  local source_url
+
+  source_url="$(source_url_for_ref "$ref")"
+  if ! command -v curl >/dev/null 2>&1; then
+    return 1
+  fi
+
+  curl --fail --silent --location --max-time 6 "$source_url" >"$target_file" 2>/dev/null
+}
+
+fetch_remote_script_version_to_file() {
+  local version="$1"
+  local target_file="$2"
+  local ref repo_url repo_tmp_file repo_tmp_dir commit script_version
+
+  ref="v$version"
+  if fetch_remote_script_ref_to_file "$ref" "$target_file"; then
+    return 0
+  fi
+
+  ref="$version"
+  if fetch_remote_script_ref_to_file "$ref" "$target_file"; then
+    return 0
+  fi
+
+  if ! command -v git >/dev/null 2>&1; then
+    return 1
+  fi
+
+  repo_tmp_dir="$(mktemp -d)"
+  repo_tmp_file="$(mktemp)"
+  repo_url="https://github.com/$MCREPO_UPDATE_REPO.git"
+
+  if ! git clone --quiet --depth 200 --branch "$MCREPO_UPDATE_BRANCH" "$repo_url" "$repo_tmp_dir" >/dev/null 2>&1; then
+    rm -rf "$repo_tmp_dir"
+    rm -f "$repo_tmp_file"
+    return 1
+  fi
+
+  while IFS= read -r commit; do
+    if git -C "$repo_tmp_dir" show "$commit:$MCREPO_UPDATE_SCRIPT_PATH" >"$repo_tmp_file" 2>/dev/null; then
+      script_version="$(extract_version_from_file "$repo_tmp_file" || true)"
+      if [ "$script_version" = "$version" ]; then
+        cp "$repo_tmp_file" "$target_file"
+        rm -rf "$repo_tmp_dir"
+        rm -f "$repo_tmp_file"
+        return 0
+      fi
+    fi
+  done < <(git -C "$repo_tmp_dir" log --format='%H' -- "$MCREPO_UPDATE_SCRIPT_PATH")
+
+  rm -rf "$repo_tmp_dir"
+  rm -f "$repo_tmp_file"
+  return 1
 }
 
 check_remote_version() {
@@ -1573,35 +1637,124 @@ cmd_update() {
 }
 
 cmd_export_patch() {
-  local topic="${*:-Update mcrepo.sh behavior}"
-  local script_path remote_tmp_file patch_tmp_file
-  local remote_version issues_url timestamp
-  local issue_title
+  local topic=""
+  local strategy="intent"
+  local script_path remote_tmp_file patch_tmp_file base_tmp_file merged_tmp_file
+  local remote_version issues_url timestamp patch_source
+  local issue_title default_topic entered_topic
+  local base_version
+  local patch_strategy_note=""
+  local merge_conflict_note=""
+  local arg
+  local prompt_for_title=0
+
+  while [ "$#" -gt 0 ]; do
+    arg="$1"
+    case "$arg" in
+      --strategy=*)
+        strategy="${arg#*=}"
+        ;;
+      --strategy)
+        shift || true
+        [ "$#" -gt 0 ] || die "Missing value for --strategy (use: intent or legacy)."
+        strategy="$1"
+        ;;
+      --)
+        shift || true
+        topic="${*:-}"
+        break
+        ;;
+      -*)
+        die "Unknown option for export-patch: $arg"
+        ;;
+      *)
+        if [ -n "$topic" ]; then
+          topic="$topic $arg"
+        else
+          topic="$arg"
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  case "$strategy" in
+    intent|legacy) ;;
+    *) die "Unsupported patch strategy: $strategy (expected: intent or legacy)." ;;
+  esac
 
   script_path="$(resolve_script_path)"
   [ -f "$script_path" ] || die "Local script not found: $script_path"
 
   remote_tmp_file="$(mktemp)"
   patch_tmp_file="$(mktemp)"
+  base_tmp_file="$(mktemp)"
+  merged_tmp_file="$(mktemp)"
+  patch_source="$script_path"
 
   if ! fetch_remote_script_to_file "$remote_tmp_file"; then
-    rm -f "$remote_tmp_file" "$patch_tmp_file"
+    rm -f "$remote_tmp_file" "$patch_tmp_file" "$base_tmp_file" "$merged_tmp_file"
     die "Could not fetch upstream script from: $(update_source_url)"
   fi
 
   remote_version="$(extract_version_from_file "$remote_tmp_file" || true)"
   if ! is_valid_version "$remote_version"; then
-    rm -f "$remote_tmp_file" "$patch_tmp_file"
+    rm -f "$remote_tmp_file" "$patch_tmp_file" "$base_tmp_file" "$merged_tmp_file"
     die "Could not parse upstream MCREPO_VERSION from downloaded script."
   fi
 
-  if diff -u --label a/mcrepo.sh --label b/mcrepo.sh "$remote_tmp_file" "$script_path" >"$patch_tmp_file"; then
-    rm -f "$remote_tmp_file" "$patch_tmp_file"
+  if [ "$strategy" = "intent" ]; then
+    base_version="$MCREPO_VERSION"
+    if ! command -v git >/dev/null 2>&1; then
+      strategy="legacy"
+      patch_strategy_note="Intent strategy requested but git is not available; fallback to legacy patch comparison."
+    elif ! is_valid_version "$base_version"; then
+      strategy="legacy"
+      patch_strategy_note="Intent strategy requested but local MCREPO_VERSION is not valid; fallback to legacy patch comparison."
+    else
+      if ! fetch_remote_script_version_to_file "$base_version" "$base_tmp_file"; then
+        strategy="legacy"
+        patch_strategy_note="Intent strategy requested but could not fetch upstream base for version $base_version; fallback to legacy patch comparison."
+      fi
+
+      if [ "$strategy" = "intent" ] && [ "$base_version" = "$remote_version" ]; then
+        cp "$remote_tmp_file" "$base_tmp_file"
+      fi
+
+      if [ "$strategy" = "intent" ]; then
+        if git merge-file -p "$remote_tmp_file" "$base_tmp_file" "$script_path" >"$merged_tmp_file"; then
+          patch_source="$merged_tmp_file"
+        else
+          strategy="legacy"
+          patch_strategy_note="Intent strategy detected overlapping edits against upstream and could not auto-merge intent cleanly; fallback to legacy patch comparison."
+          merge_conflict_note="Patch may include revert-looking hunks because automatic intent extraction conflicted."
+        fi
+      fi
+    fi
+  fi
+
+  if diff -u --label a/mcrepo.sh --label b/mcrepo.sh "$remote_tmp_file" "$patch_source" >"$patch_tmp_file"; then
+    rm -f "$remote_tmp_file" "$patch_tmp_file" "$base_tmp_file" "$merged_tmp_file"
     log "No local changes in mcrepo.sh compared to canonical upstream."
     return 0
   fi
 
   timestamp="$(date +%Y%m%d-%H%M%S)"
+
+  if [ -z "$topic" ]; then
+    default_topic="Feature update $timestamp"
+    topic="$default_topic"
+    if [ -t 0 ] && [ -t 1 ]; then
+      prompt_for_title=1
+      printf 'No patch title provided.\n' >&2
+      printf 'Summarize the feature in 2-5 words (press Enter for `%s`): ' "$default_topic" >&2
+      IFS= read -r entered_topic
+      if [ -n "$entered_topic" ]; then
+        topic="$entered_topic"
+      fi
+    fi
+  fi
+
   issue_title="[PATCH SUBMISSION] $topic"
   issues_url="https://github.com/$MCREPO_UPDATE_REPO/issues/new"
 
@@ -1611,6 +1764,13 @@ cmd_export_patch() {
   printf '3. Set issue title to: `%s`\n' "$issue_title"
   printf '4. Paste the issue body below and submit\n'
   printf '5. Ask maintainer to add label `patch submission` and assign the issue to Copilot coding agent\n\n'
+
+  if [ "$prompt_for_title" -eq 1 ]; then
+    printf 'Press Enter to show issue content... ' >&2
+    IFS= read -r _
+    printf '\n' >&2
+  fi
+
   printf '# Issue Title\n\n'
   printf '%s\n\n' "$issue_title"
   printf '# Issue Body\n\n'
@@ -1619,26 +1779,37 @@ cmd_export_patch() {
   printf -- '- Local mcrepo version: `%s`\n' "$MCREPO_VERSION"
   printf -- '- Upstream mcrepo version: `%s`\n' "$remote_version"
   printf -- '- Upstream source URL: `%s`\n' "$(update_source_url)"
+  printf -- '- Patch strategy: `%s`\n' "$strategy"
   printf -- '- Generated at: `%s`\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf -- '- Local generation id: `%s`\n\n' "$timestamp"
+  if [ -n "$patch_strategy_note" ]; then
+    printf -- '- Strategy note: %s\n\n' "$patch_strategy_note"
+  fi
+  if [ -n "$merge_conflict_note" ]; then
+    printf -- '- Conflict note: %s\n\n' "$merge_conflict_note"
+  fi
   printf '## Contributor Notes\n\n'
   printf -- '- Replace this line with a short problem statement and why this patch is needed.\n'
   printf -- '- Replace this line with expected behavior after applying the patch.\n\n'
   printf '## Instructions for Maintainer and Copilot\n\n'
   printf '1. Assign this issue to Copilot coding agent.\n'
-  printf '2. Apply the patch from the `Patch` section below to `mcrepo.sh`.\n'
+  printf '2. Apply the patch from the `Patch` section below to `mcrepo.sh`, but keep current upstream behavior where unrelated hunks look like rollbacks.\n'
   printf '3. Validate syntax with `bash -n mcrepo.sh`.\n'
   printf '4. Run sandbox checks from `TESTING.md` as far as practical.\n'
   printf '5. Open a PR with:\n'
   printf '   - a concise summary of behavior changes,\n'
   printf '   - validation steps and outcomes,\n'
   printf '   - any caveats or follow-ups.\n\n'
+  printf '## Copilot Guidance\n\n'
+  printf -- '- Preserve upstream behavior unless a hunk is required for the new feature intent.\n'
+  printf -- '- If a patch hunk appears to reintroduce removed logic, treat it as non-intent unless clearly required.\n'
+  printf -- '- Prefer extracting minimal feature-specific changes over replaying historical state differences.\n\n'
   printf '## Patch\n\n'
   printf '```diff\n'
   cat "$patch_tmp_file"
   printf '```\n'
 
-  rm -f "$remote_tmp_file" "$patch_tmp_file"
+  rm -f "$remote_tmp_file" "$patch_tmp_file" "$base_tmp_file" "$merged_tmp_file"
 }
 
 main() {

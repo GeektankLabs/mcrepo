@@ -126,7 +126,11 @@ You can keep component repositories public/open-source while keeping the `mcrepo
 
 ## Patch Submission Without Repository Checkout
 
-- Run `mcrepo export-patch [topic]` (or `mcrepo create-patch [topic]`).
+- Run `mcrepo export-patch [--strategy intent|legacy] [topic]` (or `mcrepo create-patch ...`).
+- Default strategy is `intent`: mcrepo tries to carry only your feature intent onto current upstream and avoid rollback-style hunks.
+- Use `--strategy legacy` to force raw `upstream-main vs local-file` diff behavior.
+- If you omit `[topic]` in an interactive terminal, mcrepo asks for a short 2-5 word title and supports Enter for a default `Feature update <timestamp>` title.
+- When `[topic]` is omitted and mcrepo prompts you, it pauses after the instructions and waits for Enter before printing issue title/body content.
 - The command prints everything to stdout:
   - submission steps and issue URL
   - issue title
