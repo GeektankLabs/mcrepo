@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.0"
+MCREPO_VERSION="0.2.1"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -1192,9 +1192,8 @@ cmd_init() {
   log "Multi-Context repo initialized."
   if [ "${#REPO_NAMES[@]}" -eq 0 ]; then
     log "No repos configured yet."
-    log "Next steps:"
+    log "Next steps - add all relevant repostories:"
     log "  ./mcrepo.sh add <git-url>"
-    log "  ./mcrepo.sh write <name> | ./mcrepo.sh read <name> | ./mcrepo.sh sleep <name>"
   fi
 }
 
