@@ -29,7 +29,7 @@ Add repositories to your meta context:
 mcrepo add <git-url>
 ```
 
-If you added all repositories to your Meta-Context-Repository then run the suggested prompt it your local AI agent tool of choice.
+If you added all needed repositories to your Meta-Context-Repository then run the suggested prompt with your local AI agent tool of choice (OpenCode, Codex CLI, Claude Code, etc) - they have now all those repositories as context and can make coordinated feature changes, documentation and integrated dev & tests setups for you.
 
 ## Modes and Visibility
 
