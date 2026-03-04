@@ -39,3 +39,9 @@ This file defines how AI agents should work in this repository, which develops `
 - Make focused, minimal changes.
 - Avoid unrelated refactors in the same change.
 - Keep user-facing messages clear and action-oriented.
+
+## Versioning Rule
+
+- When an AI agent edits `mcrepo.sh`, it must also bump `MCREPO_VERSION` in the same change.
+- Use a patch-only bump: increment only the right-most version segment (`x.y.z` -> `x.y.(z+1)`).
+- The patch segment is unbounded (`...9` can become `...10`, `...11`, etc.).

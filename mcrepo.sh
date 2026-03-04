@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.2"
+MCREPO_VERSION="0.2.3"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -56,7 +56,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh sleep <repo-name> [--force]         # Switch a repository to sleep mode and clear its local folder contents
   ./mcrepo.sh sleep --wakeall                     # Wake all sleeping repositories and set them to read mode
   ./mcrepo.sh list                                # List configured repositories with mode, local clone state, and current branch
-  ./mcrepo.sh branch <branch-name> [--include-read] # Set global branch in mcrepo.yaml and create/switch it across target repos
+  ./mcrepo.sh branch <branch-name> [--include-read] # Set global branch and switch clean target repos plus meta-context repo
   ./mcrepo.sh open <repo-name>                    # Open a write-mode repository in VS Code
   ./mcrepo.sh status                              # Show list output plus clean/dirty working tree state
   ./mcrepo.sh update                              # Update mcrepo.sh from canonical upstream when newer version is available
@@ -966,7 +966,7 @@ This repository is a lightweight meta-repo for coordinating multiple standalone 
 4. Open a new shell once, then run commands as `mcrepo`
 5. Add a repository: `mcrepo add <git-url>`
 6. Set repo mode: `mcrepo write <repo>` or `mcrepo read <repo>` or `mcrepo sleep <repo>`
-7. Create/switch branch in write repos: `mcrepo branch <branch-name>`
+7. Coordinate branch across clean target repos and meta-context repo: `mcrepo branch <branch-name>`
 8. Check state: `mcrepo status`
 
 ## Core Concepts
@@ -980,7 +980,9 @@ This repository is a lightweight meta-repo for coordinating multiple standalone 
 - Default path style uses emoji folder prefixes: `✍️`, `👀`, `💤`
 - You can disable emoji folders during init: `./mcrepo.sh init --no-emojis` (uses clean paths without mode prefixes)
 - `mcrepo.sh` orchestrates repositories.
-- `mcrepo branch <name>` updates the global branch and applies it across write repos.
+- `mcrepo branch <name>` updates the global branch, aligns clean write repos (optionally read repos), then switches the meta-context repo.
+- Branch switching is remote-first: if `origin/<name>` exists and local `<name>` does not, mcrepo creates a tracking local branch from origin.
+- Global branch switch aborts if uncommitted changes are present in target repos or the meta-context repo.
 - Switching a repo to `write` auto-aligns it to the global branch when configured.
 - `🛠 scripts/` is for project-specific helper scripts.
 
@@ -1562,19 +1564,29 @@ switch_repo_branch() {
     warn "Fetch failed in '$repo_dir' before switching to '$target_branch'"
   fi
 
-  if ! git -C "$repo_dir" pull --ff-only; then
-    warn "Pull failed in '$repo_dir' before switching to '$target_branch'"
+  if git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    if ! git -C "$repo_dir" pull --ff-only; then
+      warn "Pull failed in '$repo_dir' before switching to '$target_branch'"
+    fi
   fi
 
-  if ! git -C "$repo_dir" fetch origin --prune; then
-    warn "Fetch origin failed in '$repo_dir' before switching to '$target_branch'"
+  if git -C "$repo_dir" remote get-url origin >/dev/null 2>&1; then
+    if ! git -C "$repo_dir" fetch origin --prune; then
+      warn "Fetch origin failed in '$repo_dir' before switching to '$target_branch'"
+    fi
   fi
 
   if git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$target_branch"; then
     git -C "$repo_dir" checkout "$target_branch"
-  else
-    git -C "$repo_dir" checkout -b "$target_branch"
+    return 0
   fi
+
+  if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$target_branch"; then
+    git -C "$repo_dir" checkout --track "origin/$target_branch"
+    return 0
+  fi
+
+  git -C "$repo_dir" checkout -b "$target_branch"
 }
 
 cmd_branch() {
@@ -1582,6 +1594,8 @@ cmd_branch() {
   local branch_name="$1"
   shift
   local include_read=0
+  local dirty_found=0
+  local -a dirty_repos=()
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -1592,10 +1606,33 @@ cmd_branch() {
   done
 
   load_repos
+
+  local i mode repo_dir
+  for i in "${!REPO_NAMES[@]}"; do
+    mode="${REPO_MODES[$i]}"
+    if [ "$mode" = "write" ] || { [ "$include_read" -eq 1 ] && [ "$mode" = "read" ]; }; then
+      repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "$mode")"
+      if [ -d "$repo_dir/.git" ] && [ -n "$(git -C "$repo_dir" status --porcelain 2>/dev/null)" ]; then
+        dirty_found=1
+        dirty_repos+=("${REPO_NAMES[$i]} ($repo_dir)")
+      fi
+    fi
+  done
+
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [ -n "$(git -C . status --porcelain 2>/dev/null)" ]; then
+      dirty_found=1
+      dirty_repos+=("meta-context repo (.)")
+    fi
+  fi
+
+  if [ "$dirty_found" -eq 1 ]; then
+    die "Uncommitted changes found in: ${dirty_repos[*]}. Commit, stash, or discard them and run branch again."
+  fi
+
   GLOBAL_BRANCH="$branch_name"
   save_repos
 
-  local i mode repo_dir
   for i in "${!REPO_NAMES[@]}"; do
     mode="${REPO_MODES[$i]}"
     if [ "$mode" = "write" ] || { [ "$include_read" -eq 1 ] && [ "$mode" = "read" ]; }; then
@@ -1603,6 +1640,8 @@ cmd_branch() {
       switch_repo_branch "$repo_dir" "$branch_name"
     fi
   done
+
+  switch_repo_branch "." "$branch_name"
 
   log "Branch operation complete. Global branch set to '$GLOBAL_BRANCH'."
 }

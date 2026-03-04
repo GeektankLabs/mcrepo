@@ -58,6 +58,13 @@ Before implementing a cross-repo feature, set one coordinated branch name across
 mcrepo branch <feature-branch-name>
 ```
 
+Behavior details:
+
+- `mcrepo branch <name>` aborts if any target repo (write, and read when `--include-read`) or the meta-context repo has uncommitted changes.
+- If `<name>` exists on `origin` but not locally, mcrepo creates a local tracking branch from `origin/<name>`.
+- If `<name>` does not exist locally or on `origin`, mcrepo creates a new local branch.
+- After updating target repos, mcrepo switches the meta-context repo to the same branch as the final step.
+
 This keeps feature work aligned and makes later per-repo commits and pull requests easier to coordinate.
 
 ## VS Code Workflow
