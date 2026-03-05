@@ -28,6 +28,8 @@ HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh write hello-world'
 HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh read hello-world'
 HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh sleep hello-world --force'
 HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh sleep --wakeall'
+HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh skill list'
+HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh skill validate'
 ```
 
 Optional cleanup:
@@ -43,6 +45,9 @@ rm -rf "$tmp"
 - Mode switches rename folders with mode icons.
 - `sleep --force` clears local repo contents.
 - `sleep --wakeall` restores sleeping repos to `read` mode.
+- `🧠 skills/` is generated with a default skill pack and template.
+- `mcrepo skill list` shows skill states.
+- `mcrepo skill validate` passes on a fresh workspace.
 - `init --no-shell-install` does not write shell integration blocks.
 - `init --no-emojis` writes `path_style: clean` and uses plain repo folder names without mode prefixes.
 

@@ -1,7 +1,7 @@
 # mcrepo.sh
 
 An AI-agent-first Meta-Context-Repository approach for MacOS and Linux.
-It lets you work across many independent Git repositories in one local directory context, without migrating them into a monorepo. All managed by just one shell script: `mcrepo.sh`
+It lets you work across many independent Git repositories in one local directory context, without migrating them into a monorepo. All managed by just one shell script: `mcrepo.sh` with practical workspace governance for multi-repo agent workflows.
 
 ![mcrepo workspace banner](assets/mcrepo-banner.svg)
 
@@ -82,11 +82,62 @@ mcrepo open <repo-name>
 
 `init` generates coordination directories in the meta-context root:
 
-- `🛠 scripts/`: helper scripts for this meta workspace
 - `🧩 contracts/`: cross-repo interfaces and contracts
 - `🧾 docs/`: architecture, integration notes, and generated overviews
 - `🧪 tests/`: integration test setup and shared test assets
+- `🧠 skills/`: company and project specific skills (`skill.md`) with optional colocated helper scripts
 - `mcrepo.yaml`: source of truth for repos, modes, descriptions, branch and path style
+
+Design ordering principle:
+
+- Repositories stay above `🔹🔹🔹` with mode icons (`✍️`, `👀`, `💤`).
+- Shared folders stay below `🔹🔹🔹` (contracts/docs/tests/skills), using icons selected to keep this ordering consistent in VS Code.
+
+## Skills and Workspace Governance
+
+Use `mcrepo` skill commands to manage workspace-local skill packs:
+
+```bash
+mcrepo skill list
+mcrepo skill new <skill-id>
+mcrepo skill enable <skill-id>
+mcrepo skill disable <skill-id>
+mcrepo skill validate
+```
+
+Activation behavior:
+
+- If `🧠 skills/skills.yaml` exists, enable/disable state is taken from that file.
+- If `🧠 skills/skills.yaml` is missing, every `🧠 skills/<id>/skill.md` is treated as active.
+
+Skill layout (colocated docs + helpers):
+
+```text
+🧠 skills/
+  skills.yaml
+  _templates/
+    skill-template.md
+  change-implementation/
+    skill.md
+    run.sh   # optional helper
+```
+
+Authoring notes:
+
+- Keep each skill self-contained in `🧠 skills/<id>/`.
+- Put process and guardrails in `skill.md`.
+- Put optional executable helpers (`run.sh`, `check.sh`) next to `skill.md`.
+- Use lowercase kebab-case skill IDs (for example: `release-prep`, `test-gate`).
+
+Default skill pack created during `init`:
+
+- `change-implementation`
+- `test-gate`
+- `release-prep`
+- `no-secrets`
+- `subproject-skill-loader` (loads sub-repo local skills only for write/change scope)
+
+These are starter skills meant to be edited or replaced with your company-specific workflows.
 
 ## AI-Agent-First Starter Tasks
 

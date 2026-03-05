@@ -2,17 +2,19 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.3"
+MCREPO_VERSION="0.2.4"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
 REPOS_FILE="mcrepo.yaml"
 DEFAULT_PATH_STYLE="emoji"
-SUPPORT_SCRIPTS_DIR="🛠 scripts"
+LEGACY_SUPPORT_SCRIPTS_DIR="🛠 scripts"
 SUPPORT_SEPARATOR_DIR="🔹🔹🔹"
 SUPPORT_CONTRACTS_DIR="🧩 contracts"
 SUPPORT_DOCS_DIR="🧾 docs"
 SUPPORT_TESTS_DIR="🧪 tests"
+SUPPORT_SKILLS_DIR="🧠 skills"
+SKILLS_CONFIG_FILE="$SUPPORT_SKILLS_DIR/skills.yaml"
 COMPLETION_BASH_FILE=".mcrepo-completion.bash"
 COMPLETION_ZSH_FILE=".mcrepo-completion.zsh"
 
@@ -59,6 +61,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh branch <branch-name> [--include-read] # Set global branch and switch clean target repos plus meta-context repo
   ./mcrepo.sh open <repo-name>                    # Open a write-mode repository in VS Code
   ./mcrepo.sh status                              # Show list output plus clean/dirty working tree state
+  ./mcrepo.sh skill <list|new|enable|disable|validate> [args] # Manage workspace governance skills in 🧠 skills/
   ./mcrepo.sh update                              # Update mcrepo.sh from canonical upstream when newer version is available
   ./mcrepo.sh create-patch [--strategy intent|legacy] [topic] # Print a ready-to-submit GitHub issue body (with embedded patch) to stdout
   ./mcrepo.sh help                                # Print this help text
@@ -791,12 +794,8 @@ clone_repo_if_needed() {
 }
 
 refresh_generated_files() {
-  mkdir -p "$SUPPORT_SCRIPTS_DIR"
-
-  COMPLETION_BASH_FILE="$SUPPORT_SCRIPTS_DIR/mcrepo-completion.bash"
-  COMPLETION_ZSH_FILE="$SUPPORT_SCRIPTS_DIR/mcrepo-completion.zsh"
-
-  rm -f .mcrepo-completion.bash .mcrepo-completion.zsh .mcrepo-completion.csh
+  rm -f "$LEGACY_SUPPORT_SCRIPTS_DIR/mcrepo-completion.bash" "$LEGACY_SUPPORT_SCRIPTS_DIR/mcrepo-completion.zsh"
+  rm -f .mcrepo-completion.csh
 
   generate_bash_completion
   generate_zsh_completion
@@ -834,7 +833,8 @@ _mcrepo_repo_names() {
 
 _mcrepo_complete() {
   local cur prev
-  local commands="init add remove write read sleep off list branch open status update export-patch create-patch help"
+  local commands="init add remove write read sleep off list branch open status skill update export-patch create-patch help"
+  local skill_commands="list new enable disable validate"
   local repo_commands="remove write read sleep off open"
 
   COMPREPLY=()
@@ -853,6 +853,13 @@ _mcrepo_complete() {
       ;;
     branch)
       COMPREPLY=( $(compgen -W "--include-read" -- "$cur") )
+      ;;
+    skill)
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        COMPREPLY=( $(compgen -W "$skill_commands" -- "$cur") )
+      elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[2]}" = "enable" -o "${COMP_WORDS[2]}" = "disable" ]; then
+        COMPREPLY=( $(compgen -W "$(MCREPO_SUPPRESS_VERSION_BANNER=1 MCREPO_DISABLE_UPDATE_CHECK=1 ./mcrepo.sh skill list --ids 2>/dev/null || true)" -- "$cur") )
+      fi
       ;;
     remove|write|read|sleep|off|open)
       if [ "$COMP_CWORD" -eq 2 ]; then
@@ -913,9 +920,11 @@ _mcrepo_repo_names() {
 
 _mcrepo_complete() {
   local cmd
-  local -a commands repos
+  local subcmd
+  local -a commands repos skill_commands
 
-  commands=(init add remove write read sleep off list branch open status update export-patch create-patch help)
+  commands=(init add remove write read sleep off list branch open status skill update export-patch create-patch help)
+  skill_commands=(list new enable disable validate)
   repos=("${(@f)$(_mcrepo_repo_names)}")
 
   if (( CURRENT == 2 )); then
@@ -930,6 +939,16 @@ _mcrepo_complete() {
     branch)
       if (( CURRENT == 3 )); then
         compadd -- --include-read
+      fi
+      ;;
+    skill)
+      if (( CURRENT == 3 )); then
+        compadd -- "${skill_commands[@]}"
+      elif (( CURRENT == 4 )); then
+        subcmd="${words[3]}"
+        if [[ "$subcmd" == "enable" || "$subcmd" == "disable" ]]; then
+          compadd -- "${(@f)$(MCREPO_SUPPRESS_VERSION_BANNER=1 MCREPO_DISABLE_UPDATE_CHECK=1 ./mcrepo.sh skill list --ids 2>/dev/null)}"
+        fi
       fi
       ;;
     remove|write|read|sleep|off|open)
@@ -957,6 +976,7 @@ create_readme_template() {
 # Multi-Context Repo
 
 This repository is a lightweight meta-repo for coordinating multiple standalone repositories with explicit access modes.
+It provides workspace governance across repos, shared documentation, tests, and reusable agent skills.
 
 ## Quickstart
 
@@ -968,6 +988,7 @@ This repository is a lightweight meta-repo for coordinating multiple standalone 
 6. Set repo mode: `mcrepo write <repo>` or `mcrepo read <repo>` or `mcrepo sleep <repo>`
 7. Coordinate branch across clean target repos and meta-context repo: `mcrepo branch <branch-name>`
 8. Check state: `mcrepo status`
+9. Manage workspace skills: `mcrepo skill list`
 
 ## Core Concepts
 
@@ -984,7 +1005,8 @@ This repository is a lightweight meta-repo for coordinating multiple standalone 
 - Branch switching is remote-first: if `origin/<name>` exists and local `<name>` does not, mcrepo creates a tracking local branch from origin.
 - Global branch switch aborts if uncommitted changes are present in target repos or the meta-context repo.
 - Switching a repo to `write` auto-aligns it to the global branch when configured.
-- `🛠 scripts/` is for project-specific helper scripts.
+- `🧠 skills/` stores project and company specific agent skills.
+- Skills can include colocated helper scripts (for example `run.sh` or `check.sh`) next to `skill.md`.
 
 ## Human Workflow
 
@@ -1024,12 +1046,195 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 9. Do not execute git commits.
 10. Always wrap paths in quotes to handle spaces correctly.
 
+## Ordering and Shared Folders
+
+- Keep managed repositories above `🔹🔹🔹`.
+- Keep shared workspace folders below `🔹🔹🔹`.
+- In emoji path style, `🧠 skills/` is intentionally placed below `🔹🔹🔹` for consistent ordering.
+
+## Skills Loading
+
+1. Enforce `mcrepo.yaml` mode and path-style gates first.
+2. Load active skills from `🧠 skills/`:
+   - If `🧠 skills/skills.yaml` exists, use its enable/disable lists.
+   - If no config exists, treat each `🧠 skills/<id>/skill.md` as active by default.
+3. For sub-repo write/change tasks, apply `subproject-skill-loader` and load repo-local skills only for repos in write scope.
+4. For each active skill, read `skill.md` first and run colocated helper scripts only when needed.
+
 ## Local Project Instructions
 
 When working inside a project repository, also read and follow local instruction files if present:
 - `AGENTS.md`
 - `CLAUDE.md`
 EOF
+}
+
+create_skills_config_template() {
+  cat >"$SKILLS_CONFIG_FILE" <<'EOF'
+# Optional workspace governance for skill activation.
+# If this file is missing, all discovered skills are treated as active.
+enabled:
+  - change-implementation
+  - test-gate
+  - release-prep
+  - no-secrets
+  - subproject-skill-loader
+disabled: []
+EOF
+}
+
+create_skill_template_file() {
+  mkdir -p "$SUPPORT_SKILLS_DIR/_templates"
+  cat >"$SUPPORT_SKILLS_DIR/_templates/skill-template.md" <<'EOF'
+# <skill-id>
+
+## Purpose
+One short sentence describing what this skill optimizes for.
+
+## When to Apply
+- Trigger condition 1
+- Trigger condition 2
+
+## Inputs
+- Expected context/files/repositories.
+
+## Procedure
+1. Step one.
+2. Step two.
+3. Validation step.
+
+## Guardrails
+- Respect `mcrepo.yaml` mode restrictions.
+- Do not write outside `mode: write` repositories.
+- Never commit unless explicitly requested.
+
+## Optional Helpers
+- `run.sh`: execution helper
+- `check.sh`: validation helper
+EOF
+}
+
+create_default_skill_pack() {
+  mkdir -p "$SUPPORT_SKILLS_DIR/change-implementation"
+  cat >"$SUPPORT_SKILLS_DIR/change-implementation/skill.md" <<'EOF'
+# change-implementation
+
+## Purpose
+Coordinate cross-repo feature changes with explicit contract and docs checks.
+
+## When to Apply
+- A task touches two or more repositories.
+- A change modifies an API, interface, or integration point.
+
+## Procedure
+1. Read `mcrepo.yaml` and identify writable repositories.
+2. Check `🧩 contracts/` and `🧾 docs/` for existing agreements.
+3. Implement only in writable repositories.
+4. Update contracts/docs if behavior changes.
+5. Validate repository-level tests before finishing.
+EOF
+
+  mkdir -p "$SUPPORT_SKILLS_DIR/test-gate"
+  cat >"$SUPPORT_SKILLS_DIR/test-gate/skill.md" <<'EOF'
+# test-gate
+
+## Purpose
+Ensure every change includes practical validation before handoff.
+
+## When to Apply
+- Any code or configuration change.
+
+## Procedure
+1. Run relevant tests in affected repositories.
+2. Run fast syntax/lint checks where available.
+3. Capture failures with actionable next steps.
+4. Report what was run and what could not be run.
+EOF
+
+  mkdir -p "$SUPPORT_SKILLS_DIR/release-prep"
+  cat >"$SUPPORT_SKILLS_DIR/release-prep/skill.md" <<'EOF'
+# release-prep
+
+## Purpose
+Prepare multi-repo release work while preserving per-repo autonomy.
+
+## When to Apply
+- A feature is ready for release coordination.
+
+## Procedure
+1. Confirm target branch alignment.
+2. Verify each affected repo has clear release notes inputs.
+3. Check version bumps and changelog conventions per repository.
+4. List repo-by-repo release order and dependencies.
+EOF
+
+  mkdir -p "$SUPPORT_SKILLS_DIR/no-secrets"
+  cat >"$SUPPORT_SKILLS_DIR/no-secrets/skill.md" <<'EOF'
+# no-secrets
+
+## Purpose
+Prevent accidental exposure of credentials and private tokens.
+
+## When to Apply
+- Any edit touching config, environment files, CI, or docs.
+
+## Procedure
+1. Avoid committing `.env` and credential files.
+2. Use placeholder values in examples.
+3. Keep secret names documented, not secret values.
+4. Flag potential leaks immediately.
+EOF
+
+  mkdir -p "$SUPPORT_SKILLS_DIR/subproject-skill-loader"
+  cat >"$SUPPORT_SKILLS_DIR/subproject-skill-loader/skill.md" <<'EOF'
+# subproject-skill-loader
+
+## Purpose
+Load sub-repo local skills only when that sub-repo is in write/change scope.
+
+## When to Apply
+- A task edits, generates, or fixes code/config/docs in a managed sub-repository.
+
+## Procedure
+1. Read `mcrepo.yaml` and enforce mode/path-style gates first.
+2. Identify sub-repositories in write/change scope.
+3. For each write-scope repo, discover local skills in this order:
+   - `.opencode/skills/*/SKILL.md`
+   - `.agents/skills/*/SKILL.md`
+   - `.claude/skills/*/SKILL.md`
+   - `🧠 skills/*/skill.md` (repo-local convention)
+4. Load and apply only those repo-local skills needed for the current write task.
+5. Do not load repo-local skills for read-only context scans.
+6. Report which repo-local skills were loaded and which repos were skipped.
+
+## Guardrails
+- Never bypass `mcrepo.yaml` mode restrictions.
+- Workspace governance and safety skills always win in conflicts.
+- Repo-local skills can refine workflow details only inside their own repo scope.
+EOF
+}
+
+ensure_skills_files() {
+  mkdir -p "$SUPPORT_SKILLS_DIR"
+  [ -f "$SKILLS_CONFIG_FILE" ] || create_skills_config_template
+  [ -f "$SUPPORT_SKILLS_DIR/_templates/skill-template.md" ] || create_skill_template_file
+
+  local existing_skills=0
+  local dir
+  shopt -s nullglob
+  for dir in "$SUPPORT_SKILLS_DIR"/*; do
+    [ -d "$dir" ] || continue
+    [ "$(basename "$dir")" = "_templates" ] && continue
+    if [ -f "$dir/skill.md" ]; then
+      existing_skills=1
+      break
+    fi
+  done
+  shopt -u nullglob
+
+  if [ "$existing_skills" -eq 0 ]; then
+    create_default_skill_pack
+  fi
 }
 
 create_gitignore_template() {
@@ -1057,8 +1262,8 @@ ensure_base_structure() {
     mv "separator" "$SUPPORT_SEPARATOR_DIR"
   fi
 
-  if [ -d "🛠scripts" ] && [ ! -e "$SUPPORT_SCRIPTS_DIR" ]; then
-    mv "🛠scripts" "$SUPPORT_SCRIPTS_DIR"
+  if [ -d "🧠skills" ] && [ ! -e "$SUPPORT_SKILLS_DIR" ]; then
+    mv "🧠skills" "$SUPPORT_SKILLS_DIR"
   fi
   if [ -d "🧩contracts" ] && [ ! -e "$SUPPORT_CONTRACTS_DIR" ]; then
     mv "🧩contracts" "$SUPPORT_CONTRACTS_DIR"
@@ -1067,8 +1272,8 @@ ensure_base_structure() {
     mv "🧾docs" "$SUPPORT_DOCS_DIR"
   fi
 
-  if [ -d "scripts" ] && [ ! -e "$SUPPORT_SCRIPTS_DIR" ]; then
-    mv "scripts" "$SUPPORT_SCRIPTS_DIR"
+  if [ -d "skills" ] && [ ! -e "$SUPPORT_SKILLS_DIR" ]; then
+    mv "skills" "$SUPPORT_SKILLS_DIR"
   fi
   if [ -d "contracts" ] && [ ! -e "$SUPPORT_CONTRACTS_DIR" ]; then
     mv "contracts" "$SUPPORT_CONTRACTS_DIR"
@@ -1080,7 +1285,7 @@ ensure_base_structure() {
     mv "tests" "$SUPPORT_TESTS_DIR"
   fi
 
-  mkdir -p "$SUPPORT_SCRIPTS_DIR" "$SUPPORT_SEPARATOR_DIR" "$SUPPORT_CONTRACTS_DIR" "$SUPPORT_DOCS_DIR" "$SUPPORT_TESTS_DIR"
+  mkdir -p "$SUPPORT_SEPARATOR_DIR" "$SUPPORT_CONTRACTS_DIR" "$SUPPORT_DOCS_DIR" "$SUPPORT_TESTS_DIR" "$SUPPORT_SKILLS_DIR"
 }
 
 ensure_base_files() {
@@ -1088,6 +1293,7 @@ ensure_base_files() {
   [ -f README.md ] || create_readme_template
   [ -f AGENTS.md ] || create_agents_template
   [ -f "$REPOS_FILE" ] || create_repos_template
+  ensure_skills_files
   ensure_gitignore_base
 }
 
@@ -1517,6 +1723,320 @@ cmd_status() {
   done
 }
 
+parse_skill_config_list() {
+  local section="$1"
+  [ -f "$SKILLS_CONFIG_FILE" ] || return 0
+
+  awk -v section="$section" '
+    function trim(s) {
+      gsub(/^[ \t]+|[ \t]+$/, "", s)
+      return s
+    }
+    function unquote(s) {
+      s = trim(s)
+      if ((s ~ /^".*"$/) || (s ~ /^\047.*\047$/)) {
+        return substr(s, 2, length(s) - 2)
+      }
+      return s
+    }
+    {
+      line = $0
+      if (line ~ /^[ \t]*#/ || line ~ /^[ \t]*$/) {
+        next
+      }
+      if (line ~ /^[ \t]*enabled:[ \t]*/) {
+        in_section = (section == "enabled")
+        next
+      }
+      if (line ~ /^[ \t]*disabled:[ \t]*/) {
+        in_section = (section == "disabled")
+        next
+      }
+      if (in_section && line ~ /^[ \t]*-[ \t]*/) {
+        sub(/^[ \t]*-[ \t]*/, "", line)
+        print unquote(line)
+      }
+    }
+  ' "$SKILLS_CONFIG_FILE"
+}
+
+list_skill_ids() {
+  local skill_dir skill_id
+  [ -d "$SUPPORT_SKILLS_DIR" ] || return 0
+
+  shopt -s nullglob
+  for skill_dir in "$SUPPORT_SKILLS_DIR"/*; do
+    [ -d "$skill_dir" ] || continue
+    skill_id="$(basename "$skill_dir")"
+    [ "$skill_id" = "_templates" ] && continue
+    [ -f "$skill_dir/skill.md" ] || continue
+    printf '%s\n' "$skill_id"
+  done
+  shopt -u nullglob
+}
+
+array_contains() {
+  local needle="$1"
+  shift || true
+  local item
+  for item in "$@"; do
+    if [ "$item" = "$needle" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+array_remove_item() {
+  local needle="$1"
+  shift || true
+  local item
+  for item in "$@"; do
+    if [ "$item" != "$needle" ]; then
+      printf '%s\n' "$item"
+    fi
+  done
+}
+
+write_skills_config() {
+  local -a enabled_ids=("$@")
+  local disabled_marker="__MCREPO_DISABLED_SPLIT__"
+  local -a disabled_ids=()
+  local -a new_enabled=()
+  local parsing_disabled=0
+  local id
+
+  for id in "${enabled_ids[@]}"; do
+    if [ "$id" = "$disabled_marker" ]; then
+      parsing_disabled=1
+      continue
+    fi
+    if [ "$parsing_disabled" -eq 1 ]; then
+      disabled_ids+=("$id")
+    else
+      new_enabled+=("$id")
+    fi
+  done
+
+  mkdir -p "$SUPPORT_SKILLS_DIR"
+  {
+    printf '# Optional workspace governance for skill activation.\n'
+    printf '# If this file is missing, all discovered skills are treated as active.\n'
+    printf 'enabled:\n'
+    if [ "${#new_enabled[@]}" -eq 0 ]; then
+      printf '  []\n'
+    else
+      for id in "${new_enabled[@]}"; do
+        printf '  - %s\n' "$id"
+      done
+    fi
+    printf 'disabled:\n'
+    if [ "${#disabled_ids[@]}" -eq 0 ]; then
+      printf '  []\n'
+    else
+      for id in "${disabled_ids[@]}"; do
+        printf '  - %s\n' "$id"
+      done
+    fi
+  } >"$SKILLS_CONFIG_FILE"
+}
+
+is_skill_active() {
+  local skill_id="$1"
+  local -a enabled_ids=()
+  local -a disabled_ids=()
+  local id
+
+  if [ ! -f "$SKILLS_CONFIG_FILE" ]; then
+    return 0
+  fi
+
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    enabled_ids+=("$id")
+  done < <(parse_skill_config_list "enabled")
+
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    disabled_ids+=("$id")
+  done < <(parse_skill_config_list "disabled")
+
+  if array_contains "$skill_id" "${disabled_ids[@]}"; then
+    return 1
+  fi
+
+  if [ "${#enabled_ids[@]}" -gt 0 ]; then
+    array_contains "$skill_id" "${enabled_ids[@]}"
+    return $?
+  fi
+
+  return 0
+}
+
+validate_skill_id() {
+  case "$1" in
+    ''|*[!a-z0-9-]*|-*|*-) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+cmd_skill() {
+  local subcmd="${1:-list}"
+  if [ "$#" -gt 0 ]; then
+    shift
+  fi
+
+  case "$subcmd" in
+    list)
+      local ids_only=0
+      if [ "${1:-}" = "--ids" ]; then
+        ids_only=1
+        shift
+      fi
+      [ "$#" -eq 0 ] || die "Usage: ./mcrepo.sh skill list [--ids]"
+
+      local id
+      if [ "$ids_only" -eq 1 ]; then
+        list_skill_ids | sort
+        return 0
+      fi
+
+      if [ ! -d "$SUPPORT_SKILLS_DIR" ]; then
+        log "No skills directory found: $SUPPORT_SKILLS_DIR"
+        return 0
+      fi
+
+      while IFS= read -r id; do
+        if is_skill_active "$id"; then
+          printf '%-30s state=enabled\n' "$id"
+        else
+          printf '%-30s state=disabled\n' "$id"
+        fi
+      done < <(list_skill_ids | sort)
+      ;;
+    new)
+      [ "$#" -eq 1 ] || die "Usage: ./mcrepo.sh skill new <skill-id>"
+      local new_id="$1"
+      validate_skill_id "$new_id" || die "Invalid skill id '$new_id' (allowed: lowercase letters, digits, hyphen)"
+
+      local skill_dir="$SUPPORT_SKILLS_DIR/$new_id"
+      [ ! -e "$skill_dir" ] || die "Skill already exists: $new_id"
+      mkdir -p "$skill_dir"
+
+      cat >"$skill_dir/skill.md" <<EOF
+# $new_id
+
+## Purpose
+Describe what this skill does.
+
+## When to Apply
+- Add triggers for using this skill.
+
+## Procedure
+1. Add the first actionable step.
+2. Add validation steps.
+
+## Optional Helpers
+- \`run.sh\` for task automation
+- \`check.sh\` for verification
+EOF
+
+      cat >"$skill_dir/run.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Implement task-specific helper logic here."
+EOF
+      chmod +x "$skill_dir/run.sh"
+
+      log "Created skill: $new_id"
+      ;;
+    enable|disable)
+      [ "$#" -eq 1 ] || die "Usage: ./mcrepo.sh skill $subcmd <skill-id>"
+      local target_id="$1"
+      local target_dir="$SUPPORT_SKILLS_DIR/$target_id"
+      [ -f "$target_dir/skill.md" ] || die "Skill not found: $target_id"
+
+      local id
+      local -a enabled_ids=()
+      local -a disabled_ids=()
+      local explicit_mode=0
+
+      while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        enabled_ids+=("$id")
+      done < <(parse_skill_config_list "enabled")
+
+      while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        disabled_ids+=("$id")
+      done < <(parse_skill_config_list "disabled")
+
+      if [ "${#enabled_ids[@]}" -gt 0 ]; then
+        explicit_mode=1
+      fi
+
+      if [ ! -f "$SKILLS_CONFIG_FILE" ]; then
+        while IFS= read -r id; do
+          [ -n "$id" ] || continue
+          enabled_ids+=("$id")
+        done < <(list_skill_ids)
+        explicit_mode=1
+      fi
+
+      mapfile -t enabled_ids < <(array_remove_item "$target_id" "${enabled_ids[@]}")
+      mapfile -t disabled_ids < <(array_remove_item "$target_id" "${disabled_ids[@]}")
+
+      if [ "$subcmd" = "enable" ]; then
+        if [ "$explicit_mode" -eq 1 ]; then
+          enabled_ids+=("$target_id")
+        fi
+      else
+        disabled_ids+=("$target_id")
+      fi
+
+      write_skills_config "${enabled_ids[@]}" "__MCREPO_DISABLED_SPLIT__" "${disabled_ids[@]}"
+      log "Skill '$target_id' set to $subcmd"
+      ;;
+    validate)
+      [ "$#" -eq 0 ] || die "Usage: ./mcrepo.sh skill validate"
+
+      local failures=0
+      local id skill_dir
+      while IFS= read -r id; do
+        skill_dir="$SUPPORT_SKILLS_DIR/$id"
+        if [ ! -f "$skill_dir/skill.md" ]; then
+          warn "Missing skill.md for '$id'"
+          failures=$((failures + 1))
+        fi
+
+        if [ -f "$skill_dir/run.sh" ] && [ ! -x "$skill_dir/run.sh" ]; then
+          warn "run.sh is not executable for '$id'"
+          failures=$((failures + 1))
+        fi
+      done < <(list_skill_ids)
+
+      if [ -f "$SKILLS_CONFIG_FILE" ]; then
+        for id in $(parse_skill_config_list "enabled"; parse_skill_config_list "disabled"); do
+          [ -z "$id" ] && continue
+          if [ ! -f "$SUPPORT_SKILLS_DIR/$id/skill.md" ]; then
+            warn "Configured skill missing on disk: $id"
+            failures=$((failures + 1))
+          fi
+        done
+      fi
+
+      if [ "$failures" -gt 0 ]; then
+        die "Skill validation failed with $failures issue(s)."
+      fi
+      log "Skill validation passed."
+      ;;
+    *)
+      die "Unknown skill subcommand: $subcmd"
+      ;;
+  esac
+}
+
 cmd_open() {
   [ "$#" -eq 1 ] || die "Usage: ./mcrepo.sh open <repo-name>"
   local repo_name="$1"
@@ -1890,6 +2410,7 @@ main() {
     branch) cmd_branch "$@" ;;
     open) cmd_open "$@" ;;
     status) cmd_status "$@" ;;
+    skill) cmd_skill "$@" ;;
     update) cmd_update "$@" ;;
     export-patch|create-patch) cmd_export_patch "$@" ;;
     --post-update-migrate) cmd_post_update_migrate "$@" ;;
