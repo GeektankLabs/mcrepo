@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.7"
+MCREPO_VERSION="0.2.9"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -63,6 +63,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh open <repo-name>                    # Open a write-mode repository in VS Code
   ./mcrepo.sh status                              # Show list output plus clean/dirty working tree state
   ./mcrepo.sh skill [repo-name] <list|new|install|enable|disable|validate> [args] # Manage workspace or sub-repo skills (OpenCode-compatible)
+                                              # Browse public skills: https://clawhub.ai/skills
   ./mcrepo.sh update                              # Update mcrepo.sh from canonical upstream when newer version is available
   ./mcrepo.sh create-patch [--strategy intent|legacy] [topic] # Print a ready-to-submit GitHub issue body (with embedded patch) to stdout
   ./mcrepo.sh help                                # Print this help text
@@ -2464,7 +2465,8 @@ EOF
       fi
       ;;
     install)
-      [ "$#" -ge 1 ] || die "Usage: ./mcrepo.sh skill [repo-name] install <github-url|clawhub-url> [--skip-scan] [--require-scan] [--max-severity CRITICAL|HIGH|MEDIUM|LOW]"
+      [ "$#" -ge 1 ] || die "Usage: ./mcrepo.sh skill [repo-name] install <github-url|clawhub-url> [--skip-scan] [--require-scan] [--max-severity CRITICAL|HIGH|MEDIUM|LOW]
+Tip: Browse skills at https://clawhub.ai/skills"
 
       local source="$1"
       shift
