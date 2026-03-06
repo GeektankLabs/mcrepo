@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.4"
+MCREPO_VERSION="0.2.7"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -15,6 +15,7 @@ SUPPORT_DOCS_DIR="🧾 docs"
 SUPPORT_TESTS_DIR="🧪 tests"
 SUPPORT_SKILLS_DIR="🧠 skills"
 SKILLS_CONFIG_FILE="$SUPPORT_SKILLS_DIR/skills.yaml"
+OPENCODE_PROJECT_SKILLS_DIR=".opencode/skills"
 COMPLETION_BASH_FILE=".mcrepo-completion.bash"
 COMPLETION_ZSH_FILE=".mcrepo-completion.zsh"
 
@@ -61,7 +62,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh branch <branch-name> [--include-read] # Set global branch and switch clean target repos plus meta-context repo
   ./mcrepo.sh open <repo-name>                    # Open a write-mode repository in VS Code
   ./mcrepo.sh status                              # Show list output plus clean/dirty working tree state
-  ./mcrepo.sh skill <list|new|enable|disable|validate> [args] # Manage workspace governance skills in 🧠 skills/
+  ./mcrepo.sh skill [repo-name] <list|new|install|enable|disable|validate> [args] # Manage workspace or sub-repo skills (OpenCode-compatible)
   ./mcrepo.sh update                              # Update mcrepo.sh from canonical upstream when newer version is available
   ./mcrepo.sh create-patch [--strategy intent|legacy] [topic] # Print a ready-to-submit GitHub issue body (with embedded patch) to stdout
   ./mcrepo.sh help                                # Print this help text
@@ -834,7 +835,7 @@ _mcrepo_repo_names() {
 _mcrepo_complete() {
   local cur prev
   local commands="init add remove write read sleep off list branch open status skill update export-patch create-patch help"
-  local skill_commands="list new enable disable validate"
+  local skill_commands="list new install enable disable validate"
   local repo_commands="remove write read sleep off open"
 
   COMPREPLY=()
@@ -856,9 +857,13 @@ _mcrepo_complete() {
       ;;
     skill)
       if [ "$COMP_CWORD" -eq 2 ]; then
-        COMPREPLY=( $(compgen -W "$skill_commands" -- "$cur") )
-      elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[2]}" = "enable" -o "${COMP_WORDS[2]}" = "disable" ]; then
-        COMPREPLY=( $(compgen -W "$(MCREPO_SUPPRESS_VERSION_BANNER=1 MCREPO_DISABLE_UPDATE_CHECK=1 ./mcrepo.sh skill list --ids 2>/dev/null || true)" -- "$cur") )
+        COMPREPLY=( $(compgen -W "$skill_commands $(_mcrepo_repo_names)" -- "$cur") )
+      elif [ "$COMP_CWORD" -eq 3 ]; then
+        if [ "${COMP_WORDS[2]}" = "enable" -o "${COMP_WORDS[2]}" = "disable" ]; then
+          COMPREPLY=( $(compgen -W "$(MCREPO_SUPPRESS_VERSION_BANNER=1 MCREPO_DISABLE_UPDATE_CHECK=1 ./mcrepo.sh skill list --ids 2>/dev/null || true)" -- "$cur") )
+        elif printf '%s\n' "$(_mcrepo_repo_names)" | grep -Fxq "${COMP_WORDS[2]}"; then
+          COMPREPLY=( $(compgen -W "$skill_commands" -- "$cur") )
+        fi
       fi
       ;;
     remove|write|read|sleep|off|open)
@@ -924,7 +929,7 @@ _mcrepo_complete() {
   local -a commands repos skill_commands
 
   commands=(init add remove write read sleep off list branch open status skill update export-patch create-patch help)
-  skill_commands=(list new enable disable validate)
+  skill_commands=(list new install enable disable validate)
   repos=("${(@f)$(_mcrepo_repo_names)}")
 
   if (( CURRENT == 2 )); then
@@ -943,11 +948,13 @@ _mcrepo_complete() {
       ;;
     skill)
       if (( CURRENT == 3 )); then
-        compadd -- "${skill_commands[@]}"
+        compadd -- "${skill_commands[@]}" "${repos[@]}"
       elif (( CURRENT == 4 )); then
         subcmd="${words[3]}"
         if [[ "$subcmd" == "enable" || "$subcmd" == "disable" ]]; then
           compadd -- "${(@f)$(MCREPO_SUPPRESS_VERSION_BANNER=1 MCREPO_DISABLE_UPDATE_CHECK=1 ./mcrepo.sh skill list --ids 2>/dev/null)}"
+        elif (( ${repos[(Ie)$subcmd]} > 0 )); then
+          compadd -- "${skill_commands[@]}"
         fi
       fi
       ;;
@@ -989,6 +996,7 @@ It provides workspace governance across repos, shared documentation, tests, and 
 7. Coordinate branch across clean target repos and meta-context repo: `mcrepo branch <branch-name>`
 8. Check state: `mcrepo status`
 9. Manage workspace skills: `mcrepo skill list`
+10. Install skills from URL: `mcrepo skill install <github-url|clawhub-url>`
 
 ## Core Concepts
 
@@ -1007,6 +1015,7 @@ It provides workspace governance across repos, shared documentation, tests, and 
 - Switching a repo to `write` auto-aligns it to the global branch when configured.
 - `🧠 skills/` stores project and company specific agent skills.
 - Skills can include colocated helper scripts (for example `run.sh` or `check.sh`) next to `skill.md`.
+- ClawHub URL installs are scanned by default; `CRITICAL` blocks install and `HIGH` warns.
 
 ## Human Workflow
 
@@ -1058,8 +1067,9 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 2. Load active skills from `🧠 skills/`:
    - If `🧠 skills/skills.yaml` exists, use its enable/disable lists.
    - If no config exists, treat each `🧠 skills/<id>/skill.md` as active by default.
-3. For sub-repo write/change tasks, apply `subproject-skill-loader` and load repo-local skills only for repos in write scope.
-4. For each active skill, read `skill.md` first and run colocated helper scripts only when needed.
+3. `🧠 skills/` is the workspace source of truth and is mirrored to `.opencode/skills/` for OpenCode auto-discovery.
+4. For sub-repo write/change tasks, apply `subproject-skill-loader` and load repo-local skills only for repos in write scope.
+5. For each active skill, read `skill.md` first and run colocated helper scripts only when needed.
 
 ## Local Project Instructions
 
@@ -1202,7 +1212,7 @@ Load sub-repo local skills only when that sub-repo is in write/change scope.
    - `.opencode/skills/*/SKILL.md`
    - `.agents/skills/*/SKILL.md`
    - `.claude/skills/*/SKILL.md`
-   - `🧠 skills/*/skill.md` (repo-local convention)
+   - `skills/*/SKILL.md` (optional repo-local fallback)
 4. Load and apply only those repo-local skills needed for the current write task.
 5. Do not load repo-local skills for read-only context scans.
 6. Report which repo-local skills were loaded and which repos were skipped.
@@ -1235,6 +1245,8 @@ ensure_skills_files() {
   if [ "$existing_skills" -eq 0 ]; then
     create_default_skill_pack
   fi
+
+  sync_workspace_skills_to_opencode
 }
 
 create_gitignore_template() {
@@ -1761,18 +1773,436 @@ parse_skill_config_list() {
 }
 
 list_skill_ids() {
+  local base_dir="${1:-$SUPPORT_SKILLS_DIR}"
   local skill_dir skill_id
-  [ -d "$SUPPORT_SKILLS_DIR" ] || return 0
+  [ -d "$base_dir" ] || return 0
 
   shopt -s nullglob
-  for skill_dir in "$SUPPORT_SKILLS_DIR"/*; do
+  for skill_dir in "$base_dir"/*; do
     [ -d "$skill_dir" ] || continue
     skill_id="$(basename "$skill_dir")"
     [ "$skill_id" = "_templates" ] && continue
-    [ -f "$skill_dir/skill.md" ] || continue
+    if [ ! -f "$skill_dir/skill.md" ] && [ ! -f "$skill_dir/SKILL.md" ]; then
+      continue
+    fi
     printf '%s\n' "$skill_id"
   done
   shopt -u nullglob
+}
+
+sync_workspace_skills_to_opencode() {
+  local skill_id src_dir dst_dir description
+
+  mkdir -p "$OPENCODE_PROJECT_SKILLS_DIR"
+  while IFS= read -r skill_id; do
+    [ -n "$skill_id" ] || continue
+    src_dir="$SUPPORT_SKILLS_DIR/$skill_id"
+    dst_dir="$OPENCODE_PROJECT_SKILLS_DIR/$skill_id"
+
+    rm -rf "$dst_dir"
+    mkdir -p "$dst_dir"
+    cp -R "$src_dir"/. "$dst_dir"/
+
+    if [ -f "$src_dir/SKILL.md" ]; then
+      cp "$src_dir/SKILL.md" "$dst_dir/SKILL.md"
+      continue
+    fi
+
+    description="Workspace governance skill '$skill_id' for this MC-Repo."
+    {
+      printf -- '---\n'
+      printf 'name: %s\n' "$skill_id"
+      printf 'description: %s\n' "$description"
+      printf -- '---\n\n'
+      if [ -f "$src_dir/skill.md" ]; then
+        cat "$src_dir/skill.md"
+      fi
+      printf '\n'
+    } >"$dst_dir/SKILL.md"
+  done < <(list_skill_ids)
+}
+
+severity_rank() {
+  case "$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')" in
+    LOW) printf '1' ;;
+    MEDIUM) printf '2' ;;
+    HIGH) printf '3' ;;
+    CRITICAL) printf '4' ;;
+    *) printf '0' ;;
+  esac
+}
+
+is_http_url() {
+  case "$1" in
+    http://*|https://*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_github_url() {
+  case "$1" in
+    http://github.com/*|https://github.com/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_clawhub_url() {
+  case "$1" in
+    http://clawhub.ai/*|https://clawhub.ai/*|http://www.clawhub.ai/*|https://www.clawhub.ai/*|http://clawhub.com/*|https://clawhub.com/*|http://www.clawhub.com/*|https://www.clawhub.com/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_imported_skill_id() {
+  local id
+  id="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-')"
+  id="${id#-}"
+  id="${id%-}"
+  while [[ "$id" == *--* ]]; do
+    id="${id//--/-}"
+  done
+  if [ -z "$id" ]; then
+    id="imported-skill"
+  fi
+  printf '%s' "$id"
+}
+
+extract_json_from_mixed_output() {
+  awk 'BEGIN{p=0} /^[[:space:]]*\{/ {p=1} p {print}'
+}
+
+parse_clawhub_slug_candidates() {
+  local url="$1"
+  local no_scheme path
+  no_scheme="${url#http://}"
+  no_scheme="${no_scheme#https://}"
+  path="${no_scheme#*/}"
+  path="${path%%\?*}"
+  path="${path%%\#*}"
+  path="${path#/}"
+
+  local first second
+  first="${path%%/*}"
+  if [ "$first" = "$path" ]; then
+    first=""
+  fi
+  second="${path#*/}"
+  if [ "$second" = "$path" ]; then
+    second=""
+  fi
+
+  if [ "$first" = "skills" ] && [ -n "$second" ]; then
+    printf '%s\n' "${second%%/*}"
+    return 0
+  fi
+
+  if [ -n "$first" ] && [ -n "$second" ]; then
+    printf '%s\n' "$first/$second"
+    printf '%s\n' "$second"
+    return 0
+  fi
+
+  if [ -n "$path" ]; then
+    printf '%s\n' "$path"
+  fi
+}
+
+clawhub_inspect_json() {
+  local slug="$1"
+  shift
+  local out
+  out="$(npx -y clawhub@latest inspect "$slug" --json "$@" 2>/dev/null || true)"
+  if [ -z "$out" ]; then
+    return 1
+  fi
+  printf '%s\n' "$out" | extract_json_from_mixed_output
+}
+
+scan_clawhub_skill() {
+  local skill_url="$1"
+  local skip_scan="$2"
+  local require_scan="$3"
+  local max_severity="$4"
+
+  if [ "$skip_scan" -eq 1 ]; then
+    return 0
+  fi
+
+  command -v curl >/dev/null 2>&1 || {
+    if [ "$require_scan" -eq 1 ]; then
+      die "curl is required for --require-scan"
+    fi
+    warn "curl not found; skipping scan."
+    return 0
+  }
+  command -v jq >/dev/null 2>&1 || {
+    if [ "$require_scan" -eq 1 ]; then
+      die "jq is required for --require-scan"
+    fi
+    warn "jq not found; skipping scan."
+    return 0
+  }
+
+  local payload response http_code body status severity reasons
+  payload="{\"skillUrl\":\"$skill_url\"}"
+
+  if ! response="$(curl --silent --show-error --location --write-out $'\n%{http_code}' --request POST --url "https://ai.gendigital.com/api/scan/lookup" --header "Content-Type: application/json" --data "$payload" 2>/dev/null)"; then
+    if [ "$require_scan" -eq 1 ]; then
+      die "Skill scan failed and --require-scan is set."
+    fi
+    warn "Skill scan service unavailable, continuing install. Use --require-scan to enforce."
+    return 0
+  fi
+
+  http_code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  if [ "$http_code" != "200" ]; then
+    if [ "$require_scan" -eq 1 ]; then
+      die "Skill scan rejected this URL (HTTP $http_code) and --require-scan is set."
+    fi
+    warn "Skill scan not applicable for this URL (HTTP $http_code), continuing."
+    return 0
+  fi
+
+  status="$(printf '%s' "$body" | jq -r '.status // empty' 2>/dev/null || true)"
+  if [ "$status" = "error" ]; then
+    local message
+    message="$(printf '%s' "$body" | jq -r '.message // "scan error"' 2>/dev/null || true)"
+    if [ "$require_scan" -eq 1 ]; then
+      die "Skill scan could not verify URL: $message"
+    fi
+    warn "Skill scan could not verify URL: $message (continuing)."
+    return 0
+  fi
+
+  severity="$(printf '%s' "$body" | jq -r '.severity // "UNKNOWN"' 2>/dev/null || true)"
+  reasons="$(printf '%s' "$body" | jq -r '.reasons[]? // empty' 2>/dev/null || true)"
+  if [ -n "$severity" ] && [ "$severity" != "UNKNOWN" ]; then
+    log "Skill scan severity: $severity"
+  fi
+  if [ -n "$reasons" ]; then
+    warn "Skill scan reasons:"
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      warn "  - $line"
+    done <<<"$reasons"
+  fi
+
+  if [ "$(severity_rank "$severity")" -ge "$(severity_rank "$max_severity")" ] && [ "$(severity_rank "$max_severity")" -gt 0 ]; then
+    die "Skill install blocked by scan policy (severity=$severity threshold=$max_severity)."
+  fi
+
+  if [ "$(severity_rank "$severity")" -ge "$(severity_rank "HIGH")" ]; then
+    warn "High-risk scan result detected; review files before use."
+  fi
+}
+
+resolve_scope_dir() {
+  local scope_repo="$1"
+  local for_write="$2"
+
+  SKILL_SCOPE_KIND="workspace"
+  SKILL_SCOPE_NAME="workspace"
+  SKILL_SCOPE_DIR="$SUPPORT_SKILLS_DIR"
+
+  if [ -z "$scope_repo" ]; then
+    return 0
+  fi
+
+  load_repos
+  local idx
+  idx="$(find_repo_index "$scope_repo")" || die "Repo not found: $scope_repo"
+
+  local mode repo_name repo_dir
+  mode="${REPO_MODES[$idx]}"
+  repo_name="${REPO_NAMES[$idx]}"
+  if [ "$for_write" -eq 1 ] && [ "$mode" != "write" ]; then
+    die "Skill install into sub-repo requires mode=write. '$repo_name' is mode '$mode'."
+  fi
+
+  repo_dir="$(get_repo_dir "$repo_name" "$mode")"
+  if [ "$for_write" -eq 1 ] && [ ! -d "$repo_dir" ]; then
+    die "Sub-repo directory not found: $repo_dir"
+  fi
+
+  SKILL_SCOPE_KIND="repo"
+  SKILL_SCOPE_NAME="$repo_name"
+  SKILL_SCOPE_DIR="$repo_dir/$OPENCODE_PROJECT_SKILLS_DIR"
+}
+
+discover_single_skill_source_dir() {
+  local base_dir="$1"
+  local -a hits=()
+  local dir
+
+  if [ -f "$base_dir/SKILL.md" ] || [ -f "$base_dir/skill.md" ]; then
+    printf '%s' "$base_dir"
+    return 0
+  fi
+
+  shopt -s nullglob
+  for dir in "$base_dir"/* "$base_dir"/skills/*; do
+    [ -d "$dir" ] || continue
+    if [ -f "$dir/SKILL.md" ] || [ -f "$dir/skill.md" ]; then
+      hits+=("$dir")
+    fi
+  done
+  shopt -u nullglob
+
+  if [ "${#hits[@]}" -eq 1 ]; then
+    printf '%s' "${hits[0]}"
+    return 0
+  fi
+
+  if [ "${#hits[@]}" -eq 0 ]; then
+    return 1
+  fi
+
+  die "Source contains multiple skills; use a direct skill folder URL (for example GitHub tree URL)."
+}
+
+install_skill_from_github_url() {
+  local source_url="$1"
+  local target_root="$2"
+  local url no_scheme path owner rest repo tail clone_url branch subpath tmp_dir source_root source_dir
+
+  url="${source_url%%\#*}"
+  url="${url%%\?*}"
+  no_scheme="${url#http://}"
+  no_scheme="${no_scheme#https://}"
+  path="${no_scheme#github.com/}"
+  [ "$path" != "$no_scheme" ] || die "Invalid GitHub URL: $source_url"
+
+  owner="${path%%/*}"
+  rest="${path#*/}"
+  repo="${rest%%/*}"
+  tail="${rest#*/}"
+
+  repo="${repo%.git}"
+  [ -n "$owner" ] || die "Invalid GitHub URL owner: $source_url"
+  [ -n "$repo" ] || die "Invalid GitHub URL repo: $source_url"
+  command -v git >/dev/null 2>&1 || die "git is required for GitHub skill installs"
+
+  branch=""
+  subpath=""
+  if [ "$tail" != "$rest" ] && [[ "$tail" == tree/* ]]; then
+    tail="${tail#tree/}"
+    branch="${tail%%/*}"
+    subpath="${tail#*/}"
+    if [ "$subpath" = "$tail" ]; then
+      subpath=""
+    fi
+  fi
+
+  tmp_dir="$(mktemp -d)"
+  clone_url="https://github.com/$owner/$repo.git"
+  if [ -n "$branch" ]; then
+    git clone --depth 1 --branch "$branch" "$clone_url" "$tmp_dir/repo" >/dev/null 2>&1 || die "Failed to clone GitHub source: $clone_url"
+  else
+    git clone --depth 1 "$clone_url" "$tmp_dir/repo" >/dev/null 2>&1 || die "Failed to clone GitHub source: $clone_url"
+  fi
+
+  source_root="$tmp_dir/repo"
+  if [ -n "$subpath" ]; then
+    source_root="$source_root/$subpath"
+  fi
+  [ -d "$source_root" ] || die "Source path not found in GitHub repo: $subpath"
+
+  source_dir="$(discover_single_skill_source_dir "$source_root")" || die "No skill folder found in source URL."
+
+  local skill_id target_dir
+  skill_id="$(normalize_imported_skill_id "$(basename "$source_dir")")"
+  target_dir="$target_root/$skill_id"
+  [ ! -e "$target_dir" ] || die "Skill already exists: $skill_id"
+
+  mkdir -p "$target_dir"
+  cp -R "$source_dir"/. "$target_dir"/
+  if [ ! -f "$target_dir/SKILL.md" ] && [ -f "$target_dir/skill.md" ]; then
+    cp "$target_dir/skill.md" "$target_dir/SKILL.md"
+  fi
+  [ -f "$target_dir/SKILL.md" ] || die "Imported GitHub skill missing SKILL.md/skill.md"
+
+  printf '%s' "$skill_id"
+}
+
+resolve_clawhub_slug() {
+  local source_url="$1"
+  local candidate json slug
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    json="$(clawhub_inspect_json "$candidate")"
+    [ -n "$json" ] || continue
+    slug="$(printf '%s' "$json" | jq -r '.skill.slug // empty' 2>/dev/null || true)"
+    if [ -n "$slug" ]; then
+      printf '%s' "$slug"
+      return 0
+    fi
+  done < <(parse_clawhub_slug_candidates "$source_url")
+  return 1
+}
+
+install_skill_from_clawhub_url() {
+  local source_url="$1"
+  local target_root="$2"
+  local slug metadata_json files_json files skill_id target_dir file_path file_json file_content
+
+  command -v jq >/dev/null 2>&1 || die "jq is required for ClawHub skill installs"
+  command -v npx >/dev/null 2>&1 || die "npx is required for ClawHub skill installs"
+
+  slug="$(resolve_clawhub_slug "$source_url")" || die "Could not resolve ClawHub skill slug from URL: $source_url"
+  metadata_json="$(clawhub_inspect_json "$slug")"
+  [ -n "$metadata_json" ] || die "Failed to fetch ClawHub metadata for slug: $slug"
+  files_json="$(clawhub_inspect_json "$slug" --files)"
+  [ -n "$files_json" ] || die "Failed to fetch ClawHub files for slug: $slug"
+
+  files="$(printf '%s' "$files_json" | jq -r '.version.files[]?.path // empty' 2>/dev/null || true)"
+  [ -n "$files" ] || die "No files found for ClawHub skill: $slug"
+
+  skill_id="$(printf '%s' "$metadata_json" | jq -r '.skill.slug // empty' 2>/dev/null || true)"
+  [ -n "$skill_id" ] || skill_id="$(normalize_imported_skill_id "${slug##*/}")"
+  skill_id="$(normalize_imported_skill_id "$skill_id")"
+
+  target_dir="$target_root/$skill_id"
+  [ ! -e "$target_dir" ] || die "Skill already exists: $skill_id"
+  mkdir -p "$target_dir"
+
+  while IFS= read -r file_path; do
+    [ -n "$file_path" ] || continue
+    file_json="$(clawhub_inspect_json "$slug" --file "$file_path")"
+    [ -n "$file_json" ] || die "Failed fetching ClawHub file: $file_path"
+    file_content="$(printf '%s' "$file_json" | jq -r '.file.content // empty' 2>/dev/null || true)"
+
+    mkdir -p "$target_dir/$(dirname "$file_path")"
+    printf '%s' "$file_content" >"$target_dir/$file_path"
+    if [[ "$file_path" == *.sh ]]; then
+      chmod +x "$target_dir/$file_path"
+    fi
+  done <<<"$files"
+
+  [ -f "$target_dir/SKILL.md" ] || die "Downloaded ClawHub skill is missing SKILL.md"
+  printf '%s' "$skill_id"
+}
+
+install_skill_from_url() {
+  local source_url="$1"
+  local target_root="$2"
+  local skip_scan="$3"
+  local require_scan="$4"
+  local max_severity="$5"
+
+  if is_github_url "$source_url"; then
+    install_skill_from_github_url "$source_url" "$target_root"
+    return 0
+  fi
+
+  if is_clawhub_url "$source_url"; then
+    scan_clawhub_skill "$source_url" "$skip_scan" "$require_scan" "$max_severity"
+    install_skill_from_clawhub_url "$source_url" "$target_root"
+    return 0
+  fi
+
+  die "Unsupported skill source URL. Use GitHub or ClawHub URL."
 }
 
 array_contains() {
@@ -1841,6 +2271,28 @@ write_skills_config() {
   } >"$SKILLS_CONFIG_FILE"
 }
 
+workspace_enable_skill() {
+  local skill_id="$1"
+  [ -f "$SKILLS_CONFIG_FILE" ] || return 0
+
+  local id
+  local -a enabled_ids=()
+  local -a disabled_ids=()
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    enabled_ids+=("$id")
+  done < <(parse_skill_config_list "enabled")
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    disabled_ids+=("$id")
+  done < <(parse_skill_config_list "disabled")
+
+  mapfile -t enabled_ids < <(array_remove_item "$skill_id" "${enabled_ids[@]}")
+  mapfile -t disabled_ids < <(array_remove_item "$skill_id" "${disabled_ids[@]}")
+  enabled_ids+=("$skill_id")
+  write_skills_config "${enabled_ids[@]}" "__MCREPO_DISABLED_SPLIT__" "${disabled_ids[@]}"
+}
+
 is_skill_active() {
   local skill_id="$1"
   local -a enabled_ids=()
@@ -1881,10 +2333,34 @@ validate_skill_id() {
 }
 
 cmd_skill() {
+  local scope_repo=""
   local subcmd="${1:-list}"
-  if [ "$#" -gt 0 ]; then
-    shift
+
+  case "$subcmd" in
+    list|new|install|enable|disable|validate)
+      shift || true
+      ;;
+    '')
+      subcmd="list"
+      ;;
+    *)
+      scope_repo="$subcmd"
+      shift || true
+      subcmd="${1:-list}"
+      shift || true
+      ;;
+  esac
+
+  case "$subcmd" in
+    list|new|install|enable|disable|validate) ;;
+    *) die "Unknown skill subcommand: $subcmd" ;;
+  esac
+
+  local require_write=0
+  if [ "$subcmd" = "new" ] || [ "$subcmd" = "install" ]; then
+    require_write=1
   fi
+  resolve_scope_dir "$scope_repo" "$require_write"
 
   case "$subcmd" in
     list)
@@ -1893,38 +2369,49 @@ cmd_skill() {
         ids_only=1
         shift
       fi
-      [ "$#" -eq 0 ] || die "Usage: ./mcrepo.sh skill list [--ids]"
+      [ "$#" -eq 0 ] || die "Usage: ./mcrepo.sh skill [repo-name] list [--ids]"
 
       local id
       if [ "$ids_only" -eq 1 ]; then
-        list_skill_ids | sort
+        list_skill_ids "$SKILL_SCOPE_DIR" | sort
         return 0
       fi
 
-      if [ ! -d "$SUPPORT_SKILLS_DIR" ]; then
-        log "No skills directory found: $SUPPORT_SKILLS_DIR"
+      if [ ! -d "$SKILL_SCOPE_DIR" ]; then
+        log "No skills directory found: $SKILL_SCOPE_DIR"
         return 0
       fi
 
       while IFS= read -r id; do
-        if is_skill_active "$id"; then
-          printf '%-30s state=enabled\n' "$id"
+        if [ "$SKILL_SCOPE_KIND" = "workspace" ]; then
+          if is_skill_active "$id"; then
+            printf '%-30s state=enabled\n' "$id"
+          else
+            printf '%-30s state=disabled\n' "$id"
+          fi
         else
-          printf '%-30s state=disabled\n' "$id"
+          printf '%-30s state=enabled\n' "$id"
         fi
-      done < <(list_skill_ids | sort)
+      done < <(list_skill_ids "$SKILL_SCOPE_DIR" | sort)
       ;;
     new)
-      [ "$#" -eq 1 ] || die "Usage: ./mcrepo.sh skill new <skill-id>"
-      local new_id="$1"
-      validate_skill_id "$new_id" || die "Invalid skill id '$new_id' (allowed: lowercase letters, digits, hyphen)"
+      [ "$#" -eq 1 ] || die "Usage: ./mcrepo.sh skill [repo-name] new <skill-id>"
+      local source="$1"
+      if is_http_url "$source"; then
+        die "'new' creates a template skill. Use 'install' for URLs: ./mcrepo.sh skill [repo-name] install <github-url|clawhub-url>"
+      fi
 
-      local skill_dir="$SUPPORT_SKILLS_DIR/$new_id"
-      [ ! -e "$skill_dir" ] || die "Skill already exists: $new_id"
+      local skill_id skill_dir
+      mkdir -p "$SKILL_SCOPE_DIR"
+      validate_skill_id "$source" || die "Invalid skill id '$source' (allowed: lowercase letters, digits, hyphen)"
+      skill_id="$source"
+      skill_dir="$SKILL_SCOPE_DIR/$skill_id"
+      [ ! -e "$skill_dir" ] || die "Skill already exists: $skill_id"
       mkdir -p "$skill_dir"
 
-      cat >"$skill_dir/skill.md" <<EOF
-# $new_id
+      if [ "$SKILL_SCOPE_KIND" = "workspace" ]; then
+        cat >"$skill_dir/skill.md" <<EOF
+# $skill_id
 
 ## Purpose
 Describe what this skill does.
@@ -1940,6 +2427,26 @@ Describe what this skill does.
 - \`run.sh\` for task automation
 - \`check.sh\` for verification
 EOF
+      else
+        cat >"$skill_dir/SKILL.md" <<EOF
+---
+name: $skill_id
+description: Describe what this skill does.
+---
+
+# $skill_id
+
+## Purpose
+Describe what this skill does.
+
+## When to Apply
+- Add triggers for using this skill.
+
+## Procedure
+1. Add the first actionable step.
+2. Add validation steps.
+EOF
+      fi
 
       cat >"$skill_dir/run.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -1949,13 +2456,60 @@ echo "Implement task-specific helper logic here."
 EOF
       chmod +x "$skill_dir/run.sh"
 
-      log "Created skill: $new_id"
+      log "Created skill: $skill_id"
+
+      if [ "$SKILL_SCOPE_KIND" = "workspace" ]; then
+        workspace_enable_skill "$skill_id"
+        sync_workspace_skills_to_opencode
+      fi
+      ;;
+    install)
+      [ "$#" -ge 1 ] || die "Usage: ./mcrepo.sh skill [repo-name] install <github-url|clawhub-url> [--skip-scan] [--require-scan] [--max-severity CRITICAL|HIGH|MEDIUM|LOW]"
+
+      local source="$1"
+      shift
+      is_http_url "$source" || die "install requires a URL source"
+
+      local skip_scan=0
+      local require_scan=0
+      local max_severity="CRITICAL"
+      local opt
+      while [ "$#" -gt 0 ]; do
+        opt="$1"
+        case "$opt" in
+          --skip-scan) skip_scan=1 ;;
+          --require-scan) require_scan=1 ;;
+          --max-severity)
+            shift
+            [ "$#" -gt 0 ] || die "Missing value for --max-severity"
+            max_severity="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+            ;;
+          *) die "Unknown skill install option: $opt" ;;
+        esac
+        shift
+      done
+      if [ "$(severity_rank "$max_severity")" -eq 0 ]; then
+        die "Invalid --max-severity value '$max_severity' (use LOW|MEDIUM|HIGH|CRITICAL)"
+      fi
+
+      local skill_id
+      mkdir -p "$SKILL_SCOPE_DIR"
+      skill_id="$(install_skill_from_url "$source" "$SKILL_SCOPE_DIR" "$skip_scan" "$require_scan" "$max_severity")"
+      log "Installed skill '$skill_id' from $source"
+
+      if [ "$SKILL_SCOPE_KIND" = "workspace" ]; then
+        workspace_enable_skill "$skill_id"
+        sync_workspace_skills_to_opencode
+      fi
       ;;
     enable|disable)
+      [ "$SKILL_SCOPE_KIND" = "workspace" ] || die "enable/disable is only supported for workspace skills"
       [ "$#" -eq 1 ] || die "Usage: ./mcrepo.sh skill $subcmd <skill-id>"
       local target_id="$1"
       local target_dir="$SUPPORT_SKILLS_DIR/$target_id"
-      [ -f "$target_dir/skill.md" ] || die "Skill not found: $target_id"
+      if [ ! -f "$target_dir/skill.md" ] && [ ! -f "$target_dir/SKILL.md" ]; then
+        die "Skill not found: $target_id"
+      fi
 
       local id
       local -a enabled_ids=()
@@ -1980,7 +2534,7 @@ EOF
         while IFS= read -r id; do
           [ -n "$id" ] || continue
           enabled_ids+=("$id")
-        done < <(list_skill_ids)
+        done < <(list_skill_ids "$SUPPORT_SKILLS_DIR")
         explicit_mode=1
       fi
 
@@ -1996,30 +2550,30 @@ EOF
       fi
 
       write_skills_config "${enabled_ids[@]}" "__MCREPO_DISABLED_SPLIT__" "${disabled_ids[@]}"
+      sync_workspace_skills_to_opencode
       log "Skill '$target_id' set to $subcmd"
       ;;
     validate)
-      [ "$#" -eq 0 ] || die "Usage: ./mcrepo.sh skill validate"
+      [ "$#" -eq 0 ] || die "Usage: ./mcrepo.sh skill [repo-name] validate"
 
       local failures=0
       local id skill_dir
       while IFS= read -r id; do
-        skill_dir="$SUPPORT_SKILLS_DIR/$id"
-        if [ ! -f "$skill_dir/skill.md" ]; then
-          warn "Missing skill.md for '$id'"
+        skill_dir="$SKILL_SCOPE_DIR/$id"
+        if [ ! -f "$skill_dir/skill.md" ] && [ ! -f "$skill_dir/SKILL.md" ]; then
+          warn "Missing skill.md or SKILL.md for '$id'"
           failures=$((failures + 1))
         fi
-
         if [ -f "$skill_dir/run.sh" ] && [ ! -x "$skill_dir/run.sh" ]; then
           warn "run.sh is not executable for '$id'"
           failures=$((failures + 1))
         fi
-      done < <(list_skill_ids)
+      done < <(list_skill_ids "$SKILL_SCOPE_DIR")
 
-      if [ -f "$SKILLS_CONFIG_FILE" ]; then
+      if [ "$SKILL_SCOPE_KIND" = "workspace" ] && [ -f "$SKILLS_CONFIG_FILE" ]; then
         for id in $(parse_skill_config_list "enabled"; parse_skill_config_list "disabled"); do
           [ -z "$id" ] && continue
-          if [ ! -f "$SUPPORT_SKILLS_DIR/$id/skill.md" ]; then
+          if [ ! -f "$SUPPORT_SKILLS_DIR/$id/skill.md" ] && [ ! -f "$SUPPORT_SKILLS_DIR/$id/SKILL.md" ]; then
             warn "Configured skill missing on disk: $id"
             failures=$((failures + 1))
           fi
@@ -2029,10 +2583,11 @@ EOF
       if [ "$failures" -gt 0 ]; then
         die "Skill validation failed with $failures issue(s)."
       fi
+
+      if [ "$SKILL_SCOPE_KIND" = "workspace" ]; then
+        sync_workspace_skills_to_opencode
+      fi
       log "Skill validation passed."
-      ;;
-    *)
-      die "Unknown skill subcommand: $subcmd"
       ;;
   esac
 }

@@ -100,15 +100,33 @@ Use `mcrepo` skill commands to manage workspace-local skill packs:
 ```bash
 mcrepo skill list
 mcrepo skill new <skill-id>
+mcrepo skill install <github-url>
+mcrepo skill install <clawhub-url>
+mcrepo skill <repo-name> install <github-url|clawhub-url>
 mcrepo skill enable <skill-id>
 mcrepo skill disable <skill-id>
 mcrepo skill validate
 ```
 
+Skill source support:
+
+- GitHub URLs are supported for direct skill import.
+- ClawHub URLs are supported and scanned through Gen Agent Trust Hub before install.
+- Recommended public skill directory: `https://clawhub.ai/skills`
+
+ClawHub scan policy defaults:
+
+- `CRITICAL` scan severity blocks install.
+- `HIGH` scan severity warns and continues.
+- Use `--skip-scan` to bypass scanner checks.
+- Use `--require-scan` to fail when scan cannot be performed.
+
 Activation behavior:
 
 - If `🧠 skills/skills.yaml` exists, enable/disable state is taken from that file.
 - If `🧠 skills/skills.yaml` is missing, every `🧠 skills/<id>/skill.md` is treated as active.
+- MC workspace skills are mirrored into `.opencode/skills/` so OpenCode can auto-discover them.
+- For sub-repositories, use standard `.opencode/skills/` (no emoji folder) for local skill installs.
 
 Skill layout (colocated docs + helpers):
 

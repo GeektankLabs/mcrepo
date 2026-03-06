@@ -46,8 +46,11 @@ rm -rf "$tmp"
 - `sleep --force` clears local repo contents.
 - `sleep --wakeall` restores sleeping repos to `read` mode.
 - `🧠 skills/` is generated with a default skill pack and template.
+- `.opencode/skills/` is generated as mirror for OpenCode discovery.
 - `mcrepo skill list` shows skill states.
 - `mcrepo skill validate` passes on a fresh workspace.
+- `mcrepo skill install <github-url>` installs a skill into workspace scope.
+- `mcrepo skill <repo-name> install <github-url|clawhub-url>` installs into sub-repo `.opencode/skills/` when repo is in write mode.
 - `init --no-shell-install` does not write shell integration blocks.
 - `init --no-emojis` writes `path_style: clean` and uses plain repo folder names without mode prefixes.
 
