@@ -36,7 +36,7 @@ If you added all needed repositories to your Meta-Context-Repository then run th
 Every added repository starts in `read` mode.
 
 - `👀 read`: context available, no edits intended
-- `✍️ write`: active repository where changes should be done
+- `✏️ write`: active repository where changes should be done
 - `💤 sleep`: currently not relevant; reduce active scope
 
 Switch modes with:
@@ -90,8 +90,9 @@ mcrepo open <repo-name>
 
 Design ordering principle:
 
-- Repositories stay above `🔹🔹🔹` using clean repo names.
-- Shared folders stay below `🔹🔹🔹` (contracts/docs/tests/skills), using icons selected to keep this ordering consistent in VS Code.
+- Repositories use clean top-level names.
+- Shared folders (`🧩 contracts`, `🧾 docs`, `🧪 tests`, `🧠 skills`) are created directly at the top level.
+- The old visual separator directory is no longer created.
 
 ## Skills and Workspace Governance
 

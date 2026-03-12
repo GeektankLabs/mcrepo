@@ -1,8 +1,8 @@
 {
-  "name": "mcrepo-decorations",
-  "displayName": "MCRepo Decorations",
-  "description": "Explorer decorations for mcrepo write/read/sleep and support folders",
-  "version": "0.0.1",
+  "name": "mcrepo-multi-context",
+  "displayName": "mcrepo (Multi-Context)",
+  "description": "Explorer mode badges for mcrepo multi-context repositories",
+  "version": "0.0.4",
   "publisher": "local",
   "engines": {
     "vscode": "^1.90.0"
@@ -19,9 +19,40 @@
     "commands": [
       {
         "command": "mcrepoDecorations.refresh",
-        "title": "MCRepo Decorations: Refresh"
+        "title": "mcrepo (Multi-Context): Refresh Decorations"
+      },
+      {
+        "command": "mcrepoDecorations.setWrite",
+        "title": "mcrepo: Set Write Mode"
+      },
+      {
+        "command": "mcrepoDecorations.setRead",
+        "title": "mcrepo: Set Read Mode"
+      },
+      {
+        "command": "mcrepoDecorations.setSleep",
+        "title": "mcrepo: Set Sleep Mode"
       }
-    ]
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "mcrepoDecorations.setWrite",
+          "group": "navigation@mcrepo",
+          "when": "explorerResourceIsFolder && resourceScheme == file && resourceFilename != '🧩 contracts' && resourceFilename != '🧾 docs' && resourceFilename != '🧪 tests' && resourceFilename != '🧠 skills'"
+        },
+        {
+          "command": "mcrepoDecorations.setRead",
+          "group": "navigation@mcrepo",
+          "when": "explorerResourceIsFolder && resourceScheme == file && resourceFilename != '🧩 contracts' && resourceFilename != '🧾 docs' && resourceFilename != '🧪 tests' && resourceFilename != '🧠 skills'"
+        },
+        {
+          "command": "mcrepoDecorations.setSleep",
+          "group": "navigation@mcrepo",
+          "when": "explorerResourceIsFolder && resourceScheme == file && resourceFilename != '🧩 contracts' && resourceFilename != '🧾 docs' && resourceFilename != '🧪 tests' && resourceFilename != '🧠 skills'"
+        }
+      ]
+    }
   },
   "scripts": {
     "compile": "tsc -p ./",

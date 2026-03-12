@@ -1,20 +1,27 @@
-# MCRepo Decorations (VS Code Extension)
+# mcrepo (Multi-Context) VS Code Extension
 
-Adds Explorer decorations for mcrepo workspaces without changing real folder names.
+Adds Explorer decorations and right-click mode switches for mcrepo workspaces without changing real folder names.
 
 ## What it decorates
 
 - Repo folders from `mcrepo.yaml` with mode badges:
-  - `✍️` for `write`
+- `✏️` for `write`
   - `👀` for `read`
   - `💤` for `sleep`
-- Support folders with badges:
-  - `🧩` contracts
-  - `🧾` docs
-  - `🧪` tests
-  - `🧠` skills
+
+Support folders (`docs`, `tests`, `skills`, `contracts`) are intentionally not decorated to avoid duplicate icon display.
 
 The extension reads `mcrepo.yaml` and updates decorations when the file changes.
+
+## Explorer context actions
+
+On a top-level sub-repo folder in Explorer, right-click and use:
+
+- `mcrepo: Set Write Mode`
+- `mcrepo: Set Read Mode`
+- `mcrepo: Set Sleep Mode`
+
+`Set Sleep Mode` asks for confirmation.
 
 ## Local development
 
@@ -37,19 +44,19 @@ npm run package
 
 This creates:
 
-- `vsc-plugin/mcrepo-decorations-0.0.1.vsix`
+- `vsc-plugin/mcrepo-multi-context-0.0.4.vsix`
 
 ## Install the extension
 
 Option A (VS Code UI):
 
 - Command Palette -> `Extensions: Install from VSIX...`
-- Choose `vsc-plugin/mcrepo-decorations-0.0.1.vsix`
+- Choose `vsc-plugin/mcrepo-multi-context-0.0.4.vsix`
 
 Option B (CLI):
 
 ```bash
-code --install-extension "vsc-plugin/mcrepo-decorations-0.0.1.vsix"
+code --install-extension "vsc-plugin/mcrepo-multi-context-0.0.4.vsix"
 ```
 
 ## Rebuild after changes
@@ -60,7 +67,7 @@ If you change extension code, rebuild and reinstall:
 cd vsc-plugin
 npm run compile
 npm run package
-code --install-extension "mcrepo-decorations-0.0.1.vsix" --force
+code --install-extension "mcrepo-multi-context-0.0.4.vsix" --force
 ```
 
 ## Command

@@ -2,14 +2,13 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.10"
+MCREPO_VERSION="0.2.12"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
 REPOS_FILE="mcrepo.yaml"
 DEFAULT_PATH_STYLE="clean"
 LEGACY_SUPPORT_SCRIPTS_DIR="🛠 scripts"
-SUPPORT_SEPARATOR_DIR="🔹🔹🔹"
 SUPPORT_CONTRACTS_DIR="🧩 contracts"
 SUPPORT_DOCS_DIR="🧾 docs"
 SUPPORT_TESTS_DIR="🧪 tests"
@@ -314,7 +313,7 @@ normalize_path_style() {
 
 mode_icon() {
   case "$1" in
-    write) printf '✍️' ;;
+    write) printf '✏️' ;;
     read) printf '👀' ;;
     sleep|off) printf '💤' ;;
     *) printf '•' ;;
@@ -1042,7 +1041,7 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
    - prefix in `localpath` according to `path_style`
 2. Mode/prefix mapping is strict and must be treated as a hard safety gate:
    - For `path_style: emoji`:
-     - `mode: write` <-> `✍️`
+     - `mode: write` <-> `✏️`
      - `mode: read` <-> `👀`
      - `mode: sleep` <-> `💤`
    - For `path_style: clean`:
@@ -1059,9 +1058,8 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 
 ## Ordering and Shared Folders
 
-- Keep managed repositories above `🔹🔹🔹`.
-- Keep shared workspace folders below `🔹🔹🔹`.
-- In emoji path style, `🧠 skills/` is intentionally placed below `🔹🔹🔹` for consistent ordering.
+- Keep managed repositories and shared folders as separate top-level entries.
+- Do not create or rely on a visual separator directory.
 
 ## Skills Loading
 
@@ -1259,22 +1257,39 @@ create_repos_template() {
   printf 'repos: []\n' >"$REPOS_FILE"
 }
 
+directory_is_empty() {
+  local dir="$1"
+  local entries=()
+  shopt -s nullglob dotglob
+  entries=("$dir"/*)
+  shopt -u nullglob dotglob
+  [ "${#entries[@]}" -eq 0 ]
+}
+
+remove_legacy_separator_dirs() {
+  local separator_dir
+  local separator_dirs=(
+    "🔹🔹🔹"
+    "🔹 separator"
+    "▪️ separator"
+    "〰️ separator"
+    "– separator"
+    "separator"
+  )
+
+  for separator_dir in "${separator_dirs[@]}"; do
+    [ -d "$separator_dir" ] || continue
+    if directory_is_empty "$separator_dir"; then
+      rmdir "$separator_dir"
+      log "Removed legacy separator directory: $separator_dir"
+    else
+      warn "Keeping non-empty legacy separator directory: $separator_dir"
+    fi
+  done
+}
+
 ensure_base_structure() {
-  if [ -d "🔹 separator" ] && [ ! -e "$SUPPORT_SEPARATOR_DIR" ]; then
-    mv "🔹 separator" "$SUPPORT_SEPARATOR_DIR"
-  fi
-  if [ -d "▪️ separator" ] && [ ! -e "$SUPPORT_SEPARATOR_DIR" ]; then
-    mv "▪️ separator" "$SUPPORT_SEPARATOR_DIR"
-  fi
-  if [ -d "〰️ separator" ] && [ ! -e "$SUPPORT_SEPARATOR_DIR" ]; then
-    mv "〰️ separator" "$SUPPORT_SEPARATOR_DIR"
-  fi
-  if [ -d "– separator" ] && [ ! -e "$SUPPORT_SEPARATOR_DIR" ]; then
-    mv "– separator" "$SUPPORT_SEPARATOR_DIR"
-  fi
-  if [ -d "separator" ] && [ ! -e "$SUPPORT_SEPARATOR_DIR" ]; then
-    mv "separator" "$SUPPORT_SEPARATOR_DIR"
-  fi
+  remove_legacy_separator_dirs
 
   if [ -d "🧠skills" ] && [ ! -e "$SUPPORT_SKILLS_DIR" ]; then
     mv "🧠skills" "$SUPPORT_SKILLS_DIR"
@@ -1299,7 +1314,7 @@ ensure_base_structure() {
     mv "tests" "$SUPPORT_TESTS_DIR"
   fi
 
-  mkdir -p "$SUPPORT_SEPARATOR_DIR" "$SUPPORT_CONTRACTS_DIR" "$SUPPORT_DOCS_DIR" "$SUPPORT_TESTS_DIR" "$SUPPORT_SKILLS_DIR"
+  mkdir -p "$SUPPORT_CONTRACTS_DIR" "$SUPPORT_DOCS_DIR" "$SUPPORT_TESTS_DIR" "$SUPPORT_SKILLS_DIR"
 }
 
 ensure_base_files() {

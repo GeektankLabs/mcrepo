@@ -42,6 +42,7 @@ rm -rf "$tmp"
 
 - `mcrepo.yaml` is created and updated correctly.
 - Support directories are generated.
+- Separator directory is not created.
 - Mode switches keep clean repo folder names (no mode-prefix renames).
 - `sleep --force` clears local repo contents.
 - `sleep --wakeall` restores sleeping repos to `read` mode.
@@ -54,6 +55,7 @@ rm -rf "$tmp"
 - `init --no-shell-install` does not write shell integration blocks.
 - `init` writes `path_style: clean` and uses plain repo folder names without mode prefixes.
 - Re-running `init` migrates older emoji-prefixed repo folders to clean names when found.
+- Re-running `init` removes legacy separator directories when they are empty.
 
 ## Manual Check for Shell Integration Idempotency
 

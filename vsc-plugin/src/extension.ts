@@ -1,5 +1,8 @@
 import * as vscode from "vscode";
 import * as path from "node:path";
+import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { promisify } from "node:util";
 import { parse } from "yaml";
 
 type FolderDecoration = {
@@ -18,20 +21,21 @@ type McrepoConfig = {
   repos?: RepoEntry[];
 };
 
+type RepoMode = "write" | "read" | "sleep";
+
+type WorkspaceDecorations = {
+  decorations: Map<string, FolderDecoration>;
+  repoNameByPath: Map<string, string>;
+};
+
 const REPOS_FILE = "mcrepo.yaml";
+const execFileAsync = promisify(execFile);
 
 const MODE_BADGES: Record<string, string> = {
-  write: "✍️",
+  write: "✏️",
   read: "👀",
   sleep: "💤"
 };
-
-const SUPPORT_FOLDERS: Array<{ names: string[]; badge: string; label: string }> = [
-  { names: ["🧩 contracts", "contracts"], badge: "🧩", label: "contracts" },
-  { names: ["🧾 docs", "docs"], badge: "🧾", label: "docs" },
-  { names: ["🧪 tests", "tests"], badge: "🧪", label: "tests" },
-  { names: ["🧠 skills", "skills"], badge: "🧠", label: "skills" }
-];
 
 class McrepoDecorationProvider implements vscode.FileDecorationProvider {
   private readonly onDidChangeEmitter = new vscode.EventEmitter<vscode.Uri[]>();
@@ -39,6 +43,7 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
 
   private readonly output = vscode.window.createOutputChannel("MCRepo Decorations");
   private readonly decorationsByWorkspace = new Map<string, Map<string, FolderDecoration>>();
+  private readonly repoNameByWorkspacePath = new Map<string, Map<string, string>>();
   private readonly disposables: vscode.Disposable[] = [];
 
   constructor(private readonly context: vscode.ExtensionContext) {
@@ -47,6 +52,21 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
       vscode.commands.registerCommand("mcrepoDecorations.refresh", async () => {
         await this.reloadAll();
         vscode.window.setStatusBarMessage("MCRepo decorations refreshed", 2000);
+      })
+    );
+    this.disposables.push(
+      vscode.commands.registerCommand("mcrepoDecorations.setWrite", async (uri: vscode.Uri) => {
+        await this.switchRepoModeFromExplorer(uri, "write");
+      })
+    );
+    this.disposables.push(
+      vscode.commands.registerCommand("mcrepoDecorations.setRead", async (uri: vscode.Uri) => {
+        await this.switchRepoModeFromExplorer(uri, "read");
+      })
+    );
+    this.disposables.push(
+      vscode.commands.registerCommand("mcrepoDecorations.setSleep", async (uri: vscode.Uri) => {
+        await this.switchRepoModeFromExplorer(uri, "sleep");
       })
     );
     this.disposables.push(
@@ -75,9 +95,10 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
     for (const folder of folders) {
       const workspaceKey = folder.uri.toString();
       const before = this.decorationsByWorkspace.get(workspaceKey) ?? new Map<string, FolderDecoration>();
-      const after = await this.loadDecorationsForWorkspace(folder);
-      this.decorationsByWorkspace.set(workspaceKey, after);
-      changedUris.push(...this.collectChangedUris(folder, before, after));
+      const workspaceDecorations = await this.loadDecorationsForWorkspace(folder);
+      this.decorationsByWorkspace.set(workspaceKey, workspaceDecorations.decorations);
+      this.repoNameByWorkspacePath.set(workspaceKey, workspaceDecorations.repoNameByPath);
+      changedUris.push(...this.collectChangedUris(folder, before, workspaceDecorations.decorations));
     }
 
     const validKeys = new Set(folders.map((folder) => folder.uri.toString()));
@@ -86,6 +107,7 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
         continue;
       }
       this.decorationsByWorkspace.delete(workspaceKey);
+      this.repoNameByWorkspacePath.delete(workspaceKey);
       const removedRoot = vscode.Uri.parse(workspaceKey);
       for (const relativePath of oldMap.keys()) {
         changedUris.push(vscode.Uri.joinPath(removedRoot, relativePath));
@@ -141,16 +163,92 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
     this.disposables.push(watcher);
   }
 
-  private async loadDecorationsForWorkspace(workspaceFolder: vscode.WorkspaceFolder): Promise<Map<string, FolderDecoration>> {
+  private async switchRepoModeFromExplorer(uri: vscode.Uri | undefined, targetMode: RepoMode): Promise<void> {
+    if (!uri) {
+      void vscode.window.showWarningMessage("Please run this command from a repository folder in Explorer.");
+      return;
+    }
+
+    const folder = vscode.workspace.getWorkspaceFolder(uri);
+    if (!folder) {
+      void vscode.window.showWarningMessage("Selected folder is not in an active workspace.");
+      return;
+    }
+
+    const relativePath = this.getTopLevelRelativePath(folder, uri);
+    if (!relativePath) {
+      void vscode.window.showWarningMessage("Please select a top-level mcrepo repository folder.");
+      return;
+    }
+
+    const repoNameByPath = this.repoNameByWorkspacePath.get(folder.uri.toString());
+    const repoName = repoNameByPath?.get(relativePath);
+    if (!repoName) {
+      void vscode.window.showWarningMessage(`'${path.posix.basename(relativePath)}' is not a managed repository in mcrepo.yaml.`);
+      return;
+    }
+
+    if (targetMode === "sleep") {
+      const choice = await vscode.window.showWarningMessage(
+        `Set '${repoName}' to Sleep mode?`,
+        { modal: true, detail: "Sleep mode can clear local repository contents depending on your mcrepo workflow." },
+        "Set Sleep"
+      );
+      if (choice !== "Set Sleep") {
+        return;
+      }
+    }
+
+    try {
+      await this.runMcrepoModeCommand(folder, repoName, targetMode);
+      await this.reloadAll();
+      void vscode.window.setStatusBarMessage(`mcrepo: '${repoName}' set to ${targetMode}`, 2500);
+    } catch (error) {
+      this.output.show(true);
+      this.output.appendLine(String(error));
+      void vscode.window.showErrorMessage(`Failed to set '${repoName}' to ${targetMode}. See 'MCRepo Decorations' output.`);
+    }
+  }
+
+  private async runMcrepoModeCommand(
+    workspaceFolder: vscode.WorkspaceFolder,
+    repoName: string,
+    targetMode: RepoMode
+  ): Promise<void> {
+    const cwd = workspaceFolder.uri.fsPath;
+    const localScriptPath = path.join(cwd, "mcrepo.sh");
+    const args = [targetMode, repoName];
+
+    let cmd = "mcrepo";
+    let cmdArgs = args;
+    if (existsSync(localScriptPath)) {
+      cmd = "bash";
+      cmdArgs = [localScriptPath, ...args];
+    }
+
+    const { stdout, stderr } = await execFileAsync(cmd, cmdArgs, {
+      cwd,
+      maxBuffer: 1024 * 1024
+    });
+
+    if (stdout.trim()) {
+      this.output.appendLine(stdout.trim());
+    }
+    if (stderr.trim()) {
+      this.output.appendLine(stderr.trim());
+    }
+  }
+
+  private async loadDecorationsForWorkspace(workspaceFolder: vscode.WorkspaceFolder): Promise<WorkspaceDecorations> {
     const map = new Map<string, FolderDecoration>();
-    this.addSupportFolderDecorations(map);
+    const repoNameByPath = new Map<string, string>();
 
     const reposUri = vscode.Uri.joinPath(workspaceFolder.uri, REPOS_FILE);
     let rawContent: Uint8Array;
     try {
       rawContent = await vscode.workspace.fs.readFile(reposUri);
     } catch {
-      return map;
+      return { decorations: map, repoNameByPath };
     }
 
     const content = new TextDecoder("utf-8").decode(rawContent);
@@ -159,11 +257,11 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
       config = parse(content) as McrepoConfig;
     } catch (error) {
       this.output.appendLine(`Could not parse ${REPOS_FILE} in ${workspaceFolder.name}: ${String(error)}`);
-      return map;
+      return { decorations: map, repoNameByPath };
     }
 
     if (!config || !Array.isArray(config.repos)) {
-      return map;
+      return { decorations: map, repoNameByPath };
     }
 
     const pathStyle = typeof config.path_style === "string" ? config.path_style : "emoji";
@@ -175,25 +273,22 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
         continue;
       }
 
+      const repoName = (repo.name ?? "").trim();
+      if (!repoName) {
+        continue;
+      }
+
       const candidatePaths = this.resolveRepoFolderCandidates(repo, pathStyle, mode);
       const tooltip = `mcrepo repo mode: ${mode}`;
       for (const relativePath of candidatePaths) {
         map.set(relativePath, { badge: modeBadge, tooltip });
+        if (!repoNameByPath.has(relativePath)) {
+          repoNameByPath.set(relativePath, repoName);
+        }
       }
     }
 
-    return map;
-  }
-
-  private addSupportFolderDecorations(map: Map<string, FolderDecoration>): void {
-    for (const folder of SUPPORT_FOLDERS) {
-      for (const name of folder.names) {
-        map.set(name, {
-          badge: folder.badge,
-          tooltip: `mcrepo support folder: ${folder.label}`
-        });
-      }
-    }
+    return { decorations: map, repoNameByPath };
   }
 
   private resolveRepoFolderCandidates(repo: RepoEntry, pathStyle: string, mode: string): string[] {
