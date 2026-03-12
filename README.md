@@ -48,7 +48,7 @@ mcrepo sleep <repo-name>
 mcrepo status
 ```
 
-By default, folder names use these emoji prefixes, which makes mode status easy to spot in VS Code file explorer.
+By default, repository folder names stay clean (no emoji prefix in directory names). Mode visibility is still tracked in `mcrepo.yaml` and can be decorated in the editor.
 
 ## Branch Coordination
 
@@ -69,7 +69,7 @@ This keeps feature work aligned and makes later per-repo commits and pull reques
 
 ## VS Code Workflow
 
-- Keep the meta-context root open in one VS Code window to see all repositories and mode folders (`✍️`, `👀`, `💤`).
+- Keep the meta-context root open in one VS Code window to see all repositories and shared coordination folders.
 - If a write repository has changes, open it in a dedicated VS Code window:
 
 ```bash
@@ -90,7 +90,7 @@ mcrepo open <repo-name>
 
 Design ordering principle:
 
-- Repositories stay above `🔹🔹🔹` with mode icons (`✍️`, `👀`, `💤`).
+- Repositories stay above `🔹🔹🔹` using clean repo names.
 - Shared folders stay below `🔹🔹🔹` (contracts/docs/tests/skills), using icons selected to keep this ordering consistent in VS Code.
 
 ## Skills and Workspace Governance
@@ -186,11 +186,13 @@ You can keep component repositories public/open-source while keeping the `mcrepo
 ./mcrepo.sh init --no-shell-install
 ```
 
-- Disable emoji-prefixed mode folders and use clean folder names (no mode prefix in directory names):
+- `init` always uses clean repo folder names and migrates older emoji-prefixed repo folders automatically:
 
 ```bash
-./mcrepo.sh init --no-emojis
+./mcrepo.sh init
 ```
+
+- `--no-emojis` remains available as a compatibility alias and has the same behavior as default init.
 
 ## Versioning and Self-Update
 

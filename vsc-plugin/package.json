@@ -1,0 +1,40 @@
+{
+  "name": "mcrepo-decorations",
+  "displayName": "MCRepo Decorations",
+  "description": "Explorer decorations for mcrepo write/read/sleep and support folders",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:mcrepoDecorations.refresh"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "mcrepoDecorations.refresh",
+        "title": "MCRepo Decorations: Refresh"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.12",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.6.3",
+    "@vscode/vsce": "^3.6.2"
+  },
+  "dependencies": {
+    "yaml": "^2.5.1"
+  }
+}

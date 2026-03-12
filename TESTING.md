@@ -8,7 +8,7 @@ Do not run tests that mutate files in the development repo root.
 - Always test in a disposable sandbox directory.
 - Always use an isolated `HOME` to avoid touching your real shell rc files.
 - Prefer `./mcrepo.sh init --no-shell-install` for automated checks.
-- Use `./mcrepo.sh init --no-emojis` when validating clean folder naming.
+- `./mcrepo.sh init` should produce clean repo folder names by default.
 
 ## Quick Sandbox Smoke Test
 
@@ -42,7 +42,7 @@ rm -rf "$tmp"
 
 - `mcrepo.yaml` is created and updated correctly.
 - Support directories are generated.
-- Mode switches rename folders with mode icons.
+- Mode switches keep clean repo folder names (no mode-prefix renames).
 - `sleep --force` clears local repo contents.
 - `sleep --wakeall` restores sleeping repos to `read` mode.
 - `🧠 skills/` is generated with a default skill pack and template.
@@ -52,7 +52,8 @@ rm -rf "$tmp"
 - `mcrepo skill install <github-url>` installs a skill into workspace scope.
 - `mcrepo skill <repo-name> install <github-url|clawhub-url>` installs into sub-repo `.opencode/skills/` when repo is in write mode.
 - `init --no-shell-install` does not write shell integration blocks.
-- `init --no-emojis` writes `path_style: clean` and uses plain repo folder names without mode prefixes.
+- `init` writes `path_style: clean` and uses plain repo folder names without mode prefixes.
+- Re-running `init` migrates older emoji-prefixed repo folders to clean names when found.
 
 ## Manual Check for Shell Integration Idempotency
 

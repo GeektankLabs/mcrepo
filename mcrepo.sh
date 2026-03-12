@@ -2,12 +2,12 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.9"
+MCREPO_VERSION="0.2.10"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
 REPOS_FILE="mcrepo.yaml"
-DEFAULT_PATH_STYLE="emoji"
+DEFAULT_PATH_STYLE="clean"
 LEGACY_SUPPORT_SCRIPTS_DIR="🛠 scripts"
 SUPPORT_SEPARATOR_DIR="🔹🔹🔹"
 SUPPORT_CONTRACTS_DIR="🧩 contracts"
@@ -51,7 +51,7 @@ die() {
 usage() {
   cat <<'EOF'
 Usage:  # Show available mcrepo commands
-  ./mcrepo.sh init [organization] [--no-shell-install] [--no-emojis] # Initialize MC-Repo structure and optionally sync repos from a GitHub organization
+  ./mcrepo.sh init [organization] [--no-shell-install] [--no-emojis] # Initialize MC-Repo structure and optionally sync repos from a GitHub organization (clean repo paths by default)
   ./mcrepo.sh add <git-url> [name]                # Add a repository to mcrepo.yaml (default mode: read) and clone it if needed
   ./mcrepo.sh remove <name-or-url>                # Remove a repository from mcrepo management configuration
   ./mcrepo.sh write <repo-name>                   # Switch a repository to write mode and auto-align to global branch (if configured)
@@ -1007,8 +1007,9 @@ It provides workspace governance across repos, shared documentation, tests, and 
   - `write`: editable and active
   - `read`: local context only
   - `sleep`: currently inactive
-- Default path style uses emoji folder prefixes: `✍️`, `👀`, `💤`
-- You can disable emoji folders during init: `./mcrepo.sh init --no-emojis` (uses clean paths without mode prefixes)
+- Default path style uses clean repo folder names (no mode prefix in directory names)
+- `./mcrepo.sh init` migrates existing emoji-prefixed repo folders to clean names
+- `./mcrepo.sh init --no-emojis` is kept as a compatibility alias and behaves the same as default init
 - `mcrepo.sh` orchestrates repositories.
 - `mcrepo branch <name>` updates the global branch, aligns clean write repos (optionally read repos), then switches the meta-context repo.
 - Branch switching is remote-first: if `origin/<name>` exists and local `<name>` does not, mcrepo creates a tracking local branch from origin.
@@ -1429,6 +1430,7 @@ cmd_init() {
   local org_arg=""
   local no_shell_install=0
   local no_emojis=0
+  local previous_path_style=""
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -1466,6 +1468,7 @@ cmd_init() {
   ensure_base_structure
   ensure_base_files
   load_repos
+  previous_path_style="$PATH_STYLE"
 
   if [ -n "$org_arg" ]; then
     ORGANIZATION="$org_arg"
@@ -1475,8 +1478,14 @@ cmd_init() {
     sync_organization_repos "$ORGANIZATION"
   fi
 
+  PATH_STYLE="clean"
+
   if [ "$no_emojis" -eq 1 ]; then
-    PATH_STYLE="clean"
+    log "Note: --no-emojis is now the default behavior (clean repo paths)."
+  fi
+
+  if [ "$previous_path_style" = "emoji" ]; then
+    log "Migrating repository folder names from emoji-prefixed paths to clean paths."
   fi
 
   save_repos
