@@ -17,7 +17,6 @@ type RepoEntry = {
 };
 
 type McrepoConfig = {
-  path_style?: string;
   repos?: RepoEntry[];
 };
 
@@ -264,8 +263,6 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
       return { decorations: map, repoNameByPath };
     }
 
-    const pathStyle = typeof config.path_style === "string" ? config.path_style : "emoji";
-
     for (const repo of config.repos) {
       const mode = this.normalizeMode(repo.mode);
       const modeBadge = MODE_BADGES[mode];
@@ -278,7 +275,7 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
         continue;
       }
 
-      const candidatePaths = this.resolveRepoFolderCandidates(repo, pathStyle, mode);
+      const candidatePaths = this.resolveRepoFolderCandidates(repo);
       const tooltip = `mcrepo repo mode: ${mode}`;
       for (const relativePath of candidatePaths) {
         map.set(relativePath, { badge: modeBadge, tooltip });
@@ -291,7 +288,7 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
     return { decorations: map, repoNameByPath };
   }
 
-  private resolveRepoFolderCandidates(repo: RepoEntry, pathStyle: string, mode: string): string[] {
+  private resolveRepoFolderCandidates(repo: RepoEntry): string[] {
     const candidates = new Set<string>();
 
     const localPath = this.topLevelName(repo.localpath);
@@ -304,13 +301,7 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
       return [...candidates];
     }
 
-    if (pathStyle === "clean") {
-      candidates.add(repoName);
-      candidates.add(`${MODE_BADGES[mode]} ${repoName}`);
-    } else {
-      candidates.add(`${MODE_BADGES[mode]} ${repoName}`);
-      candidates.add(repoName);
-    }
+    candidates.add(repoName);
 
     return [...candidates];
   }

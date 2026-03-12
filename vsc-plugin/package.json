@@ -23,15 +23,15 @@
       },
       {
         "command": "mcrepoDecorations.setWrite",
-        "title": "mcrepo: Set Write Mode"
+        "title": "🗂 ✏️ Set Write"
       },
       {
         "command": "mcrepoDecorations.setRead",
-        "title": "mcrepo: Set Read Mode"
+        "title": "🗂 👀 Set Read"
       },
       {
         "command": "mcrepoDecorations.setSleep",
-        "title": "mcrepo: Set Sleep Mode"
+        "title": "🗂 💤 Set Sleep"
       }
     ],
     "menus": {

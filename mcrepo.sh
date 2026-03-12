@@ -2,12 +2,11 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.13"
+MCREPO_VERSION="0.2.15"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
 REPOS_FILE="mcrepo.yaml"
-DEFAULT_PATH_STYLE="clean"
 LEGACY_SUPPORT_SCRIPTS_DIR="🛠 scripts"
 SUPPORT_CONTRACTS_DIR="🧩 contracts"
 SUPPORT_DOCS_DIR="🧾 docs"
@@ -50,7 +49,7 @@ die() {
 usage() {
   cat <<'EOF'
 Usage:  # Show available mcrepo commands
-  ./mcrepo.sh init [organization] [--no-shell-install] [--no-emojis] # Initialize MC-Repo structure and optionally sync repos from a GitHub organization (clean repo paths by default)
+  ./mcrepo.sh init [organization] [--no-shell-install] # Initialize MC-Repo structure and optionally sync repos from a GitHub organization
   ./mcrepo.sh add <git-url> [name]                # Add a repository to mcrepo.yaml (default mode: read) and clone it if needed
   ./mcrepo.sh remove <name-or-url>                # Remove a repository from mcrepo management configuration
   ./mcrepo.sh write <repo-name>                   # Switch a repository to write mode and auto-align to global branch (if configured)
@@ -297,20 +296,6 @@ normalize_mode() {
   esac
 }
 
-validate_path_style() {
-  case "$1" in
-    emoji|clean) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-normalize_path_style() {
-  case "$1" in
-    plain) printf 'clean' ;;
-    *) printf '%s' "$1" ;;
-  esac
-}
-
 mode_icon() {
   case "$1" in
     write) printf '✏️' ;;
@@ -320,32 +305,9 @@ mode_icon() {
   esac
 }
 
-mode_prefix_for_style() {
-  local mode="$1"
-  local style="$2"
-
-  if [ "$style" = "clean" ]; then
-    return 0
-  fi
-
-  mode_icon "$mode"
-}
-
-repo_dir_for_mode_with_style() {
-  local repo_name="$1"
-  local mode="$2"
-  local style="$3"
-  if [ "$style" = "clean" ]; then
-    printf '%s' "$repo_name"
-    return 0
-  fi
-  printf '%s %s' "$(mode_prefix_for_style "$mode" "$style")" "$repo_name"
-}
-
 repo_dir_for_mode() {
   local repo_name="$1"
-  local mode="$2"
-  printf '%s' "$(repo_dir_for_mode_with_style "$repo_name" "$mode" "$PATH_STYLE")"
+  printf '%s' "$repo_name"
 }
 
 repo_local_path_for_mode() {
@@ -354,29 +316,13 @@ repo_local_path_for_mode() {
   printf './%s' "$(repo_dir_for_mode "$repo_name" "$mode")"
 }
 
-repo_dir_candidates() {
-  local repo_name="$1"
-  printf '%s\n' \
-    "$(repo_dir_for_mode_with_style "$repo_name" write emoji)" \
-    "$(repo_dir_for_mode_with_style "$repo_name" read emoji)" \
-    "$(repo_dir_for_mode_with_style "$repo_name" sleep emoji)" \
-    "write $repo_name" \
-    "read $repo_name" \
-    "sleep $repo_name" \
-    "$(repo_dir_for_mode_with_style "$repo_name" write clean)" \
-    "$repo_name"
-}
-
 find_existing_repo_dir() {
   local repo_name="$1"
-  local candidate
 
-  while IFS= read -r candidate; do
-    if [ -d "$candidate/.git" ] || [ -d "$candidate" ]; then
-      printf '%s' "$candidate"
-      return 0
-    fi
-  done < <(repo_dir_candidates "$repo_name")
+  if [ -d "$repo_name/.git" ] || [ -d "$repo_name" ]; then
+    printf '%s' "$repo_name"
+    return 0
+  fi
 
   return 1
 }
@@ -434,6 +380,24 @@ clear_directory_contents() {
     rm -rf "$entry"
   done
   shopt -u dotglob nullglob
+}
+
+write_sleep_placeholder_files() {
+  local dir="$1"
+  [ -d "$dir" ] || return 0
+
+  cat >"$dir/.gitignore" <<'EOF'
+*
+!.gitignore
+!.mcrepo-sleep
+EOF
+
+  cat >"$dir/.mcrepo-sleep" <<'EOF'
+This repository is in mcrepo sleep mode.
+
+Its local working copy is intentionally not kept here while sleeping.
+When you switch it back to read or write mode, mcrepo checks it out again.
+EOF
 }
 
 ensure_repos_file_exists() {
@@ -561,37 +525,12 @@ parse_branch() {
   ' "$REPOS_FILE"
 }
 
-parse_path_style() {
-  awk '
-    function trim(s) {
-      gsub(/^[ \t]+|[ \t]+$/, "", s)
-      return s
-    }
-    function unquote(s) {
-      s = trim(s)
-      if ((s ~ /^".*"$/) || (s ~ /^\047.*\047$/)) {
-        return substr(s, 2, length(s) - 2)
-      }
-      return s
-    }
-    {
-      line = $0
-      if (line ~ /^[ \t]*path_style:[ \t]*/) {
-        sub(/^[ \t]*path_style:[ \t]*/, "", line)
-        print unquote(line)
-        exit
-      }
-    }
-  ' "$REPOS_FILE"
-}
-
 REPO_URLS=()
 REPO_NAMES=()
 REPO_MODES=()
 REPO_DESCRIPTIONS=()
 ORGANIZATION=""
 GLOBAL_BRANCH=""
-PATH_STYLE="$DEFAULT_PATH_STYLE"
 
 load_repos() {
   ensure_repos_file_exists
@@ -601,15 +540,9 @@ load_repos() {
   REPO_DESCRIPTIONS=()
   ORGANIZATION=""
   GLOBAL_BRANCH=""
-  PATH_STYLE="$DEFAULT_PATH_STYLE"
 
   ORGANIZATION="$(parse_organization || true)"
   GLOBAL_BRANCH="$(parse_branch || true)"
-  PATH_STYLE="$(parse_path_style || true)"
-  PATH_STYLE="$(normalize_path_style "$PATH_STYLE")"
-  if ! validate_path_style "${PATH_STYLE:-}"; then
-    PATH_STYLE="$DEFAULT_PATH_STYLE"
-  fi
 
   local parsed_url parsed_name parsed_mode parsed_description
   while IFS=$'\t' read -r parsed_url parsed_name parsed_mode parsed_description; do
@@ -637,7 +570,6 @@ save_repos() {
   if [ -n "$GLOBAL_BRANCH" ]; then
     printf 'branch: %s\n' "$GLOBAL_BRANCH" >>"$REPOS_FILE"
   fi
-  printf 'path_style: %s\n' "$PATH_STYLE" >>"$REPOS_FILE"
 
   if [ "${#REPO_URLS[@]}" -eq 0 ]; then
     printf 'repos: []\n' >>"$REPOS_FILE"
@@ -743,25 +675,42 @@ ensure_gitignore_base() {
 ensure_gitignore_repo_entry() {
   local repo_name="$1"
   ensure_gitignore_base
-  local candidate line
-  while IFS= read -r candidate; do
-    line="/${candidate}/"
-    if ! grep -Fqx "$line" .gitignore; then
-      printf '%s\n' "$line" >>.gitignore
-    fi
-  done < <(repo_dir_candidates "$repo_name")
+  local line tmp
+
+  line="/$repo_name/"
+  if ! grep -Fqx "$line" .gitignore; then
+    printf '%s\n' "$line" >>.gitignore
+  fi
+
+  tmp="$(mktemp)"
+  grep -Fvx "/✏️ $repo_name/" .gitignore >"$tmp" || true
+  mv "$tmp" .gitignore
+  tmp="$(mktemp)"
+  grep -Fvx "/👀 $repo_name/" .gitignore >"$tmp" || true
+  mv "$tmp" .gitignore
+  tmp="$(mktemp)"
+  grep -Fvx "/💤 $repo_name/" .gitignore >"$tmp" || true
+  mv "$tmp" .gitignore
+  tmp="$(mktemp)"
+  grep -Fvx "/write $repo_name/" .gitignore >"$tmp" || true
+  mv "$tmp" .gitignore
+  tmp="$(mktemp)"
+  grep -Fvx "/read $repo_name/" .gitignore >"$tmp" || true
+  mv "$tmp" .gitignore
+  tmp="$(mktemp)"
+  grep -Fvx "/sleep $repo_name/" .gitignore >"$tmp" || true
+  mv "$tmp" .gitignore
 }
 
 remove_gitignore_repo_entry() {
   local repo_name="$1"
   [ -f .gitignore ] || return 0
-  local candidate line tmp
-  while IFS= read -r candidate; do
-    line="/${candidate}/"
-    tmp="$(mktemp)"
-    grep -Fvx "$line" .gitignore >"$tmp" || true
-    mv "$tmp" .gitignore
-  done < <(repo_dir_candidates "$repo_name")
+  local line tmp
+
+  line="/$repo_name/"
+  tmp="$(mktemp)"
+  grep -Fvx "$line" .gitignore >"$tmp" || true
+  mv "$tmp" .gitignore
 }
 
 clone_repo_if_needed() {
@@ -781,6 +730,10 @@ clone_repo_if_needed() {
   fi
 
   if [ -d "$repo_dir" ]; then
+    if [ -f "$repo_dir/.mcrepo-sleep" ]; then
+      clear_directory_contents "$repo_dir"
+    fi
+
     shopt -s nullglob dotglob
     local entries=("$repo_dir"/*)
     shopt -u nullglob dotglob
@@ -1006,9 +959,7 @@ It provides workspace governance across repos, shared documentation, tests, and 
   - `write`: editable and active
   - `read`: local context only
   - `sleep`: currently inactive
-- Default path style uses clean repo folder names (no mode prefix in directory names)
-- `./mcrepo.sh init` migrates existing emoji-prefixed repo folders to clean names
-- `./mcrepo.sh init --no-emojis` is kept as a compatibility alias and behaves the same as default init
+- Repository folders always use clean repo names (no mode-prefix or emoji-prefix renaming)
 - `mcrepo.sh` orchestrates repositories.
 - `mcrepo branch <name>` updates the global branch, aligns clean write repos (optionally read repos), then switches the meta-context repo.
 - Branch switching is remote-first: if `origin/<name>` exists and local `<name>` does not, mcrepo creates a tracking local branch from origin.
@@ -1030,31 +981,22 @@ create_agents_template() {
 ## MC-Repo Context
 
 This repository is a Multi-Context-Repo (MC-Repo) that groups multiple independent repositories for coordinated work.
-Always read the mcrepo.yaml first under "repos" you find the list of all repositories their "localpath", "mode" and "description". 
+Always read the mcrepo.yaml first under "repos" you find the list of all repositories their "localpath", "mode" and "description".
 
 # Agent Rules for this Multi-Context Repo
 
-**STRICT MODE + PATH STYLE ENFORCEMENT (MANDATORY)**
+**STRICT MODE ENFORCEMENT (MANDATORY)**
 
 1. Before any work, read `mcrepo.yaml` and verify repo access by **both** fields:
    - `mode` value
-   - prefix in `localpath` according to `path_style`
-2. Mode/prefix mapping is strict and must be treated as a hard safety gate:
-   - For `path_style: emoji`:
-     - `mode: write` <-> `✏️`
-     - `mode: read` <-> `👀`
-     - `mode: sleep` <-> `💤`
-   - For `path_style: clean`:
-     - local paths are plain repo names without mode prefixes
-     - mode restrictions still apply from `mode` field
-3. Edit **only** repositories marked `mode: write` with matching prefix.
-4. Treat repositories marked `mode: read` with matching prefix as strictly read-only (never modify files there).
-5. Treat repositories marked `mode: sleep` with matching prefix as strictly inactive: do not implement, do not research inside them, do not include them in active scope.
-6. If mode and path prefix ever disagree, treat the repository as restricted (read-only at minimum) and do not perform write operations until clarified.
-7. For cross-repo changes, check `🧩 contracts/` and `🧾 docs/` first.
-8. Coordinate changes across all `write` repositories.
-9. Do not execute git commits.
-10. Always wrap paths in quotes to handle spaces correctly.
+   - clean repo folder in `localpath` (no mode/emoji prefix)
+2. Edit **only** repositories marked `mode: write`.
+3. Treat repositories marked `mode: read` as strictly read-only (never modify files there).
+4. Treat repositories marked `mode: sleep` as strictly inactive: do not implement, do not research inside them, do not include them in active scope.
+5. For cross-repo changes, check `🧩 contracts/` and `🧾 docs/` first.
+6. Coordinate changes across all `write` repositories.
+7. Do not execute git commits.
+8. Always wrap paths in quotes to handle spaces correctly.
 
 ## Ordering and Shared Folders
 
@@ -1063,7 +1005,7 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 
 ## Skills Loading
 
-1. Enforce `mcrepo.yaml` mode and path-style gates first.
+1. Enforce `mcrepo.yaml` mode gates first.
 2. Load active skills from `🧠 skills/`:
    - If `🧠 skills/skills.yaml` exists, use its enable/disable lists.
    - If no config exists, treat each `🧠 skills/<id>/skill.md` as active by default.
@@ -1206,7 +1148,7 @@ Load sub-repo local skills only when that sub-repo is in write/change scope.
 - A task edits, generates, or fixes code/config/docs in a managed sub-repository.
 
 ## Procedure
-1. Read `mcrepo.yaml` and enforce mode/path-style gates first.
+1. Read `mcrepo.yaml` and enforce mode gates first.
 2. Identify sub-repositories in write/change scope.
 3. For each write-scope repo, discover local skills in this order:
    - `.opencode/skills/*/SKILL.md`
@@ -1483,16 +1425,11 @@ materialize_from_repos_file() {
 cmd_init() {
   local org_arg=""
   local no_shell_install=0
-  local no_emojis=0
-  local previous_path_style=""
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --no-shell-install)
         no_shell_install=1
-        ;;
-      --no-emojis)
-        no_emojis=1
         ;;
       --)
         shift
@@ -1503,7 +1440,7 @@ cmd_init() {
         ;;
       *)
         if [ -n "$org_arg" ]; then
-          die "Usage: ./mcrepo.sh init [organization] [--no-shell-install] [--no-emojis]"
+          die "Usage: ./mcrepo.sh init [organization] [--no-shell-install]"
         fi
         org_arg="$1"
         ;;
@@ -1511,7 +1448,7 @@ cmd_init() {
     shift
   done
 
-  [ "$#" -eq 0 ] || die "Usage: ./mcrepo.sh init [organization] [--no-shell-install] [--no-emojis]"
+  [ "$#" -eq 0 ] || die "Usage: ./mcrepo.sh init [organization] [--no-shell-install]"
 
   case "${MCREPO_NO_SHELL_INSTALL:-0}" in
     1|true|TRUE|yes|YES)
@@ -1523,7 +1460,6 @@ cmd_init() {
   ensure_base_files
   ensure_vscode_workspace_settings
   load_repos
-  previous_path_style="$PATH_STYLE"
 
   if [ -n "$org_arg" ]; then
     ORGANIZATION="$org_arg"
@@ -1531,16 +1467,6 @@ cmd_init() {
 
   if [ -n "$ORGANIZATION" ]; then
     sync_organization_repos "$ORGANIZATION"
-  fi
-
-  PATH_STYLE="clean"
-
-  if [ "$no_emojis" -eq 1 ]; then
-    log "Note: --no-emojis is now the default behavior (clean repo paths)."
-  fi
-
-  if [ "$previous_path_style" = "emoji" ]; then
-    log "Migrating repository folder names from emoji-prefixed paths to clean paths."
   fi
 
   save_repos
@@ -1705,6 +1631,7 @@ set_mode_command() {
   if [ "$target_mode" = "sleep" ] || [ "$target_mode" = "off" ]; then
     mkdir -p "$repo_dir"
     clear_directory_contents "$repo_dir"
+    write_sleep_placeholder_files "$repo_dir"
     if [ "$force_sleep" -eq 1 ]; then
       log "Put repo into sleep mode and force-cleared local contents: $repo_dir"
     else

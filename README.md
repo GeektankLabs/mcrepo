@@ -48,7 +48,9 @@ mcrepo sleep <repo-name>
 mcrepo status
 ```
 
-By default, repository folder names stay clean (no emoji prefix in directory names). Mode visibility is still tracked in `mcrepo.yaml` and can be decorated in the editor.
+Repository folder names are always clean (no mode or emoji prefix in directory names). Mode visibility is tracked in `mcrepo.yaml` and can be decorated in the editor.
+
+When a repo is set to `sleep`, mcrepo clears the local checkout and leaves two placeholders in that folder: `.gitignore` and `.mcrepo-sleep`. Switching back to `read` or `write` checks out the repository again.
 
 ## Branch Coordination
 
@@ -70,8 +72,10 @@ This keeps feature work aligned and makes later per-repo commits and pull reques
 ## VS Code Workflow
 
 - Keep the meta-context root open in one VS Code window to see all repositories and shared coordination folders.
+- `🗂` is the simplified mcrepo context logo used for MC-Repo actions in UI labels.
 - During `./mcrepo.sh init`, mcrepo ensures `.vscode/settings.json` exists with SCM multi-repository defaults (`alwaysShowRepositories`, `selectionMode=multi`, `autoRepositoryDetection=subFolders`, `repositoryScanMaxDepth=2`). Existing settings files are kept unchanged.
 - After `init`, mcrepo attempts to trigger a VS Code window reload via the `code` CLI; if that is not possible, it prints a hint to reload/restart VS Code manually.
+- In the VS Code Explorer context menu (sub-repo folder right-click), the extension shows MC-Repo mode actions as `🗂 ✏️ Set Write`, `🗂 👀 Set Read`, and `🗂 💤 Set Sleep`.
 - If a write repository has changes, open it in a dedicated VS Code window:
 
 ```bash
@@ -88,7 +92,7 @@ mcrepo open <repo-name>
 - `🧾 docs/`: architecture, integration notes, and generated overviews
 - `🧪 tests/`: integration test setup and shared test assets
 - `🧠 skills/`: company and project specific skills (`skill.md`) with optional colocated helper scripts
-- `mcrepo.yaml`: source of truth for repos, modes, descriptions, branch and path style
+- `mcrepo.yaml`: source of truth for repos, modes, descriptions, and branch
 
 Design ordering principle:
 
@@ -189,13 +193,12 @@ You can keep component repositories public/open-source while keeping the `mcrepo
 ./mcrepo.sh init --no-shell-install
 ```
 
-- `init` always uses clean repo folder names and migrates older emoji-prefixed repo folders automatically:
+- `init` always uses clean repo folder names:
 
 ```bash
 ./mcrepo.sh init
 ```
 
-- `--no-emojis` remains available as a compatibility alias and has the same behavior as default init.
 
 ## Versioning and Self-Update
 

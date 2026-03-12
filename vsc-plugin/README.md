@@ -17,11 +17,11 @@ The extension reads `mcrepo.yaml` and updates decorations when the file changes.
 
 On a top-level sub-repo folder in Explorer, right-click and use:
 
-- `mcrepo: Set Write Mode`
-- `mcrepo: Set Read Mode`
-- `mcrepo: Set Sleep Mode`
+- `🗂 ✏️ Set Write`
+- `🗂 👀 Set Read`
+- `🗂 💤 Set Sleep`
 
-`Set Sleep Mode` asks for confirmation.
+`Set Sleep` asks for confirmation.
 
 ## Local development
 
