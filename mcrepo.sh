@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.16"
+MCREPO_VERSION="0.2.17"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -744,7 +744,19 @@ clone_repo_if_needed() {
   fi
 
   log "Cloning $repo_dir..."
-  git clone "$repo_url" "$repo_dir"
+  if git clone "$repo_url" "$repo_dir"; then
+    return 0
+  fi
+
+  if [ -d "$repo_dir" ]; then
+    warn "Initial clone failed for '$repo_dir'. Cleaning partial contents and retrying once."
+    clear_directory_contents "$repo_dir"
+    if git clone "$repo_url" "$repo_dir"; then
+      return 0
+    fi
+  fi
+
+  return 1
 }
 
 refresh_generated_files() {
@@ -1258,7 +1270,7 @@ sync_vscode_git_ignored_repositories() {
     return 0
   fi
 
-  if ! python3 - "$vscode_settings_file" "${sleep_repos[@]}" <<'PY'
+  if ! python3 - "$vscode_settings_file" "${sleep_repos[@]-}" <<'PY'
 import json
 import sys
 from pathlib import Path
