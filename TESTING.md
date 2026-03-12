@@ -46,6 +46,7 @@ rm -rf "$tmp"
 - Mode switches keep clean repo folder names (no mode-prefix renames).
 - `sleep --force` clears local repo contents and leaves `.gitignore` plus `.mcrepo-sleep` placeholder files.
 - `sleep --wakeall` restores sleeping repos to `read` mode.
+- Sleep/wake mode changes update `.vscode/settings.json` -> `git.ignoredRepositories` for current sleeping repos.
 - `🧠 skills/` is generated with a default skill pack and template.
 - `.opencode/skills/` is generated as mirror for OpenCode discovery.
 - `mcrepo skill list` shows skill states.

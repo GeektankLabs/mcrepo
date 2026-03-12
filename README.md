@@ -74,6 +74,7 @@ This keeps feature work aligned and makes later per-repo commits and pull reques
 - Keep the meta-context root open in one VS Code window to see all repositories and shared coordination folders.
 - `🗂` is the simplified mcrepo context logo used for MC-Repo actions in UI labels.
 - During `./mcrepo.sh init`, mcrepo ensures `.vscode/settings.json` exists with SCM multi-repository defaults (`alwaysShowRepositories`, `selectionMode=multi`, `autoRepositoryDetection=subFolders`, `repositoryScanMaxDepth=2`). Existing settings files are kept unchanged.
+- mcrepo maintains `git.ignoredRepositories` in `.vscode/settings.json` for repos currently in `sleep` mode to reduce stale SCM detection; existing user entries are preserved.
 - After `init`, mcrepo attempts to trigger a VS Code window reload via the `code` CLI; if that is not possible, it prints a hint to reload/restart VS Code manually.
 - In the VS Code Explorer context menu (sub-repo folder right-click), the extension shows MC-Repo mode actions as `🗂 ✏️ Set Write`, `🗂 👀 Set Read`, and `🗂 💤 Set Sleep`.
 - If a write repository has changes, open it in a dedicated VS Code window:

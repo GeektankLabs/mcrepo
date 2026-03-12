@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.15"
+MCREPO_VERSION="0.2.16"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -1238,6 +1238,78 @@ maybe_reload_vscode_window() {
   log "If VS Code does not reflect SCM settings yet, reload the window (Cmd/Ctrl+Shift+P -> Reload Window) or restart VS Code."
 }
 
+sync_vscode_git_ignored_repositories() {
+  local vscode_dir=".vscode"
+  local vscode_settings_file="$vscode_dir/settings.json"
+  local -a sleep_repos=()
+  local i
+
+  for i in "${!REPO_NAMES[@]}"; do
+    if [ "${REPO_MODES[$i]}" = "sleep" ] || [ "${REPO_MODES[$i]}" = "off" ]; then
+      sleep_repos+=("${REPO_NAMES[$i]}")
+    fi
+  done
+
+  mkdir -p "$vscode_dir"
+  [ -f "$vscode_settings_file" ] || printf '{}\n' >"$vscode_settings_file"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 not found; could not sync VS Code git.ignoredRepositories for sleeping repos."
+    return 0
+  fi
+
+  if ! python3 - "$vscode_settings_file" "${sleep_repos[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+settings_path = Path(sys.argv[1])
+current_sleep = [item for item in sys.argv[2:] if item]
+managed_key = "mcrepo.sleepRepositories"
+
+try:
+    raw = settings_path.read_text(encoding="utf-8")
+except FileNotFoundError:
+    raw = "{}"
+
+try:
+    data = json.loads(raw) if raw.strip() else {}
+except json.JSONDecodeError:
+    data = {}
+
+if not isinstance(data, dict):
+    data = {}
+
+previous_managed = data.get(managed_key)
+if not isinstance(previous_managed, list):
+    previous_managed = []
+previous_managed = [item for item in previous_managed if isinstance(item, str)]
+
+existing_ignored = data.get("git.ignoredRepositories")
+if not isinstance(existing_ignored, list):
+    existing_ignored = []
+existing_ignored = [item for item in existing_ignored if isinstance(item, str)]
+
+base_ignored = [item for item in existing_ignored if item not in previous_managed]
+
+merged = []
+for item in base_ignored + current_sleep:
+    if item not in merged:
+        merged.append(item)
+
+data["git.ignoredRepositories"] = merged
+data[managed_key] = current_sleep
+
+settings_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+PY
+  then
+    warn "Could not sync VS Code git.ignoredRepositories for sleeping repos."
+    return 0
+  fi
+
+  log "Synced VS Code git.ignoredRepositories for sleeping repos."
+}
+
 directory_is_empty() {
   local dir="$1"
   local entries=()
@@ -1472,6 +1544,7 @@ cmd_init() {
   save_repos
   materialize_from_repos_file
   refresh_generated_files
+  sync_vscode_git_ignored_repositories
 
   if [ "$no_shell_install" -eq 1 ]; then
     log "Skipped shell command installation (--no-shell-install or MCREPO_NO_SHELL_INSTALL=1)."
@@ -1519,6 +1592,7 @@ cmd_add() {
     warn "Repo added, but clone failed for '$name'"
   fi
   refresh_generated_files
+  sync_vscode_git_ignored_repositories
 
   log "Added repo '$name' in mode '$mode'."
   print_description_update_prompt
@@ -1558,6 +1632,7 @@ cmd_remove() {
   remove_gitignore_repo_entry "$removed_name"
 
   refresh_generated_files
+  sync_vscode_git_ignored_repositories
   log "Removed repo '$removed_name' from management."
 }
 
@@ -1640,6 +1715,7 @@ set_mode_command() {
   fi
 
   refresh_generated_files
+  sync_vscode_git_ignored_repositories
   log "Set '${REPO_NAMES[$idx]}' to mode '$target_mode'."
 }
 
@@ -1673,6 +1749,7 @@ wake_all_sleeping_repos_to_read() {
   done
 
   refresh_generated_files
+  sync_vscode_git_ignored_repositories
   log "Woke $woke_count sleeping repos to mode 'read'."
 }
 
