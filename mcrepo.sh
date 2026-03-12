@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.12"
+MCREPO_VERSION="0.2.13"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -1257,6 +1257,45 @@ create_repos_template() {
   printf 'repos: []\n' >"$REPOS_FILE"
 }
 
+ensure_vscode_workspace_settings() {
+  local vscode_dir=".vscode"
+  local vscode_settings_file="$vscode_dir/settings.json"
+
+  if [ -f "$vscode_settings_file" ]; then
+    log "VS Code workspace settings already exist: $vscode_settings_file"
+    log "To reset to MC-Repo defaults, delete this file and run init again."
+    return 0
+  fi
+
+  if [ -e "$vscode_settings_file" ] && [ ! -f "$vscode_settings_file" ]; then
+    warn "Cannot write VS Code settings because path exists and is not a file: $vscode_settings_file"
+    return 0
+  fi
+
+  mkdir -p "$vscode_dir"
+  cat >"$vscode_settings_file" <<'EOF'
+{
+  "scm.alwaysShowRepositories": true,
+  "scm.repositories.selectionMode": "multi",
+  "git.autoRepositoryDetection": "subFolders",
+  "git.repositoryScanMaxDepth": 2
+}
+EOF
+
+  log "Created VS Code workspace settings: $vscode_settings_file"
+}
+
+maybe_reload_vscode_window() {
+  if command -v code >/dev/null 2>&1; then
+    if code --reuse-window --command workbench.action.reloadWindow >/dev/null 2>&1; then
+      log "Triggered VS Code window reload via CLI command."
+      return 0
+    fi
+  fi
+
+  log "If VS Code does not reflect SCM settings yet, reload the window (Cmd/Ctrl+Shift+P -> Reload Window) or restart VS Code."
+}
+
 directory_is_empty() {
   local dir="$1"
   local entries=()
@@ -1482,6 +1521,7 @@ cmd_init() {
 
   ensure_base_structure
   ensure_base_files
+  ensure_vscode_workspace_settings
   load_repos
   previous_path_style="$PATH_STYLE"
 
@@ -1512,6 +1552,8 @@ cmd_init() {
   else
     install_shell_command
   fi
+
+  maybe_reload_vscode_window
 
   log "Multi-Context repo initialized."
   if [ "${#REPO_NAMES[@]}" -eq 0 ]; then
