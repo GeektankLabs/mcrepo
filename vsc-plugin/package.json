@@ -2,7 +2,7 @@
   "name": "mcrepo-multi-context",
   "displayName": "mcrepo (Multi-Context)",
   "description": "Explorer mode badges for mcrepo multi-context repositories",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "publisher": "local",
   "engines": {
     "vscode": "^1.90.0"

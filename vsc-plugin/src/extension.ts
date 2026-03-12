@@ -25,9 +25,16 @@ type RepoMode = "write" | "read" | "sleep";
 type WorkspaceDecorations = {
   decorations: Map<string, FolderDecoration>;
   repoNameByPath: Map<string, string>;
+  repoSnapshot: Map<string, RepoSnapshotEntry>;
+};
+
+type RepoSnapshotEntry = {
+  mode: RepoMode;
+  localpath?: string;
 };
 
 const REPOS_FILE = "mcrepo.yaml";
+const VSCODE_SETTINGS_FILE = ".vscode/settings.json";
 const execFileAsync = promisify(execFile);
 
 const MODE_BADGES: Record<string, string> = {
@@ -43,6 +50,9 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
   private readonly output = vscode.window.createOutputChannel("MCRepo Decorations");
   private readonly decorationsByWorkspace = new Map<string, Map<string, FolderDecoration>>();
   private readonly repoNameByWorkspacePath = new Map<string, Map<string, string>>();
+  private readonly repoSnapshotByWorkspace = new Map<string, Map<string, RepoSnapshotEntry>>();
+  private readonly initializedWorkspaces = new Set<string>();
+  private readonly refreshPromptPending = new Set<string>();
   private readonly disposables: vscode.Disposable[] = [];
 
   constructor(private readonly context: vscode.ExtensionContext) {
@@ -94,10 +104,21 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
     for (const folder of folders) {
       const workspaceKey = folder.uri.toString();
       const before = this.decorationsByWorkspace.get(workspaceKey) ?? new Map<string, FolderDecoration>();
+      const beforeSnapshot = this.repoSnapshotByWorkspace.get(workspaceKey) ?? new Map<string, RepoSnapshotEntry>();
       const workspaceDecorations = await this.loadDecorationsForWorkspace(folder);
       this.decorationsByWorkspace.set(workspaceKey, workspaceDecorations.decorations);
       this.repoNameByWorkspacePath.set(workspaceKey, workspaceDecorations.repoNameByPath);
+      this.repoSnapshotByWorkspace.set(workspaceKey, workspaceDecorations.repoSnapshot);
       changedUris.push(...this.collectChangedUris(folder, before, workspaceDecorations.decorations));
+
+      if (this.initializedWorkspaces.has(workspaceKey)) {
+        const reasons = this.detectScmRefreshReasons(beforeSnapshot, workspaceDecorations.repoSnapshot);
+        if (reasons.length > 0) {
+          void this.promptScmRefresh(folder, reasons);
+        }
+      } else {
+        this.initializedWorkspaces.add(workspaceKey);
+      }
     }
 
     const validKeys = new Set(folders.map((folder) => folder.uri.toString()));
@@ -107,6 +128,9 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
       }
       this.decorationsByWorkspace.delete(workspaceKey);
       this.repoNameByWorkspacePath.delete(workspaceKey);
+      this.repoSnapshotByWorkspace.delete(workspaceKey);
+      this.initializedWorkspaces.delete(workspaceKey);
+      this.refreshPromptPending.delete(workspaceKey);
       const removedRoot = vscode.Uri.parse(workspaceKey);
       for (const relativePath of oldMap.keys()) {
         changedUris.push(vscode.Uri.joinPath(removedRoot, relativePath));
@@ -149,17 +173,23 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
   }
 
   private registerWorkspaceWatcher(workspaceFolder: vscode.WorkspaceFolder): void {
-    const pattern = new vscode.RelativePattern(workspaceFolder, REPOS_FILE);
-    const watcher = vscode.workspace.createFileSystemWatcher(pattern);
+    const reposPattern = new vscode.RelativePattern(workspaceFolder, REPOS_FILE);
+    const settingsPattern = new vscode.RelativePattern(workspaceFolder, VSCODE_SETTINGS_FILE);
+    const reposWatcher = vscode.workspace.createFileSystemWatcher(reposPattern);
+    const settingsWatcher = vscode.workspace.createFileSystemWatcher(settingsPattern);
     const reload = this.debounce(async () => {
       await this.reloadAll();
     }, 200);
 
-    watcher.onDidCreate(reload);
-    watcher.onDidChange(reload);
-    watcher.onDidDelete(reload);
+    reposWatcher.onDidCreate(reload);
+    reposWatcher.onDidChange(reload);
+    reposWatcher.onDidDelete(reload);
 
-    this.disposables.push(watcher);
+    settingsWatcher.onDidCreate(reload);
+    settingsWatcher.onDidChange(reload);
+    settingsWatcher.onDidDelete(reload);
+
+    this.disposables.push(reposWatcher, settingsWatcher);
   }
 
   private async switchRepoModeFromExplorer(uri: vscode.Uri | undefined, targetMode: RepoMode): Promise<void> {
@@ -241,13 +271,14 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
   private async loadDecorationsForWorkspace(workspaceFolder: vscode.WorkspaceFolder): Promise<WorkspaceDecorations> {
     const map = new Map<string, FolderDecoration>();
     const repoNameByPath = new Map<string, string>();
+    const repoSnapshot = new Map<string, RepoSnapshotEntry>();
 
     const reposUri = vscode.Uri.joinPath(workspaceFolder.uri, REPOS_FILE);
     let rawContent: Uint8Array;
     try {
       rawContent = await vscode.workspace.fs.readFile(reposUri);
     } catch {
-      return { decorations: map, repoNameByPath };
+      return { decorations: map, repoNameByPath, repoSnapshot };
     }
 
     const content = new TextDecoder("utf-8").decode(rawContent);
@@ -256,11 +287,11 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
       config = parse(content) as McrepoConfig;
     } catch (error) {
       this.output.appendLine(`Could not parse ${REPOS_FILE} in ${workspaceFolder.name}: ${String(error)}`);
-      return { decorations: map, repoNameByPath };
+      return { decorations: map, repoNameByPath, repoSnapshot };
     }
 
     if (!config || !Array.isArray(config.repos)) {
-      return { decorations: map, repoNameByPath };
+      return { decorations: map, repoNameByPath, repoSnapshot };
     }
 
     for (const repo of config.repos) {
@@ -275,6 +306,11 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
         continue;
       }
 
+      repoSnapshot.set(repoName, {
+        mode,
+        localpath: this.topLevelName(repo.localpath)
+      });
+
       const candidatePaths = this.resolveRepoFolderCandidates(repo);
       const tooltip = `mcrepo repo mode: ${mode}`;
       for (const relativePath of candidatePaths) {
@@ -285,7 +321,7 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
       }
     }
 
-    return { decorations: map, repoNameByPath };
+    return { decorations: map, repoNameByPath, repoSnapshot };
   }
 
   private resolveRepoFolderCandidates(repo: RepoEntry): string[] {
@@ -306,7 +342,7 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
     return [...candidates];
   }
 
-  private normalizeMode(mode: string | undefined): string {
+  private normalizeMode(mode: string | undefined): RepoMode {
     if (!mode) {
       return "read";
     }
@@ -314,9 +350,59 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
       return "sleep";
     }
     if (mode in MODE_BADGES) {
-      return mode;
+      return mode as RepoMode;
     }
     return "read";
+  }
+
+  private detectScmRefreshReasons(
+    before: Map<string, RepoSnapshotEntry>,
+    after: Map<string, RepoSnapshotEntry>
+  ): string[] {
+    const reasons: string[] = [];
+
+    for (const repoName of after.keys()) {
+      if (!before.has(repoName)) {
+        reasons.push(`new repo added: ${repoName}`);
+      }
+    }
+
+    for (const [repoName, next] of after.entries()) {
+      const prev = before.get(repoName);
+      if (!prev) {
+        continue;
+      }
+
+      const sleepToActive = prev.mode === "sleep" && next.mode !== "sleep";
+      const activeToSleep = prev.mode !== "sleep" && next.mode === "sleep";
+      if (sleepToActive || activeToSleep) {
+        reasons.push(`mode transition ${repoName}: ${prev.mode} -> ${next.mode}`);
+      }
+    }
+
+    return reasons;
+  }
+
+  private async promptScmRefresh(workspaceFolder: vscode.WorkspaceFolder, reasons: string[]): Promise<void> {
+    const workspaceKey = workspaceFolder.uri.toString();
+    if (this.refreshPromptPending.has(workspaceKey)) {
+      return;
+    }
+
+    this.refreshPromptPending.add(workspaceKey);
+    try {
+      this.output.appendLine(`SCM refresh recommended for ${workspaceFolder.name}: ${reasons.join("; ")}`);
+      const choice = await vscode.window.showInformationMessage(
+        `MCRepo detected repository topology changes. Reload window to refresh Source Control?`,
+        "Reload Now",
+        "Later"
+      );
+      if (choice === "Reload Now") {
+        await vscode.commands.executeCommand("workbench.action.reloadWindow");
+      }
+    } finally {
+      this.refreshPromptPending.delete(workspaceKey);
+    }
   }
 
   private topLevelName(localpath: string | undefined): string | undefined {

@@ -12,6 +12,7 @@ Adds Explorer decorations and right-click mode switches for mcrepo workspaces wi
 Support folders (`docs`, `tests`, `skills`, `contracts`) are intentionally not decorated to avoid duplicate icon display.
 
 The extension reads `mcrepo.yaml` and updates decorations when the file changes.
+It also watches for SCM-relevant topology changes (new repo added, or `sleep <-> read/write` transitions) and prompts to reload the window to refresh Source Control.
 
 ## Explorer context actions
 
@@ -44,19 +45,19 @@ npm run package
 
 This creates:
 
-- `vsc-plugin/mcrepo-multi-context-0.0.4.vsix`
+- `vsc-plugin/mcrepo-multi-context-0.0.5.vsix`
 
 ## Install the extension
 
 Option A (VS Code UI):
 
 - Command Palette -> `Extensions: Install from VSIX...`
-- Choose `vsc-plugin/mcrepo-multi-context-0.0.4.vsix`
+- Choose `vsc-plugin/mcrepo-multi-context-0.0.5.vsix`
 
 Option B (CLI):
 
 ```bash
-code --install-extension "vsc-plugin/mcrepo-multi-context-0.0.4.vsix"
+code --install-extension "vsc-plugin/mcrepo-multi-context-0.0.5.vsix"
 ```
 
 ## Rebuild after changes
@@ -67,7 +68,7 @@ If you change extension code, rebuild and reinstall:
 cd vsc-plugin
 npm run compile
 npm run package
-code --install-extension "mcrepo-multi-context-0.0.4.vsix" --force
+code --install-extension "mcrepo-multi-context-0.0.5.vsix" --force
 ```
 
 ## Command
