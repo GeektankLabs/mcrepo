@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.17"
+MCREPO_VERSION="0.2.18"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -995,6 +995,12 @@ create_agents_template() {
 This repository is a Multi-Context-Repo (MC-Repo) that groups multiple independent repositories for coordinated work.
 Always read the mcrepo.yaml first under "repos" you find the list of all repositories their "localpath", "mode" and "description".
 
+## Proactive Tooling
+
+- When RepoMapper MCP is available, use `repo_map` at the start of work on large or unfamiliar repositories to get a ranked structural overview before planning changes.
+- When RepoMapper MCP is available, use `search_identifiers` for symbol-aware code search so definitions and references stay easy to distinguish.
+- When browser automation is available, use Playwright proactively for browser-based validation, end-to-end checks, and UI verification on web-facing changes.
+
 # Agent Rules for this Multi-Context Repo
 
 **STRICT MODE ENFORCEMENT (MANDATORY)**
@@ -1110,9 +1116,10 @@ Ensure every change includes practical validation before handoff.
 
 ## Procedure
 1. Run relevant tests in affected repositories.
-2. Run fast syntax/lint checks where available.
-3. Capture failures with actionable next steps.
-4. Report what was run and what could not be run.
+2. For web-facing changes, run browser or end-to-end checks with Playwright when available.
+3. Run fast syntax/lint checks where available.
+4. Capture failures with actionable next steps.
+5. Report what was run and what could not be run.
 EOF
 
   mkdir -p "$SUPPORT_SKILLS_DIR/release-prep"

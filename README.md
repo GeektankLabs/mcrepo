@@ -95,6 +95,7 @@ mcrepo open <repo-name>
 - `🧪 tests/`: integration test setup and shared test assets
 - `🧠 skills/`: company and project specific skills (`skill.md`) with optional colocated helper scripts
 - `mcrepo.yaml`: source of truth for repos, modes, descriptions, and branch
+- `AGENTS.md`: generated workspace instructions that enforce mode gates and proactively point agents to RepoMapper MCP for codebase overview and Playwright for browser validation when available
 
 Design ordering principle:
 
@@ -159,7 +160,7 @@ Authoring notes:
 Default skill pack created during `init`:
 
 - `change-implementation`
-- `test-gate`
+- `test-gate` (includes Playwright guidance for web-facing validation when available)
 - `release-prep`
 - `no-secrets`
 - `subproject-skill-loader` (loads sub-repo local skills only for write/change scope)
