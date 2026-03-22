@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.19"
+MCREPO_VERSION="0.2.20"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -1249,12 +1249,28 @@ EOF
 
 MCREPO_VSIX_URL="https://raw.githubusercontent.com/GeektankLabs/mcrepo/main/vsc-plugin/mcrepo.vsix"
 
+_find_code_cli() {
+  if command -v code >/dev/null 2>&1; then
+    echo "code"
+    return 0
+  fi
+  # Common macOS fallback when 'code' is not on PATH
+  local mac_code="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+  if [ -x "$mac_code" ]; then
+    echo "$mac_code"
+    return 0
+  fi
+  return 1
+}
+
 install_vscode_extension() {
   local silent="${1:-0}"  # pass "1" to suppress non-error output during init
-  if ! command -v code >/dev/null 2>&1; then
+  local code_cmd
+  if ! code_cmd="$(_find_code_cli)"; then
     if [ "$silent" -eq 0 ]; then
       warn "VS Code CLI 'code' not found — skipping extension install."
-      warn "To install later, run:  mcrepo install-extension"
+      warn "Open VS Code and run: Shell Command: Install 'code' command in PATH"
+      warn "Then re-run: mcrepo install-extension"
     fi
     return 0
   fi
@@ -1274,11 +1290,11 @@ install_vscode_extension() {
   fi
 
   log "Installing mcrepo VS Code extension..."
-  if code --install-extension "$tmp_vsix" --force >/dev/null 2>&1; then
+  if "$code_cmd" --install-extension "$tmp_vsix" --force >/dev/null 2>&1; then
     log "VS Code extension installed successfully."
   else
     warn "Extension install failed. You can install it manually:"
-    warn "  code --install-extension $tmp_vsix"
+    warn "  \"$code_cmd\" --install-extension $tmp_vsix"
   fi
   rm -f "$tmp_vsix"
 }
