@@ -43,5 +43,6 @@ This file defines how AI agents should work in this repository, which develops `
 ## Versioning Rule
 
 - When an AI agent edits `mcrepo.sh`, it must also bump `MCREPO_VERSION` in the same change.
+- When an AI agent edits any file under `vsc-plugin/src/` or `vsc-plugin/package.json`, it must also bump the `version` field in `vsc-plugin/package.json` in the same change.
 - Use a patch-only bump: increment only the right-most version segment (`x.y.z` -> `x.y.(z+1)`).
 - The patch segment is unbounded (`...9` can become `...10`, `...11`, etc.).
