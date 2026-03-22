@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.3.3"
+MCREPO_VERSION="0.3.4"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -2921,6 +2921,9 @@ cmd_update() {
     warn "Updated script, but post-update migration hook reported an issue."
     warn "Run mcrepo again and inspect your workspace state before continuing."
   fi
+
+  # Also update the VS Code extension if the code CLI is available
+  install_vscode_extension 1
 }
 
 cmd_export_patch() {
