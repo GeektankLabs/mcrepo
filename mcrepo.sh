@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.3.1"
+MCREPO_VERSION="0.3.2"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -133,22 +133,22 @@ extract_version_from_file() {
 fetch_remote_script_to_file() {
   local target_file="$1"
   local source_url
-  local -a curl_extra_args=()
 
   source_url="$(update_source_url)"
   if ! command -v curl >/dev/null 2>&1; then
     return 1
   fi
 
-  # When doing an explicit update, bypass CDN/proxy caches to always get the latest version
+  # When doing an explicit update, append a timestamp query param to bust the CDN cache.
+  # Fastly (GitHub raw CDN) uses the full URL as cache key and ignores Cache-Control request headers.
   if is_truthy "${MCREPO_FETCH_NO_CACHE:-0}"; then
-    curl_extra_args+=(--header "Cache-Control: no-cache" --header "Pragma: no-cache")
+    source_url="${source_url}?_=$(date +%s)"
   fi
 
   if is_truthy "${MCREPO_UPDATE_CHECK_QUIET:-0}"; then
-    curl --fail --silent --location --max-time 4 "${curl_extra_args[@]+"${curl_extra_args[@]}"}" "$source_url" >"$target_file" 2>/dev/null
+    curl --fail --silent --location --max-time 4 "$source_url" >"$target_file" 2>/dev/null
   else
-    curl --fail --silent --show-error --location --max-time 4 "${curl_extra_args[@]+"${curl_extra_args[@]}"}" "$source_url" >"$target_file"
+    curl --fail --silent --show-error --location --max-time 4 "$source_url" >"$target_file"
   fi
 }
 
