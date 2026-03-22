@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.3.5"
+MCREPO_VERSION="0.3.6"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -1284,11 +1284,12 @@ install_vscode_extension() {
   local tmp_vsix
   tmp_vsix="$(mktemp /tmp/mcrepo-XXXXXX.vsix)"
 
+  local vsix_url="${MCREPO_VSIX_URL}?_=$(date +%s)"
   log "Downloading mcrepo VS Code extension..."
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$MCREPO_VSIX_URL" -o "$tmp_vsix" || { warn "Download failed."; rm -f "$tmp_vsix"; return 1; }
+    curl -fsSL "$vsix_url" -o "$tmp_vsix" || { warn "Download failed."; rm -f "$tmp_vsix"; return 1; }
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$tmp_vsix" "$MCREPO_VSIX_URL" || { warn "Download failed."; rm -f "$tmp_vsix"; return 1; }
+    wget -qO "$tmp_vsix" "$vsix_url" || { warn "Download failed."; rm -f "$tmp_vsix"; return 1; }
   else
     warn "Neither curl nor wget found — cannot download extension."
     rm -f "$tmp_vsix"
@@ -2923,7 +2924,7 @@ cmd_update() {
   fi
 
   # Also update the VS Code extension if the code CLI is available
-  install_vscode_extension 1
+  install_vscode_extension 0
 }
 
 cmd_export_patch() {
