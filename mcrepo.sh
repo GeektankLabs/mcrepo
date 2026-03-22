@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.2.18"
+MCREPO_VERSION="0.2.19"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -63,6 +63,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh skill [repo-name] <list|new|install|enable|disable|validate> [args] # Manage workspace or sub-repo skills (OpenCode-compatible)
                                               # Browse public skills: https://clawhub.ai/skills
   ./mcrepo.sh update                              # Update mcrepo.sh from canonical upstream when newer version is available
+  ./mcrepo.sh install-extension                   # Download and install the mcrepo VS Code extension from GitHub
   ./mcrepo.sh create-patch [--strategy intent|legacy] [topic] # Print a ready-to-submit GitHub issue body (with embedded patch) to stdout
   ./mcrepo.sh help                                # Print this help text
 EOF
@@ -799,7 +800,7 @@ _mcrepo_repo_names() {
 
 _mcrepo_complete() {
   local cur prev
-  local commands="init add remove write read sleep off list branch open status skill update export-patch create-patch help"
+  local commands="init add remove write read sleep off list branch open status skill update install-extension export-patch create-patch help"
   local skill_commands="list new install enable disable validate"
   local repo_commands="remove write read sleep off open"
 
@@ -893,7 +894,7 @@ _mcrepo_complete() {
   local subcmd
   local -a commands repos skill_commands
 
-  commands=(init add remove write read sleep off list branch open status skill update export-patch create-patch help)
+  commands=(init add remove write read sleep off list branch open status skill update install-extension export-patch create-patch help)
   skill_commands=(list new install enable disable validate)
   repos=("${(@f)$(_mcrepo_repo_names)}")
 
@@ -1246,6 +1247,46 @@ EOF
   log "Created VS Code workspace settings: $vscode_settings_file"
 }
 
+MCREPO_VSIX_URL="https://raw.githubusercontent.com/GeektankLabs/mcrepo/main/vsc-plugin/mcrepo.vsix"
+
+install_vscode_extension() {
+  local silent="${1:-0}"  # pass "1" to suppress non-error output during init
+  if ! command -v code >/dev/null 2>&1; then
+    if [ "$silent" -eq 0 ]; then
+      warn "VS Code CLI 'code' not found — skipping extension install."
+      warn "To install later, run:  mcrepo install-extension"
+    fi
+    return 0
+  fi
+
+  local tmp_vsix
+  tmp_vsix="$(mktemp /tmp/mcrepo-XXXXXX.vsix)"
+
+  log "Downloading mcrepo VS Code extension..."
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$MCREPO_VSIX_URL" -o "$tmp_vsix" || { warn "Download failed."; rm -f "$tmp_vsix"; return 1; }
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$tmp_vsix" "$MCREPO_VSIX_URL" || { warn "Download failed."; rm -f "$tmp_vsix"; return 1; }
+  else
+    warn "Neither curl nor wget found — cannot download extension."
+    rm -f "$tmp_vsix"
+    return 1
+  fi
+
+  log "Installing mcrepo VS Code extension..."
+  if code --install-extension "$tmp_vsix" --force >/dev/null 2>&1; then
+    log "VS Code extension installed successfully."
+  else
+    warn "Extension install failed. You can install it manually:"
+    warn "  code --install-extension $tmp_vsix"
+  fi
+  rm -f "$tmp_vsix"
+}
+
+cmd_install_extension() {
+  install_vscode_extension 0
+}
+
 maybe_reload_vscode_window() {
   if command -v code >/dev/null 2>&1; then
     if code --reuse-window --command workbench.action.reloadWindow >/dev/null 2>&1; then
@@ -1571,6 +1612,7 @@ cmd_init() {
     install_shell_command
   fi
 
+  install_vscode_extension 1
   maybe_reload_vscode_window
 
   log "Multi-Context repo initialized."
@@ -3058,6 +3100,7 @@ main() {
     status) cmd_status "$@" ;;
     skill) cmd_skill "$@" ;;
     update) cmd_update "$@" ;;
+    install-extension) cmd_install_extension "$@" ;;
     export-patch|create-patch) cmd_export_patch "$@" ;;
     --post-update-migrate) cmd_post_update_migrate "$@" ;;
     help|-h|--help) usage ;;

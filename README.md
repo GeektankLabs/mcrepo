@@ -17,6 +17,12 @@ Excute one-liner in empty repository:
 curl -fsSL https://raw.githubusercontent.com/GeektankLabs/mcrepo/main/mcrepo.sh -o ./mcrepo.sh && chmod +x ./mcrepo.sh && ./mcrepo.sh init
 ```
 
+`init` automatically downloads and installs the mcrepo VS Code extension when the `code` CLI is available. To install or reinstall the extension manually at any time:
+
+```bash
+mcrepo install-extension
+```
+
 After `init`, close terminal and open a new one:
 
 ```bash
