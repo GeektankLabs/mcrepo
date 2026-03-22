@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.3.0"
+MCREPO_VERSION="0.3.1"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -146,9 +146,9 @@ fetch_remote_script_to_file() {
   fi
 
   if is_truthy "${MCREPO_UPDATE_CHECK_QUIET:-0}"; then
-    curl --fail --silent --location --max-time 4 "${curl_extra_args[@]}" "$source_url" >"$target_file" 2>/dev/null
+    curl --fail --silent --location --max-time 4 "${curl_extra_args[@]+"${curl_extra_args[@]}"}" "$source_url" >"$target_file" 2>/dev/null
   else
-    curl --fail --silent --show-error --location --max-time 4 "${curl_extra_args[@]}" "$source_url" >"$target_file"
+    curl --fail --silent --show-error --location --max-time 4 "${curl_extra_args[@]+"${curl_extra_args[@]}"}" "$source_url" >"$target_file"
   fi
 }
 
