@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.3.2"
+MCREPO_VERSION="0.3.3"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -1298,6 +1298,7 @@ install_vscode_extension() {
   log "Installing mcrepo VS Code extension..."
   if "$code_cmd" --install-extension "$tmp_vsix" --force >/dev/null 2>&1; then
     log "VS Code extension installed successfully."
+    log "To activate: reload the VS Code window (Cmd+Shift+P → 'Reload Window')."
   else
     warn "Extension install failed. You can install it manually:"
     warn "  \"$code_cmd\" --install-extension $tmp_vsix"

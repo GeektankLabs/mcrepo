@@ -8,6 +8,7 @@ import { parse } from "yaml";
 type FolderDecoration = {
   badge: string;
   tooltip: string;
+  color: vscode.ThemeColor | undefined;
 };
 
 type RepoEntry = {
@@ -41,6 +42,14 @@ const MODE_BADGES: Record<string, string> = {
   write: "✏️",
   read: "👀",
   sleep: "💤"
+};
+
+// ThemeColor IDs that map to green (write), default (read), and gray (sleep)
+// across standard VS Code themes.
+const MODE_COLORS: Record<string, vscode.ThemeColor | undefined> = {
+  write: new vscode.ThemeColor("gitDecoration.addedResourceForeground"),
+  read: new vscode.ThemeColor("charts.blue"),
+  sleep: new vscode.ThemeColor("gitDecoration.ignoredResourceForeground")
 };
 
 class McrepoDecorationProvider implements vscode.FileDecorationProvider {
@@ -163,7 +172,7 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
       return undefined;
     }
 
-    return new vscode.FileDecoration(decoration.badge, decoration.tooltip);
+    return new vscode.FileDecoration(decoration.badge, decoration.tooltip, decoration.color);
   }
 
   dispose(): void {
@@ -313,8 +322,9 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
 
       const candidatePaths = this.resolveRepoFolderCandidates(repo);
       const tooltip = `mcrepo repo mode: ${mode}`;
+      const color = MODE_COLORS[mode];
       for (const relativePath of candidatePaths) {
-        map.set(relativePath, { badge: modeBadge, tooltip });
+        map.set(relativePath, { badge: modeBadge, tooltip, color });
         if (!repoNameByPath.has(relativePath)) {
           repoNameByPath.set(relativePath, repoName);
         }
@@ -441,7 +451,7 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
 
     for (const [relativePath, previous] of before.entries()) {
       const next = after.get(relativePath);
-      if (!next || next.badge !== previous.badge || next.tooltip !== previous.tooltip) {
+      if (!next || next.badge !== previous.badge || next.tooltip !== previous.tooltip || next.color !== previous.color) {
         changed.add(relativePath);
       }
     }

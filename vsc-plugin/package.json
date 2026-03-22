@@ -2,7 +2,7 @@
   "name": "mcrepo-multi-context",
   "displayName": "mcrepo (Multi-Context)",
   "description": "Explorer mode badges for mcrepo multi-context repositories",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "publisher": "local",
   "engines": {
     "vscode": "^1.90.0"
@@ -11,8 +11,7 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished",
-    "onCommand:mcrepoDecorations.refresh"
+    "onStartupFinished"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -55,15 +54,16 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
+    "compile": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --platform=node --target=node18",
+    "watch": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --platform=node --target=node18 --watch",
     "package": "vsce package"
   },
   "devDependencies": {
     "@types/node": "^20.14.12",
     "@types/vscode": "^1.90.0",
     "typescript": "^5.6.3",
-    "@vscode/vsce": "^3.6.2"
+    "@vscode/vsce": "^3.6.2",
+    "esbuild": "^0.24.0"
   },
   "dependencies": {
     "yaml": "^2.5.1"
