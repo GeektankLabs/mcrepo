@@ -52,6 +52,13 @@ const MODE_COLORS: Record<string, vscode.ThemeColor | undefined> = {
   sleep: new vscode.ThemeColor("gitDecoration.ignoredResourceForeground")
 };
 
+const WORKSPACE_SETTING_DEFAULTS: Record<string, unknown> = {
+  "scm.alwaysShowRepositories": true,
+  "scm.repositories.selectionMode": "multi",
+  "git.autoRepositoryDetection": "subFolders",
+  "git.repositoryScanMaxDepth": 2
+};
+
 class McrepoDecorationProvider implements vscode.FileDecorationProvider {
   private readonly onDidChangeEmitter = new vscode.EventEmitter<vscode.Uri[]>();
   readonly onDidChangeFileDecorations = this.onDidChangeEmitter.event;
@@ -478,7 +485,21 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
   }
 }
 
+async function ensureWorkspaceSettings(): Promise<void> {
+  for (const [key, defaultValue] of Object.entries(WORKSPACE_SETTING_DEFAULTS)) {
+    const dotIndex = key.indexOf(".");
+    const section = key.substring(0, dotIndex);
+    const leaf = key.substring(dotIndex + 1);
+    const config = vscode.workspace.getConfiguration(section);
+    const inspection = config.inspect(leaf);
+    if (inspection && inspection.workspaceValue === undefined) {
+      await config.update(leaf, defaultValue, vscode.ConfigurationTarget.Workspace);
+    }
+  }
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  await ensureWorkspaceSettings();
   const provider = new McrepoDecorationProvider(context);
   context.subscriptions.push(provider);
   await provider.reloadAll();
