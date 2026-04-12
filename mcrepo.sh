@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.3.6"
+MCREPO_VERSION="0.3.9"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -57,7 +57,11 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh sleep <repo-name> [--force]         # Switch a repository to sleep mode and clear its local folder contents
   ./mcrepo.sh sleep --wakeall                     # Wake all sleeping repositories and set them to read mode
   ./mcrepo.sh list                                # List configured repositories with mode, local clone state, and current branch
-  ./mcrepo.sh branch <branch-name> [--include-read] # Set global branch and switch clean target repos plus meta-context repo
+  ./mcrepo.sh branch <branch-name> [--include-read] # Switch/create global branch (interactive dirty-change handling)
+  ./mcrepo.sh branch --off                           # Turn off branch coordination (fallback — see merge/--delete)
+  ./mcrepo.sh branch --delete                        # Delete global branch, switch repos back to parent branches
+  ./mcrepo.sh merge                                  # Merge global branch into each repo's parent branch (local only)
+  ./mcrepo.sh merge --rebase                         # Sync: merge parent branch into current global branch (auto-stashes)
   ./mcrepo.sh open <repo-name>                    # Open a write-mode repository in VS Code
   ./mcrepo.sh status                              # Show list output plus clean/dirty working tree state
   ./mcrepo.sh skill [repo-name] <list|new|install|enable|disable|validate> [args] # Manage workspace or sub-repo skills (OpenCode-compatible)
@@ -442,11 +446,13 @@ parse_repos_tsv() {
         mode = v
       } else if (k == "description") {
         description = v
+      } else if (k == "parent") {
+        parent = v
       }
     }
     function emit() {
       if (in_item) {
-        print url "\t" name "\t" mode "\t" description
+        print url "\t" name "\t" mode "\t" description "\t" parent
       }
     }
     BEGIN {
@@ -455,6 +461,7 @@ parse_repos_tsv() {
       name = ""
       mode = ""
       description = ""
+      parent = ""
     }
     {
       line = $0
@@ -465,6 +472,7 @@ parse_repos_tsv() {
         name = ""
         mode = ""
         description = ""
+        parent = ""
         sub(/^[ \t]*-[ \t]*/, "", line)
         parse_kv(line)
         next
@@ -532,12 +540,45 @@ parse_branch() {
   ' "$REPOS_FILE"
 }
 
+# Parse the top-level 'meta-parent:' field from mcrepo.yaml.
+# Returns the comma-separated parent branch stack for the meta-context repo.
+parse_meta_parent() {
+  awk '
+    function trim(s) {
+      gsub(/^[ \t]+|[ \t]+$/, "", s)
+      return s
+    }
+    function unquote(s) {
+      s = trim(s)
+      if ((s ~ /^".*"$/) || (s ~ /^\047.*\047$/)) {
+        return substr(s, 2, length(s) - 2)
+      }
+      return s
+    }
+    {
+      line = $0
+      if (line ~ /^[ \t]*meta-parent:[ \t]*/) {
+        sub(/^[ \t]*meta-parent:[ \t]*/, "", line)
+        print unquote(line)
+        exit
+      }
+    }
+  ' "$REPOS_FILE"
+}
+
 REPO_URLS=()
 REPO_NAMES=()
 REPO_MODES=()
 REPO_DESCRIPTIONS=()
+# Per-repo parent branch stack (comma-separated, rightmost = immediate parent).
+# Pushed on 'mcrepo branch', popped on 'mcrepo merge'.
+# Example: "main,feature" means feature is immediate parent, main is grandparent.
+REPO_PARENTS=()
 ORGANIZATION=""
 GLOBAL_BRANCH=""
+# Parent branch stack for the meta-context repo itself (same comma-separated
+# format as REPO_PARENTS). Tracked via 'meta-parent:' in mcrepo.yaml.
+META_PARENT=""
 
 load_repos() {
   ensure_repos_file_exists
@@ -545,14 +586,17 @@ load_repos() {
   REPO_NAMES=()
   REPO_MODES=()
   REPO_DESCRIPTIONS=()
+  REPO_PARENTS=()
   ORGANIZATION=""
   GLOBAL_BRANCH=""
+  META_PARENT=""
 
   ORGANIZATION="$(parse_organization || true)"
   GLOBAL_BRANCH="$(parse_branch || true)"
+  META_PARENT="$(parse_meta_parent || true)"
 
-  local parsed_url parsed_name parsed_mode parsed_description
-  while IFS=$'\t' read -r parsed_url parsed_name parsed_mode parsed_description; do
+  local parsed_url parsed_name parsed_mode parsed_description parsed_parent
+  while IFS=$'\t' read -r parsed_url parsed_name parsed_mode parsed_description parsed_parent; do
     [ -n "$parsed_url" ] || continue
     if [ -z "$parsed_name" ]; then
       parsed_name="$(derive_name_from_url "$parsed_url")"
@@ -566,6 +610,7 @@ load_repos() {
     REPO_NAMES+=("$parsed_name")
     REPO_MODES+=("$parsed_mode")
     REPO_DESCRIPTIONS+=("$parsed_description")
+    REPO_PARENTS+=("${parsed_parent:-}")
   done < <(parse_repos_tsv)
 }
 
@@ -576,6 +621,9 @@ save_repos() {
   fi
   if [ -n "$GLOBAL_BRANCH" ]; then
     printf 'branch: %s\n' "$GLOBAL_BRANCH" >>"$REPOS_FILE"
+  fi
+  if [ -n "$META_PARENT" ]; then
+    printf 'meta-parent: %s\n' "$META_PARENT" >>"$REPOS_FILE"
   fi
 
   if [ "${#REPO_URLS[@]}" -eq 0 ]; then
@@ -590,6 +638,9 @@ save_repos() {
     printf '    name: %s\n' "${REPO_NAMES[$i]}" >>"$REPOS_FILE"
     printf '    mode: %s\n' "${REPO_MODES[$i]}" >>"$REPOS_FILE"
     printf '    description: "%s"\n' "$(yaml_escape_double_quoted "${REPO_DESCRIPTIONS[$i]}")" >>"$REPOS_FILE"
+    if [ -n "${REPO_PARENTS[$i]:-}" ]; then
+      printf '    parent: %s\n' "${REPO_PARENTS[$i]}" >>"$REPOS_FILE"
+    fi
     printf '    localpath: %s\n' "$(repo_local_path_for_mode "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")" >>"$REPOS_FILE"
   done
 }
@@ -654,6 +705,7 @@ sync_organization_repos() {
     REPO_NAMES+=("$repo_name")
     REPO_MODES+=("read")
     REPO_DESCRIPTIONS+=("")
+    REPO_PARENTS+=("")
     ensure_gitignore_repo_entry "$repo_name"
     imported=$((imported + 1))
   done <<<"$repo_rows"
@@ -806,7 +858,7 @@ _mcrepo_repo_names() {
 
 _mcrepo_complete() {
   local cur prev
-  local commands="init add remove write read sleep off list branch open status skill update install-extension export-patch create-patch help"
+  local commands="init add remove write read sleep off list branch merge open status skill update install-extension export-patch create-patch help"
   local skill_commands="list new install enable disable validate"
   local repo_commands="remove write read sleep off open"
 
@@ -825,7 +877,14 @@ _mcrepo_complete() {
     add)
       ;;
     branch)
-      COMPREPLY=( $(compgen -W "--include-read" -- "$cur") )
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        COMPREPLY=( $(compgen -W "--off --delete --include-read" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "--include-read" -- "$cur") )
+      fi
+      ;;
+    merge)
+      COMPREPLY=( $(compgen -W "--rebase" -- "$cur") )
       ;;
     skill)
       if [ "$COMP_CWORD" -eq 2 ]; then
@@ -900,7 +959,7 @@ _mcrepo_complete() {
   local subcmd
   local -a commands repos skill_commands
 
-  commands=(init add remove write read sleep off list branch open status skill update install-extension export-patch create-patch help)
+  commands=(init add remove write read sleep off list branch merge open status skill update install-extension export-patch create-patch help)
   skill_commands=(list new install enable disable validate)
   repos=("${(@f)$(_mcrepo_repo_names)}")
 
@@ -915,7 +974,14 @@ _mcrepo_complete() {
       ;;
     branch)
       if (( CURRENT == 3 )); then
+        compadd -- --off --delete --include-read
+      elif (( CURRENT == 4 )); then
         compadd -- --include-read
+      fi
+      ;;
+    merge)
+      if (( CURRENT == 3 )); then
+        compadd -- --rebase
       fi
       ;;
     skill)
@@ -965,10 +1031,12 @@ It provides workspace governance across repos, shared documentation, tests, and 
 4. Open a new shell once, then run commands as `mcrepo`
 5. Add a repository: `mcrepo add <git-url>`
 6. Set repo mode: `mcrepo write <repo>` or `mcrepo read <repo>` or `mcrepo sleep <repo>`
-7. Coordinate branch across clean target repos and meta-context repo: `mcrepo branch <branch-name>`
-8. Check state: `mcrepo status`
-9. Manage workspace skills: `mcrepo skill list`
-10. Install skills from URL: `mcrepo skill install <github-url|clawhub-url>`
+7. Coordinate branch across target repos and meta-context repo: `mcrepo branch <branch-name>` (turn off with `mcrepo branch --off`)
+8. After feature work, merge back: `mcrepo merge` (sync with parent first: `mcrepo merge --rebase`)
+9. To discard a branch instead: `mcrepo branch --delete`
+10. Check state: `mcrepo status`
+11. Manage workspace skills: `mcrepo skill list`
+12. Install skills from URL: `mcrepo skill install <github-url|clawhub-url>`
 
 ## Core Concepts
 
@@ -980,10 +1048,16 @@ It provides workspace governance across repos, shared documentation, tests, and 
   - `sleep`: currently inactive
 - Repository folders always use clean repo names (no mode-prefix or emoji-prefix renaming)
 - `mcrepo.sh` orchestrates repositories.
-- `mcrepo branch <name>` updates the global branch, aligns clean write repos (optionally read repos), then switches the meta-context repo.
+- `mcrepo branch <name>` updates the global branch, aligns write repos (optionally read repos), then switches the meta-context repo.
+- Branch switching distinguishes fork vs jump: existing branches are jumped to (no parent recorded), new branches are forked (parent recorded).
+- When uncommitted changes exist, mcrepo offers interactive options: abort, commit, carry (stash+pop with dry-run), or discard.
 - Branch switching is remote-first: if `origin/<name>` exists and local `<name>` does not, mcrepo creates a tracking local branch from origin.
-- Global branch switch aborts if uncommitted changes are present in target repos or the meta-context repo.
 - Switching a repo to `write` auto-aligns it to the global branch when configured.
+- `mcrepo branch --off` disables global branch coordination (fallback — prefer `merge` or `--delete`).
+- `mcrepo branch --delete` discards the global branch, switches repos back to parent branches, and deletes the branch locally.
+- Parent branches are recorded automatically when `mcrepo branch` forks a new branch. Each repo can have a different parent.
+- `mcrepo merge` merges the global branch into each write repo's parent branch (local only, no push). Performs a dry-run first.
+- `mcrepo merge --rebase` syncs the current branch with its parent by merging parent INTO the current branch. Auto-stashes uncommitted work.
 - `🧠 skills/` stores project and company specific agent skills.
 - Skills can include colocated helper scripts (for example `run.sh` or `check.sh`) next to `skill.md`.
 - ClawHub URL installs are scanned by default; `CRITICAL` blocks install and `HIGH` warns.
@@ -1022,6 +1096,18 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 6. Coordinate changes across all `write` repositories.
 7. Do not execute git commits.
 8. Always wrap paths in quotes to handle spaces correctly.
+
+## Branch Coordination and Merging
+
+- `mcrepo.yaml` tracks the active global `branch:` and per-repo `parent:` stacks.
+- `parent:` is a comma-separated stack (rightmost = immediate parent, e.g. `main,feature`).
+- `meta-parent:` tracks the meta-context repo's own parent branch stack.
+- Never modify `branch:`, `parent:`, or `meta-parent:` fields directly — use `mcrepo branch`, `mcrepo merge`, `mcrepo merge --rebase`, and `mcrepo branch --delete` commands.
+- `mcrepo branch <name>` distinguishes fork (new branch, records parent) from jump (existing branch, no parent change).
+- `mcrepo branch --delete` discards the global branch and reverts repos to their parent branches.
+- `mcrepo branch --off` is a fallback that turns off coordination without switching branches.
+- When `branch:` is empty, branch coordination is off and repos manage branches independently.
+- When running non-interactively (e.g., from scripts or agents), `mcrepo branch` aborts if uncommitted changes exist. Ensure clean working trees before switching branches.
 
 ## Ordering and Shared Folders
 
@@ -1556,6 +1642,26 @@ apply_global_branch_to_repo_if_configured() {
     return 0
   fi
 
+  # Record parent if this is a fork (branch doesn't exist yet in this repo)
+  local idx=-1
+  local i
+  for i in "${!REPO_NAMES[@]}"; do
+    if [ "${REPO_NAMES[$i]}" = "$repo_name" ]; then idx=$i; break; fi
+  done
+  if [ "$idx" -ge 0 ]; then
+    if ! git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$GLOBAL_BRANCH" && \
+       ! git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$GLOBAL_BRANCH"; then
+      local current_branch
+      current_branch="$(repo_branch "$repo_dir")"
+      if [ -n "${REPO_PARENTS[$idx]:-}" ]; then
+        REPO_PARENTS[$idx]="${REPO_PARENTS[$idx]},$current_branch"
+      else
+        REPO_PARENTS[$idx]="$current_branch"
+      fi
+      save_repos
+    fi
+  fi
+
   switch_repo_branch "$repo_dir" "$GLOBAL_BRANCH"
   log "Aligned '$repo_name' to global branch '$GLOBAL_BRANCH'."
 }
@@ -1668,6 +1774,7 @@ cmd_add() {
   REPO_NAMES+=("$name")
   REPO_MODES+=("$mode")
   REPO_DESCRIPTIONS+=("")
+  REPO_PARENTS+=("")
   save_repos
 
   ensure_gitignore_repo_entry "$name"
@@ -1697,11 +1804,13 @@ cmd_remove() {
   local old_names=("${REPO_NAMES[@]}")
   local old_modes=("${REPO_MODES[@]}")
   local old_descriptions=("${REPO_DESCRIPTIONS[@]}")
+  local old_parents=("${REPO_PARENTS[@]}")
 
   REPO_URLS=()
   REPO_NAMES=()
   REPO_MODES=()
   REPO_DESCRIPTIONS=()
+  REPO_PARENTS=()
 
   local i
   for i in "${!old_urls[@]}"; do
@@ -1710,6 +1819,7 @@ cmd_remove() {
       REPO_NAMES+=("${old_names[$i]}")
       REPO_MODES+=("${old_modes[$i]}")
       REPO_DESCRIPTIONS+=("${old_descriptions[$i]}")
+      REPO_PARENTS+=("${old_parents[$i]}")
     fi
   done
   save_repos
@@ -1862,7 +1972,12 @@ repo_dirty_state() {
 
 cmd_list() {
   load_repos
-  local i local_state branch repo_dir
+  if [ -n "$GLOBAL_BRANCH" ]; then
+    log "Global branch: $GLOBAL_BRANCH"
+  else
+    log "Global branch: (off - per-repo branches)"
+  fi
+  local i local_state branch repo_dir parent_info
   for i in "${!REPO_NAMES[@]}"; do
     repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
     if [ -d "$repo_dir/.git" ]; then
@@ -1871,13 +1986,31 @@ cmd_list() {
       local_state="no"
     fi
     branch="$(repo_branch "$repo_dir")"
-    printf '%-20s mode=%-5s local=%-3s branch=%s\n' "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}" "$local_state" "$branch"
+    parent_info=""
+    if [ -n "${REPO_PARENTS[$i]:-}" ]; then
+      parent_info=" parent=${REPO_PARENTS[$i]}"
+    fi
+    printf '%-20s mode=%-5s local=%-3s branch=%s%s\n' "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}" "$local_state" "$branch" "$parent_info"
   done
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    local meta_branch meta_parent_info
+    meta_branch="$(repo_branch ".")"
+    meta_parent_info=""
+    if [ -n "$META_PARENT" ]; then
+      meta_parent_info=" parent=$META_PARENT"
+    fi
+    printf '%-20s %-11s local=%-3s branch=%s%s\n' "(meta-context)" "" "yes" "$meta_branch" "$meta_parent_info"
+  fi
 }
 
 cmd_status() {
   load_repos
-  local i local_state branch dirty repo_dir
+  if [ -n "$GLOBAL_BRANCH" ]; then
+    log "Global branch: $GLOBAL_BRANCH"
+  else
+    log "Global branch: (off - per-repo branches)"
+  fi
+  local i local_state branch dirty repo_dir parent_info
   for i in "${!REPO_NAMES[@]}"; do
     repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
     if [ -d "$repo_dir/.git" ]; then
@@ -1887,8 +2020,22 @@ cmd_status() {
     fi
     branch="$(repo_branch "$repo_dir")"
     dirty="$(repo_dirty_state "$repo_dir")"
-    printf '%-20s mode=%-5s local=%-3s branch=%-20s state=%s\n' "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}" "$local_state" "$branch" "$dirty"
+    parent_info=""
+    if [ -n "${REPO_PARENTS[$i]:-}" ]; then
+      parent_info=" parent=${REPO_PARENTS[$i]}"
+    fi
+    printf '%-20s mode=%-5s local=%-3s branch=%-20s state=%s%s\n' "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}" "$local_state" "$branch" "$dirty" "$parent_info"
   done
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    local meta_branch meta_dirty meta_parent_info
+    meta_branch="$(repo_branch ".")"
+    meta_dirty="$(repo_dirty_state ".")"
+    meta_parent_info=""
+    if [ -n "$META_PARENT" ]; then
+      meta_parent_info=" parent=$META_PARENT"
+    fi
+    printf '%-20s %-11s local=%-3s branch=%-20s state=%s%s\n' "(meta-context)" "" "yes" "$meta_branch" "$meta_dirty" "$meta_parent_info"
+  fi
 }
 
 parse_skill_config_list() {
@@ -2784,6 +2931,42 @@ Install it in VS Code:
   log "Opened '$repo_name' in VS Code: $repo_dir"
 }
 
+# Detect the default branch of a repo when no parent is recorded in mcrepo.yaml.
+# Uses a 3-layer fallback: (1) local symbolic-ref for origin/HEAD (fast, no network),
+# (2) ls-remote query to origin (network, caches result via set-head),
+# (3) heuristic check for common branch names (main/master/develop/trunk).
+# Returns empty string if detection fails.
+detect_default_branch() {
+  local repo_dir="$1"
+  local branch
+
+  # Layer 1: Local symbolic ref (fast, no network)
+  branch=$(git -C "$repo_dir" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+  if [ -n "$branch" ]; then
+    printf '%s' "$branch"
+    return 0
+  fi
+
+  # Layer 2: Remote query (needs network)
+  branch=$(git -C "$repo_dir" ls-remote --symref origin HEAD 2>/dev/null | head -1 | sed 's|.*refs/heads/||; s|\t.*||')
+  if [ -n "$branch" ]; then
+    git -C "$repo_dir" remote set-head origin "$branch" 2>/dev/null
+    printf '%s' "$branch"
+    return 0
+  fi
+
+  # Layer 3: Heuristic fallback
+  local candidate
+  for candidate in main master develop trunk; do
+    if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+
+  printf ''
+}
+
 switch_repo_branch() {
   local repo_dir="$1"
   local target_branch="$2"
@@ -2821,13 +3004,62 @@ switch_repo_branch() {
   git -C "$repo_dir" checkout -b "$target_branch"
 }
 
+# Switch all target repos (and meta-context) to a branch. Handles two modes:
+#   Fork (new branch): confirms with user, records current branch as parent.
+#   Jump (existing branch): switches without recording parent.
+# If uncommitted changes exist, offers interactive options:
+#   [a]bort, [c]ommit, [r] carry (dry-run stash+pop), [d]iscard.
+# Also handles --off (disable coordination) and --delete (discard branch).
 cmd_branch() {
-  [ "$#" -ge 1 ] || die "Usage: ./mcrepo.sh branch <branch-name> [--include-read]"
+  [ "$#" -ge 1 ] || die "Usage: ./mcrepo.sh branch <branch-name|--off|--delete> [--include-read]"
   local branch_name="$1"
   shift
+
+  # Handle "branch --off" (and deprecated "branch off") — turn off global branch coordination
+  if [ "$branch_name" = "--off" ] || [ "$branch_name" = "off" ]; then
+    if [ "$branch_name" = "off" ]; then
+      warn "Deprecation: 'mcrepo branch off' is deprecated. Use 'mcrepo branch --off' instead."
+    fi
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --include-read) die "'--include-read' is not supported with 'branch --off'." ;;
+        *) die "Unknown branch option: $1" ;;
+      esac
+      shift
+    done
+    load_repos
+    if [ -z "$GLOBAL_BRANCH" ]; then
+      log "Global branch coordination is already off."
+      return 0
+    fi
+    GLOBAL_BRANCH=""
+    # Clear all parent stacks — branch history is no longer meaningful
+    # once coordination is off, since repos manage branches independently.
+    local i
+    for i in "${!REPO_PARENTS[@]}"; do
+      REPO_PARENTS[$i]=""
+    done
+    META_PARENT=""
+    save_repos
+    log "Global branch coordination turned off. Repos keep their current branches."
+    warn "Repos remain on their current branches without coordination."
+    warn "Cleaner alternatives: 'mcrepo merge' (integrate changes) or 'mcrepo branch --delete' (discard branch)."
+    return 0
+  fi
+
+  # Handle "branch --delete" — delete global branch, revert to parent branches
+  if [ "$branch_name" = "--delete" ]; then
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        *) die "Unknown option for branch --delete: $1" ;;
+      esac
+      shift
+    done
+    cmd_branch_delete
+    return 0
+  fi
+
   local include_read=0
-  local dirty_found=0
-  local -a dirty_repos=()
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -2839,43 +3071,1094 @@ cmd_branch() {
 
   load_repos
 
+  # --- Phase 1: Fetch and classify repos (fork vs jump) ---
   local i mode repo_dir
+  local -a target_indexes=()
+  local -a target_dirs=()
+  local -a target_is_fork=()
+  local -a fork_names=()
+  local -a jump_names=()
+  local meta_is_target=0
+  local meta_is_fork=0
+
   for i in "${!REPO_NAMES[@]}"; do
     mode="${REPO_MODES[$i]}"
     if [ "$mode" = "write" ] || { [ "$include_read" -eq 1 ] && [ "$mode" = "read" ]; }; then
       repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "$mode")"
-      if [ -d "$repo_dir/.git" ] && [ -n "$(git -C "$repo_dir" status --porcelain 2>/dev/null)" ]; then
-        dirty_found=1
-        dirty_repos+=("${REPO_NAMES[$i]} ($repo_dir)")
+      if [ -d "$repo_dir/.git" ]; then
+        # Fetch to ensure remote refs are current for fork-vs-jump detection
+        git -C "$repo_dir" fetch --all --prune 2>/dev/null || true
+
+        local is_fork=1
+        if git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$branch_name" || \
+           git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$branch_name"; then
+          is_fork=0
+        fi
+
+        target_indexes+=("$i")
+        target_dirs+=("$repo_dir")
+        target_is_fork+=("$is_fork")
+        if [ "$is_fork" -eq 1 ]; then
+          fork_names+=("${REPO_NAMES[$i]}")
+        else
+          jump_names+=("${REPO_NAMES[$i]}")
+        fi
       fi
     fi
   done
 
+  # Meta-context repo classification
   if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    if [ -n "$(git -C . status --porcelain 2>/dev/null)" ]; then
-      dirty_found=1
-      dirty_repos+=("meta-context repo (.)")
+    meta_is_target=1
+    git -C . fetch --all --prune 2>/dev/null || true
+    if git -C . show-ref --verify --quiet "refs/heads/$branch_name" || \
+       git -C . show-ref --verify --quiet "refs/remotes/origin/$branch_name"; then
+      meta_is_fork=0
+    else
+      meta_is_fork=1
+    fi
+    if [ "$meta_is_fork" -eq 1 ]; then
+      fork_names+=("(meta-context)")
+    else
+      jump_names+=("(meta-context)")
     fi
   fi
 
-  if [ "$dirty_found" -eq 1 ]; then
-    die "Uncommitted changes found in: ${dirty_repos[*]}. Commit, stash, or discard them and run branch again."
+  # --- Phase 2: Fork confirmation (interactive, only if at least one fork) ---
+  if [ "${#fork_names[@]}" -gt 0 ]; then
+    local current_display
+    if [ -n "$GLOBAL_BRANCH" ]; then
+      current_display="$GLOBAL_BRANCH"
+    else
+      current_display="$(repo_branch "." 2>/dev/null || echo "unknown")"
+    fi
+
+    log ""
+    log "Branch '$branch_name' would be NEW (fork) in: ${fork_names[*]}"
+    if [ "${#jump_names[@]}" -gt 0 ]; then
+      log "Branch '$branch_name' already exists (jump) in: ${jump_names[*]}"
+    fi
+    log "Parent branch for new forks: $current_display"
+    log ""
+
+    if [ -t 0 ] && [ -t 1 ]; then
+      printf 'Proceed? [Y/n] ' >&2
+      local confirm
+      IFS= read -r confirm
+      if [ -n "$confirm" ] && [ "$confirm" != "y" ] && [ "$confirm" != "Y" ] && [ "$confirm" != "yes" ]; then
+        log "Aborted."
+        return 0
+      fi
+    fi
   fi
 
-  GLOBAL_BRANCH="$branch_name"
-  save_repos
+  # --- Phase 3: Dirty-repo detection ---
+  local dirty_found=0
+  local -a dirty_repos=()
+  local -a dirty_repo_dirs=()
 
-  for i in "${!REPO_NAMES[@]}"; do
-    mode="${REPO_MODES[$i]}"
-    if [ "$mode" = "write" ] || { [ "$include_read" -eq 1 ] && [ "$mode" = "read" ]; }; then
-      repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "$mode")"
-      switch_repo_branch "$repo_dir" "$branch_name"
+  for idx in "${!target_indexes[@]}"; do
+    local ti="${target_indexes[$idx]}"
+    repo_dir="${target_dirs[$idx]}"
+    if [ -n "$(git -C "$repo_dir" status --porcelain 2>/dev/null)" ]; then
+      dirty_found=1
+      dirty_repos+=("${REPO_NAMES[$ti]} ($repo_dir)")
+      dirty_repo_dirs+=("$repo_dir")
     fi
   done
 
-  switch_repo_branch "." "$branch_name"
+  local meta_dirty=0
+  if [ "$meta_is_target" -eq 1 ]; then
+    if [ -n "$(git -C . status --porcelain 2>/dev/null)" ]; then
+      dirty_found=1
+      meta_dirty=1
+      dirty_repos+=("meta-context repo (.)")
+      dirty_repo_dirs+=(".")
+    fi
+  fi
+
+  # --- Phase 4: Interactive dirty handling ---
+  local dirty_action="abort"
+  if [ "$dirty_found" -eq 1 ]; then
+    log ""
+    log "Uncommitted changes in: ${dirty_repos[*]}"
+    log ""
+
+    if [ -t 0 ] && [ -t 1 ]; then
+      printf 'How would you like to handle uncommitted changes?\n' >&2
+      printf '  [a] Abort  — stop and handle manually\n' >&2
+      printf '  [c] Commit — auto-commit to current branch before switching\n' >&2
+      printf '  [r] Carry  — carry changes into the target branch (stash + pop)\n' >&2
+      printf '  [d] Discard — discard all uncommitted changes\n' >&2
+      printf '\n' >&2
+      printf 'Choice [a/c/r/d]: ' >&2
+      local choice
+      IFS= read -r choice
+      case "$choice" in
+        c|C) dirty_action="commit" ;;
+        r|R) dirty_action="carry" ;;
+        d|D) dirty_action="discard" ;;
+        *) dirty_action="abort" ;;
+      esac
+    fi
+
+    if [ "$dirty_action" = "abort" ]; then
+      die "Uncommitted changes found in: ${dirty_repos[*]}. Commit, stash, or discard them and run branch again."
+    fi
+
+    if [ "$dirty_action" = "commit" ]; then
+      log "Auto-committing changes before switching ..."
+      for ddir in "${dirty_repo_dirs[@]}"; do
+        if [ -n "$(git -C "$ddir" status --porcelain 2>/dev/null)" ]; then
+          git -C "$ddir" add -A
+          if ! git -C "$ddir" commit -m "WIP: auto-commit before switching to $branch_name"; then
+            die "Auto-commit failed in '$ddir'. Please commit manually."
+          fi
+          log "  Committed in $ddir"
+        fi
+      done
+    fi
+
+    if [ "$dirty_action" = "discard" ]; then
+      log "Discarding uncommitted changes ..."
+      for ddir in "${dirty_repo_dirs[@]}"; do
+        if [ -n "$(git -C "$ddir" status --porcelain 2>/dev/null)" ]; then
+          git -C "$ddir" checkout -- . 2>/dev/null || true
+          git -C "$ddir" clean -fd 2>/dev/null || true
+          log "  Discarded in $ddir"
+        fi
+      done
+    fi
+
+    if [ "$dirty_action" = "carry" ]; then
+      # Dry-run: verify stash carry would succeed on target branch BEFORE modifying anything
+      log "Checking if changes can be carried to '$branch_name' ..."
+      local carry_ok=1
+      local -a carry_fail_repos=()
+
+      for ddir in "${dirty_repo_dirs[@]}"; do
+        if [ -z "$(git -C "$ddir" status --porcelain 2>/dev/null)" ]; then
+          continue
+        fi
+
+        local ddir_name="$ddir"
+        if [ "$ddir" = "." ]; then
+          ddir_name="(meta-context)"
+        fi
+
+        # Create stash commit without modifying working tree (returns SHA)
+        local stash_sha
+        stash_sha="$(git -C "$ddir" stash create 2>/dev/null || true)"
+
+        if [ -n "$stash_sha" ]; then
+          # Determine effective target tree (the branch we're switching to)
+          local target_ref=""
+          if git -C "$ddir" show-ref --verify --quiet "refs/heads/$branch_name"; then
+            target_ref="$branch_name"
+          elif git -C "$ddir" show-ref --verify --quiet "refs/remotes/origin/$branch_name"; then
+            target_ref="origin/$branch_name"
+          fi
+
+          if [ -n "$target_ref" ]; then
+            # Test if tracked-change patch applies against target branch tree
+            local tmpindex
+            tmpindex="$(mktemp)"
+            GIT_INDEX_FILE="$tmpindex" git -C "$ddir" read-tree "$target_ref" 2>/dev/null || true
+            if ! git -C "$ddir" stash show -p "$stash_sha" 2>/dev/null | \
+                 GIT_INDEX_FILE="$tmpindex" git -C "$ddir" apply --check --cached 2>/dev/null; then
+              carry_ok=0
+              carry_fail_repos+=("$ddir_name")
+            fi
+            rm -f "$tmpindex"
+          fi
+          # If target_ref is empty, this is a fork (new branch from current HEAD).
+          # Stash pop on same tree content always works — no conflict possible.
+        fi
+
+        # Check untracked files: would they collide with files on the target branch?
+        if [ -n "$target_ref" ]; then
+          local untracked_file
+          while IFS= read -r untracked_file; do
+            [ -n "$untracked_file" ] || continue
+            if git -C "$ddir" ls-tree --name-only "$target_ref" -- "$untracked_file" 2>/dev/null | grep -q .; then
+              carry_ok=0
+              # Only add if not already in the fail list
+              local already_listed=0
+              local cr
+              for cr in "${carry_fail_repos[@]:-}"; do
+                if [ "$cr" = "$ddir_name" ]; then already_listed=1; break; fi
+              done
+              if [ "$already_listed" -eq 0 ]; then
+                carry_fail_repos+=("$ddir_name")
+              fi
+              break
+            fi
+          done < <(git -C "$ddir" ls-files --others --exclude-standard 2>/dev/null)
+        fi
+      done
+
+      if [ "$carry_ok" -eq 0 ]; then
+        log ""
+        log "Cannot carry changes to '$branch_name'. Conflicts would occur in:"
+        local cfr
+        for cfr in "${carry_fail_repos[@]}"; do
+          log "  - $cfr"
+        done
+        log ""
+        log "The changes are too different from the branch you want to switch to."
+        log "Please commit your changes to the current branch or discard them, then try again."
+        die "Carry aborted — no changes were made."
+      fi
+
+      # Dry-run passed — stash all dirty repos
+      log "Stashing changes ..."
+      for ddir in "${dirty_repo_dirs[@]}"; do
+        if [ -n "$(git -C "$ddir" status --porcelain 2>/dev/null)" ]; then
+          git -C "$ddir" stash push -m "mcrepo: carry to $branch_name" --include-untracked
+          log "  Stashed in $ddir"
+        fi
+      done
+    fi
+  fi
+
+  # --- Phase 5: Switch branches (with fork-vs-jump parent tracking) ---
+  # Safety trap: save partial progress if the script aborts mid-loop (set -e).
+  trap 'GLOBAL_BRANCH="$branch_name"; save_repos' EXIT
+
+  for idx in "${!target_indexes[@]}"; do
+    local ti="${target_indexes[$idx]}"
+    repo_dir="${target_dirs[$idx]}"
+
+    # Only record parent when actually forking a new branch (not jumping)
+    if [ "${target_is_fork[$idx]}" -eq 1 ]; then
+      local current_branch
+      current_branch="$(repo_branch "$repo_dir")"
+      # Push current branch onto this repo's parent stack before switching.
+      # Stack format: "grandparent,parent" — rightmost is immediate parent.
+      if [ -n "${REPO_PARENTS[$ti]:-}" ]; then
+        REPO_PARENTS[$ti]="${REPO_PARENTS[$ti]},$current_branch"
+      else
+        REPO_PARENTS[$ti]="$current_branch"
+      fi
+    fi
+
+    switch_repo_branch "$repo_dir" "$branch_name"
+  done
+
+  # Meta-context repo: fork-vs-jump parent tracking + switch
+  if [ "$meta_is_target" -eq 1 ]; then
+    if [ "$meta_is_fork" -eq 1 ]; then
+      local meta_current
+      meta_current="$(repo_branch ".")"
+      # Push meta-context repo's current branch onto its parent stack
+      if [ -n "$META_PARENT" ]; then
+        META_PARENT="${META_PARENT},$meta_current"
+      else
+        META_PARENT="$meta_current"
+      fi
+    fi
+    switch_repo_branch "." "$branch_name"
+  fi
+
+  # --- Phase 6: Pop stash if carry was chosen ---
+  if [ "$dirty_action" = "carry" ]; then
+    log "Restoring carried changes ..."
+    for ddir in "${dirty_repo_dirs[@]}"; do
+      # Check if we actually stashed something (stash list might be empty)
+      local stash_msg
+      stash_msg="$(git -C "$ddir" stash list -1 2>/dev/null | head -1)"
+      if echo "$stash_msg" | grep -q "mcrepo: carry to $branch_name"; then
+        if ! git -C "$ddir" stash pop 2>/dev/null; then
+          warn "Stash pop had issues in '$ddir'. Run 'git -C $ddir stash pop' manually or 'git -C $ddir stash drop' to discard."
+        else
+          log "  Restored in $ddir"
+        fi
+      fi
+    done
+  fi
+
+  GLOBAL_BRANCH="$branch_name"
+  trap - EXIT
+  save_repos
 
   log "Branch operation complete. Global branch set to '$GLOBAL_BRANCH'."
+}
+
+# Delete the current global branch in each write-repo and meta-context,
+# switch repos back to their parent branches, and pop the parent stack.
+# Counterpart to 'mcrepo merge' (which saves work). This discards the branch.
+cmd_branch_delete() {
+  load_repos
+
+  if [ -z "$GLOBAL_BRANCH" ]; then
+    die "No global branch set. Nothing to delete."
+  fi
+
+  local source_branch="$GLOBAL_BRANCH"
+
+  # Phase 1: Pre-flight — collect repos and check for dirty state
+  log ""
+  log "=== Branch --delete: removing '$source_branch' ==="
+  log ""
+
+  local i mode repo_dir repo_name
+  local -a del_indexes=()
+  local -a del_dirs=()
+  local -a del_parents=()
+  local -a dirty_repos=()
+  local -a preflight_errors=()
+
+  for i in "${!REPO_NAMES[@]}"; do
+    mode="${REPO_MODES[$i]}"
+    [ "$mode" = "write" ] || continue
+    repo_name="${REPO_NAMES[$i]}"
+    repo_dir="$(get_repo_dir "$repo_name" "$mode")"
+    [ -d "$repo_dir/.git" ] || continue
+
+    # Check if repo is on the global branch
+    local actual_branch
+    actual_branch="$(repo_branch "$repo_dir")"
+    if [ "$actual_branch" != "$source_branch" ]; then
+      # Not on the global branch — check if the branch even exists here
+      if ! git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$source_branch"; then
+        log "  '$repo_name': branch '$source_branch' does not exist. Skipping."
+        continue
+      fi
+    fi
+
+    # Determine parent branch (pop target)
+    local parent_branch=""
+    if [ -n "${REPO_PARENTS[$i]:-}" ]; then
+      parent_branch="${REPO_PARENTS[$i]##*,}"
+    fi
+    if [ -z "$parent_branch" ]; then
+      parent_branch="$(detect_default_branch "$repo_dir")"
+    fi
+    if [ -z "$parent_branch" ]; then
+      preflight_errors+=("'$repo_name': no parent branch recorded and cannot detect default branch.")
+      continue
+    fi
+
+    # Source == parent guard
+    if [ "$source_branch" = "$parent_branch" ]; then
+      log "  '$repo_name': already on parent branch '$parent_branch'. Skipping."
+      continue
+    fi
+
+    # Dirty check
+    if [ -n "$(git -C "$repo_dir" status --porcelain 2>/dev/null)" ]; then
+      dirty_repos+=("$repo_name ($repo_dir)")
+    fi
+
+    del_indexes+=("$i")
+    del_dirs+=("$repo_dir")
+    del_parents+=("$parent_branch")
+  done
+
+  # Meta-context repo pre-flight
+  local meta_parent_branch=""
+  local meta_included=0
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    local meta_actual
+    meta_actual="$(repo_branch ".")"
+    if [ -n "$META_PARENT" ]; then
+      meta_parent_branch="${META_PARENT##*,}"
+    fi
+    if [ -z "$meta_parent_branch" ]; then
+      meta_parent_branch="$(detect_default_branch ".")"
+    fi
+
+    if [ -n "$meta_parent_branch" ] && [ "$meta_parent_branch" != "$source_branch" ]; then
+      if [ "$meta_actual" = "$source_branch" ] || git -C . show-ref --verify --quiet "refs/heads/$source_branch"; then
+        if [ -n "$(git -C . status --porcelain 2>/dev/null)" ]; then
+          dirty_repos+=("meta-context repo (.)")
+        fi
+        meta_included=1
+      fi
+    fi
+  fi
+
+  if [ "${#dirty_repos[@]}" -gt 0 ]; then
+    die "Uncommitted changes found in: ${dirty_repos[*]}. Commit or discard changes first, or use 'mcrepo branch --off' to leave as-is."
+  fi
+
+  if [ "${#preflight_errors[@]}" -gt 0 ]; then
+    log "Pre-flight errors:"
+    local err
+    for err in "${preflight_errors[@]}"; do
+      log "  - $err"
+    done
+    die "Fix the above issues and try again."
+  fi
+
+  if [ "${#del_indexes[@]}" -eq 0 ] && [ "$meta_included" -eq 0 ]; then
+    log "No repos have branch '$source_branch' to delete."
+    return 0
+  fi
+
+  # Phase 2: Switch to parent and delete the feature branch
+  # Safety trap: save partial progress if the script aborts mid-loop.
+  trap 'save_repos' EXIT
+
+  log "Delete plan:"
+  local idx
+  for idx in "${!del_indexes[@]}"; do
+    printf '  %-20s delete %s, switch to %s\n' "${REPO_NAMES[${del_indexes[$idx]}]}" "$source_branch" "${del_parents[$idx]}"
+  done
+  if [ "$meta_included" -eq 1 ]; then
+    printf '  %-20s delete %s, switch to %s\n' "(meta-context)" "$source_branch" "$meta_parent_branch"
+  fi
+  log ""
+
+  for idx in "${!del_indexes[@]}"; do
+    local ri="${del_indexes[$idx]}"
+    repo_name="${REPO_NAMES[$ri]}"
+    repo_dir="${del_dirs[$idx]}"
+    local target="${del_parents[$idx]}"
+
+    log "Processing '$repo_name' ..."
+
+    # Ensure parent branch exists locally
+    if ! git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$target"; then
+      if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$target"; then
+        git -C "$repo_dir" branch --track "$target" "origin/$target" 2>/dev/null || true
+      else
+        warn "  Parent branch '$target' not found. Skipping."
+        continue
+      fi
+    fi
+
+    git -C "$repo_dir" checkout "$target"
+    # Safe delete first; if unmerged commits exist, ask before force-deleting
+    if ! git -C "$repo_dir" branch -d "$source_branch" 2>/dev/null; then
+      if [ -t 0 ] && [ -t 1 ]; then
+        warn "  '$repo_name': branch '$source_branch' has unmerged/unpushed commits."
+        printf '  Force-delete anyway? Unpushed commits will be lost. [y/N] ' >&2
+        local del_confirm
+        IFS= read -r del_confirm
+        if [ "$del_confirm" = "y" ] || [ "$del_confirm" = "Y" ]; then
+          git -C "$repo_dir" branch -D "$source_branch" 2>/dev/null || true
+        else
+          warn "  Kept branch '$source_branch' in '$repo_name'. Merge or push it first."
+        fi
+      else
+        warn "  '$repo_name': branch '$source_branch' has unmerged commits. Skipping deletion. Merge or push first."
+      fi
+    fi
+    log "  Switched to '$target'."
+
+    # Pop parent stack one level
+    local current_parent="${REPO_PARENTS[$ri]:-}"
+    if [[ "$current_parent" == *,* ]]; then
+      REPO_PARENTS[$ri]="${current_parent%,*}"
+    else
+      REPO_PARENTS[$ri]=""
+    fi
+  done
+
+  # Meta-context repo
+  if [ "$meta_included" -eq 1 ]; then
+    log "Processing '(meta-context)' ..."
+
+    if ! git -C . show-ref --verify --quiet "refs/heads/$meta_parent_branch"; then
+      if git -C . show-ref --verify --quiet "refs/remotes/origin/$meta_parent_branch"; then
+        git -C . branch --track "$meta_parent_branch" "origin/$meta_parent_branch" 2>/dev/null || true
+      fi
+    fi
+
+    git -C . checkout "$meta_parent_branch"
+    # Safe delete for meta-context
+    if ! git -C . branch -d "$source_branch" 2>/dev/null; then
+      if [ -t 0 ] && [ -t 1 ]; then
+        warn "  (meta-context): branch '$source_branch' has unmerged/unpushed commits."
+        printf '  Force-delete anyway? Unpushed commits will be lost. [y/N] ' >&2
+        local meta_del_confirm
+        IFS= read -r meta_del_confirm
+        if [ "$meta_del_confirm" = "y" ] || [ "$meta_del_confirm" = "Y" ]; then
+          git -C . branch -D "$source_branch" 2>/dev/null || true
+        else
+          warn "  Kept branch '$source_branch' in meta-context. Merge or push it first."
+        fi
+      else
+        warn "  (meta-context): branch '$source_branch' has unmerged commits. Skipping deletion."
+      fi
+    fi
+    log "  Switched to '$meta_parent_branch'."
+
+    # Pop META_PARENT one level
+    if [[ "$META_PARENT" == *,* ]]; then
+      META_PARENT="${META_PARENT%,*}"
+    else
+      META_PARENT=""
+    fi
+  fi
+
+  # Phase 3: Update GLOBAL_BRANCH
+  local first_target="${del_parents[0]:-}"
+  local all_same=1
+  for idx in "${!del_parents[@]}"; do
+    if [ "${del_parents[$idx]}" != "$first_target" ]; then
+      all_same=0
+      break
+    fi
+  done
+  if [ "$meta_included" -eq 1 ] && [ -n "$first_target" ] && [ "$meta_parent_branch" != "$first_target" ]; then
+    all_same=0
+  fi
+
+  if [ "$all_same" -eq 1 ] && [ -n "$first_target" ]; then
+    GLOBAL_BRANCH="$first_target"
+    log ""
+    log "Global branch updated to '$GLOBAL_BRANCH'."
+  else
+    GLOBAL_BRANCH=""
+    log ""
+    log "Repos reverted to different parent branches. Global branch coordination turned off."
+  fi
+
+  trap - EXIT
+  save_repos
+
+  log ""
+  log "Branch '$source_branch' deleted. Changes are local only."
+  if [ -n "$GLOBAL_BRANCH" ]; then
+    local has_more_parents=0
+    for i in "${!REPO_PARENTS[@]}"; do
+      if [ -n "${REPO_PARENTS[$i]:-}" ]; then
+        has_more_parents=1
+        break
+      fi
+    done
+    if [ -n "$META_PARENT" ]; then
+      has_more_parents=1
+    fi
+    if [ "$has_more_parents" -eq 1 ]; then
+      log "Hint: run 'mcrepo branch --delete' again to delete the next branch level."
+    fi
+  fi
+}
+
+# Merge the global branch into each write-repo's parent branch (local only, no push).
+# Dispatches to cmd_merge_rebase() when --rebase is given.
+#
+# Workflow: pre-flight → dry-run → execute → update parent stacks.
+# If dry-run detects conflicts, aborts and suggests 'merge --rebase'.
+# After merge, pops each repo's parent stack one level (nested branch support).
+cmd_merge() {
+  local do_rebase=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --rebase) do_rebase=1 ;;
+      *) die "Unknown merge option: $1" ;;
+    esac
+    shift
+  done
+
+  load_repos
+
+  if [ -z "$GLOBAL_BRANCH" ]; then
+    die "No global branch set. Use './mcrepo.sh branch <name>' first."
+  fi
+
+  local source_branch="$GLOBAL_BRANCH"
+
+  if [ "$do_rebase" -eq 1 ]; then
+    cmd_merge_rebase "$source_branch"
+    return $?
+  fi
+
+  # --- mcrepo merge: merge current branch INTO parent ---
+
+  # Phase 1: Pre-flight checks
+  log ""
+  log "=== Pre-flight checks ==="
+  log ""
+
+  local i mode repo_dir repo_name
+  local -a merge_indexes=()
+  local -a merge_dirs=()
+  local -a merge_parents=()
+  local -a preflight_errors=()
+  local -a dirty_repos=()
+
+  for i in "${!REPO_NAMES[@]}"; do
+    mode="${REPO_MODES[$i]}"
+    [ "$mode" = "write" ] || continue
+    repo_name="${REPO_NAMES[$i]}"
+    repo_dir="$(get_repo_dir "$repo_name" "$mode")"
+    [ -d "$repo_dir/.git" ] || continue
+
+    # Read immediate parent (last element of comma-separated stack)
+    local parent_branch=""
+    if [ -n "${REPO_PARENTS[$i]:-}" ]; then
+      parent_branch="${REPO_PARENTS[$i]##*,}"
+    fi
+
+    # Fallback: detect default branch
+    if [ -z "$parent_branch" ]; then
+      parent_branch="$(detect_default_branch "$repo_dir")"
+    fi
+
+    if [ -z "$parent_branch" ]; then
+      preflight_errors+=("'$repo_name': no parent branch recorded and cannot detect default branch.")
+      continue
+    fi
+
+    # Verify repo is on GLOBAL_BRANCH
+    local actual_branch
+    actual_branch="$(repo_branch "$repo_dir")"
+    if [ "$actual_branch" != "$source_branch" ]; then
+      preflight_errors+=("'$repo_name' is on branch '$actual_branch', expected '$source_branch'.")
+    fi
+
+    # Verify parent branch exists locally
+    if ! git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$parent_branch" && \
+       ! git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$parent_branch"; then
+      preflight_errors+=("'$repo_name': parent branch '$parent_branch' not found locally or on origin.")
+    fi
+
+    # Source == parent guard
+    if [ "$source_branch" = "$parent_branch" ]; then
+      preflight_errors+=("'$repo_name': source '$source_branch' is the same as parent '$parent_branch'.")
+      continue
+    fi
+
+    # Dirty check
+    if [ -n "$(git -C "$repo_dir" status --porcelain 2>/dev/null)" ]; then
+      dirty_repos+=("$repo_name ($repo_dir)")
+    fi
+
+    merge_indexes+=("$i")
+    merge_dirs+=("$repo_dir")
+    merge_parents+=("$parent_branch")
+  done
+
+  # Meta-context repo pre-flight
+  local meta_parent_branch=""
+  local meta_included=0
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [ -n "$META_PARENT" ]; then
+      meta_parent_branch="${META_PARENT##*,}"
+    fi
+    if [ -z "$meta_parent_branch" ]; then
+      meta_parent_branch="$(detect_default_branch ".")"
+    fi
+
+    if [ -n "$meta_parent_branch" ] && [ "$meta_parent_branch" != "$source_branch" ]; then
+      local meta_actual
+      meta_actual="$(repo_branch ".")"
+      if [ "$meta_actual" != "$source_branch" ]; then
+        preflight_errors+=("meta-context repo is on branch '$meta_actual', expected '$source_branch'.")
+      fi
+      if [ -n "$(git -C . status --porcelain 2>/dev/null)" ]; then
+        dirty_repos+=("meta-context repo (.)")
+      fi
+      meta_included=1
+    fi
+  fi
+
+  if [ "${#dirty_repos[@]}" -gt 0 ]; then
+    die "Uncommitted changes found in: ${dirty_repos[*]}. Commit or stash them first."
+  fi
+
+  if [ "${#preflight_errors[@]}" -gt 0 ]; then
+    log "Pre-flight errors:"
+    local err
+    for err in "${preflight_errors[@]}"; do
+      log "  - $err"
+    done
+    die "Fix the above issues and try again."
+  fi
+
+  if [ "${#merge_indexes[@]}" -eq 0 ] && [ "$meta_included" -eq 0 ]; then
+    die "No repos found to merge."
+  fi
+
+  # Phase 2: Dry-run merge verification
+  log ""
+  log "=== Dry-run merge verification ==="
+  log ""
+
+  log "Merge plan:"
+  local idx
+  for idx in "${!merge_indexes[@]}"; do
+    printf '  %-20s %s -> %s\n' "${REPO_NAMES[${merge_indexes[$idx]}]}" "$source_branch" "${merge_parents[$idx]}"
+  done
+  if [ "$meta_included" -eq 1 ]; then
+    printf '  %-20s %s -> %s\n' "(meta-context)" "$source_branch" "$meta_parent_branch"
+  fi
+  log ""
+
+  local merge_ok=1
+  local -a conflict_repos=()
+
+  for idx in "${!merge_indexes[@]}"; do
+    local ri="${merge_indexes[$idx]}"
+    repo_name="${REPO_NAMES[$ri]}"
+    repo_dir="${merge_dirs[$idx]}"
+    local target="${merge_parents[$idx]}"
+
+    log "Checking '$repo_name' ..."
+
+    # Ensure target branch exists locally
+    if ! git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$target"; then
+      if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$target"; then
+        git -C "$repo_dir" branch --track "$target" "origin/$target" 2>/dev/null || true
+      else
+        merge_ok=0
+        conflict_repos+=("$repo_name (target branch '$target' not found)")
+        continue
+      fi
+    fi
+
+    # Dry-run using git merge-tree (Git 2.38+)
+    if git merge-tree --write-tree 2>&1 | grep -q "unknown option" 2>/dev/null; then
+      # Fallback for older git
+      if ! git -C "$repo_dir" merge-tree "$(git -C "$repo_dir" merge-base "$target" "$source_branch")" "$target" "$source_branch" >/dev/null 2>&1; then
+        merge_ok=0
+        conflict_repos+=("$repo_name")
+      else
+        log "  OK"
+      fi
+    else
+      if git -C "$repo_dir" merge-tree --write-tree "$target" "$source_branch" >/dev/null 2>&1; then
+        log "  OK"
+      else
+        merge_ok=0
+        conflict_repos+=("$repo_name")
+      fi
+    fi
+  done
+
+  # Dry-run meta-context
+  if [ "$meta_included" -eq 1 ]; then
+    log "Checking '(meta-context)' ..."
+    if ! git -C . show-ref --verify --quiet "refs/heads/$meta_parent_branch"; then
+      if git -C . show-ref --verify --quiet "refs/remotes/origin/$meta_parent_branch"; then
+        git -C . branch --track "$meta_parent_branch" "origin/$meta_parent_branch" 2>/dev/null || true
+      fi
+    fi
+    if git -C . merge-tree --write-tree "$meta_parent_branch" "$source_branch" >/dev/null 2>&1; then
+      log "  OK"
+    else
+      merge_ok=0
+      conflict_repos+=("(meta-context)")
+    fi
+  fi
+
+  log ""
+
+  if [ "$merge_ok" -eq 0 ]; then
+    log "Merge blocked. Conflicts detected in:"
+    local cr
+    for cr in "${conflict_repos[@]}"; do
+      log "  - $cr"
+    done
+    die "Run 'mcrepo merge --rebase' to sync with parent branch and resolve conflicts first."
+  fi
+
+  log "All repos can merge cleanly."
+
+  # Phase 3: Execute merges
+  # Safety trap: save partial progress if the script aborts mid-loop.
+  trap 'save_repos' EXIT
+
+  log ""
+  log "=== Executing merges ==="
+  log ""
+
+  for idx in "${!merge_indexes[@]}"; do
+    local ri="${merge_indexes[$idx]}"
+    repo_name="${REPO_NAMES[$ri]}"
+    repo_dir="${merge_dirs[$idx]}"
+    local target="${merge_parents[$idx]}"
+
+    log "Merging in '$repo_name' ($source_branch -> $target) ..."
+    git -C "$repo_dir" checkout "$target"
+    if ! git -C "$repo_dir" merge --no-ff "$source_branch" -m "Merge branch '$source_branch' into $target"; then
+      die "Merge failed in '$repo_name'. Resolve conflicts manually."
+    fi
+    log "  Done."
+  done
+
+  # Merge meta-context
+  if [ "$meta_included" -eq 1 ]; then
+    log "Merging in '(meta-context)' ($source_branch -> $meta_parent_branch) ..."
+    git -C . checkout "$meta_parent_branch"
+    if ! git -C . merge --no-ff "$source_branch" -m "Merge branch '$source_branch' into $meta_parent_branch"; then
+      die "Merge failed in meta-context repo. Resolve conflicts manually."
+    fi
+    log "  Done."
+  fi
+
+  # Phase 4: Post-merge state update
+  # Pop each repo's parent stack one level. "main,feature" → "main", "main" → "".
+  for idx in "${!merge_indexes[@]}"; do
+    local ri="${merge_indexes[$idx]}"
+    local current_parent="${REPO_PARENTS[$ri]:-}"
+    if [[ "$current_parent" == *,* ]]; then
+      REPO_PARENTS[$ri]="${current_parent%,*}"
+    else
+      REPO_PARENTS[$ri]=""
+    fi
+  done
+
+  if [ "$meta_included" -eq 1 ]; then
+    if [[ "$META_PARENT" == *,* ]]; then
+      META_PARENT="${META_PARENT%,*}"
+    else
+      META_PARENT=""
+    fi
+  fi
+
+  # Determine new GLOBAL_BRANCH
+  local first_target="${merge_parents[0]:-}"
+  local all_same=1
+  for idx in "${!merge_parents[@]}"; do
+    if [ "${merge_parents[$idx]}" != "$first_target" ]; then
+      all_same=0
+      break
+    fi
+  done
+  if [ "$meta_included" -eq 1 ] && [ "$meta_parent_branch" != "$first_target" ]; then
+    all_same=0
+  fi
+
+  if [ "$all_same" -eq 1 ] && [ -n "$first_target" ]; then
+    GLOBAL_BRANCH="$first_target"
+    log ""
+    log "Global branch updated to '$GLOBAL_BRANCH'."
+  else
+    GLOBAL_BRANCH=""
+    log ""
+    log "Repos merged into different parent branches. Global branch coordination turned off."
+  fi
+
+  trap - EXIT
+  save_repos
+
+  log ""
+  log "Merge complete. Changes are local only — review and push when ready."
+  if [ -n "$GLOBAL_BRANCH" ]; then
+    local has_more_parents=0
+    for i in "${!REPO_PARENTS[@]}"; do
+      if [ -n "${REPO_PARENTS[$i]:-}" ]; then
+        has_more_parents=1
+        break
+      fi
+    done
+    if [ -n "$META_PARENT" ]; then
+      has_more_parents=1
+    fi
+    if [ "$has_more_parents" -eq 1 ]; then
+      log "Hint: run 'mcrepo merge' again to merge into the next parent level."
+    else
+      log "Hint: run 'mcrepo branch --off' to turn off branch coordination."
+    fi
+  fi
+}
+
+# Sync the current global branch with its parent by merging parent INTO current.
+# Per repo: fetch → stash dirty work (incl. untracked) → merge parent → pop stash.
+# Processes ALL repos even if some conflict, giving a complete summary at the end.
+# On merge conflict the stash is left untouched; on stash-pop conflict the stash
+# remains in the stack (user must 'git stash drop' after resolving).
+cmd_merge_rebase() {
+  local source_branch="$1"
+
+  log ""
+  log "=== Merge --rebase: syncing with parent branches ==="
+  log ""
+
+  # Phase 1: Pre-flight
+  local i mode repo_dir repo_name
+  local -a rebase_indexes=()
+  local -a rebase_dirs=()
+  local -a rebase_parents=()
+  local -a preflight_errors=()
+
+  for i in "${!REPO_NAMES[@]}"; do
+    mode="${REPO_MODES[$i]}"
+    [ "$mode" = "write" ] || continue
+    repo_name="${REPO_NAMES[$i]}"
+    repo_dir="$(get_repo_dir "$repo_name" "$mode")"
+    [ -d "$repo_dir/.git" ] || continue
+
+    local parent_branch=""
+    if [ -n "${REPO_PARENTS[$i]:-}" ]; then
+      parent_branch="${REPO_PARENTS[$i]##*,}"
+    fi
+    if [ -z "$parent_branch" ]; then
+      parent_branch="$(detect_default_branch "$repo_dir")"
+    fi
+    if [ -z "$parent_branch" ]; then
+      preflight_errors+=("'$repo_name': no parent branch recorded and cannot detect default branch.")
+      continue
+    fi
+
+    local actual_branch
+    actual_branch="$(repo_branch "$repo_dir")"
+    if [ "$actual_branch" != "$source_branch" ]; then
+      preflight_errors+=("'$repo_name' is on branch '$actual_branch', expected '$source_branch'.")
+    fi
+
+    if [ "$source_branch" = "$parent_branch" ]; then
+      continue  # nothing to rebase from
+    fi
+
+    if ! git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$parent_branch" && \
+       ! git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$parent_branch"; then
+      preflight_errors+=("'$repo_name': parent branch '$parent_branch' not found locally or on origin.")
+      continue
+    fi
+
+    rebase_indexes+=("$i")
+    rebase_dirs+=("$repo_dir")
+    rebase_parents+=("$parent_branch")
+  done
+
+  # Meta-context pre-flight
+  local meta_parent_branch=""
+  local meta_included=0
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [ -n "$META_PARENT" ]; then
+      meta_parent_branch="${META_PARENT##*,}"
+    fi
+    if [ -z "$meta_parent_branch" ]; then
+      meta_parent_branch="$(detect_default_branch ".")"
+    fi
+    if [ -n "$meta_parent_branch" ] && [ "$meta_parent_branch" != "$source_branch" ]; then
+      local meta_actual
+      meta_actual="$(repo_branch ".")"
+      if [ "$meta_actual" != "$source_branch" ]; then
+        preflight_errors+=("meta-context repo is on branch '$meta_actual', expected '$source_branch'.")
+      else
+        meta_included=1
+      fi
+    fi
+  fi
+
+  if [ "${#preflight_errors[@]}" -gt 0 ]; then
+    log "Pre-flight errors:"
+    local err
+    for err in "${preflight_errors[@]}"; do
+      log "  - $err"
+    done
+    die "Fix the above issues and try again."
+  fi
+
+  if [ "${#rebase_indexes[@]}" -eq 0 ] && [ "$meta_included" -eq 0 ]; then
+    log "All repos are already in sync with their parent branches."
+    return 0
+  fi
+
+  # Phase 2: Fetch + stash + merge + pop per repo
+  local -a clean_repos=()
+  local -a merge_conflict_repos=()
+  local -a stash_conflict_repos=()
+
+  for idx in "${!rebase_indexes[@]}"; do
+    local ri="${rebase_indexes[$idx]}"
+    repo_name="${REPO_NAMES[$ri]}"
+    repo_dir="${rebase_dirs[$idx]}"
+    local parent="${rebase_parents[$idx]}"
+
+    log "Syncing '$repo_name' ($parent -> $source_branch) ..."
+
+    # Fetch
+    if git -C "$repo_dir" remote get-url origin >/dev/null 2>&1; then
+      git -C "$repo_dir" fetch origin --prune 2>/dev/null || true
+    fi
+
+    # Stash if dirty
+    local did_stash=0
+    local dirty
+    dirty="$(git -C "$repo_dir" status --porcelain 2>/dev/null)"
+    if [ -n "$dirty" ]; then
+      git -C "$repo_dir" stash push -m "mcrepo: auto-stash before rebase" --include-untracked
+      did_stash=1
+    fi
+
+    # Merge parent INTO current
+    if ! git -C "$repo_dir" merge "$parent" -m "Merge branch '$parent' into $source_branch"; then
+      merge_conflict_repos+=("$repo_name")
+      if [ "$did_stash" -eq 1 ]; then
+        warn "  Merge conflicts. Resolve, commit, then run 'git -C $repo_dir stash pop' to restore your changes."
+      else
+        warn "  Merge conflicts. Resolve and commit."
+      fi
+      continue
+    fi
+
+    # Pop stash
+    if [ "$did_stash" -eq 1 ]; then
+      if ! git -C "$repo_dir" stash pop; then
+        stash_conflict_repos+=("$repo_name")
+        warn "  Stash pop conflicts. Resolve, then run 'git -C $repo_dir stash drop'."
+        continue
+      fi
+    fi
+
+    clean_repos+=("$repo_name")
+    log "  Done."
+  done
+
+  # Meta-context rebase
+  if [ "$meta_included" -eq 1 ]; then
+    log "Syncing '(meta-context)' ($meta_parent_branch -> $source_branch) ..."
+
+    if git -C . remote get-url origin >/dev/null 2>&1; then
+      git -C . fetch origin --prune 2>/dev/null || true
+    fi
+
+    local meta_did_stash=0
+    local meta_dirty
+    meta_dirty="$(git -C . status --porcelain 2>/dev/null)"
+    if [ -n "$meta_dirty" ]; then
+      git -C . stash push -m "mcrepo: auto-stash before rebase" --include-untracked
+      meta_did_stash=1
+    fi
+
+    if ! git -C . merge "$meta_parent_branch" -m "Merge branch '$meta_parent_branch' into $source_branch"; then
+      merge_conflict_repos+=("(meta-context)")
+      if [ "$meta_did_stash" -eq 1 ]; then
+        warn "  Merge conflicts. Resolve, commit, then run 'git stash pop' to restore your changes."
+      else
+        warn "  Merge conflicts. Resolve and commit."
+      fi
+    else
+      if [ "$meta_did_stash" -eq 1 ]; then
+        if ! git -C . stash pop; then
+          stash_conflict_repos+=("(meta-context)")
+          warn "  Stash pop conflicts. Resolve, then run 'git stash drop'."
+        else
+          clean_repos+=("(meta-context)")
+          log "  Done."
+        fi
+      else
+        clean_repos+=("(meta-context)")
+        log "  Done."
+      fi
+    fi
+  fi
+
+  # Phase 3: Summary
+  log ""
+  log "=== Rebase summary ==="
+  if [ "${#clean_repos[@]}" -gt 0 ]; then
+    log "Synced cleanly: ${clean_repos[*]}"
+  fi
+  if [ "${#merge_conflict_repos[@]}" -gt 0 ]; then
+    log "Merge conflicts (resolve, commit, then 'git stash pop' if stashed): ${merge_conflict_repos[*]}"
+  fi
+  if [ "${#stash_conflict_repos[@]}" -gt 0 ]; then
+    log "Stash conflicts (resolve, then 'git stash drop'): ${stash_conflict_repos[*]}"
+  fi
+  if [ "${#merge_conflict_repos[@]}" -eq 0 ] && [ "${#stash_conflict_repos[@]}" -eq 0 ]; then
+    log ""
+    log "All repos synced. You can now run 'mcrepo merge' to merge into parent branches."
+  fi
 }
 
 cmd_post_update_migrate() {
@@ -3124,6 +4407,7 @@ main() {
     off) set_mode_command sleep "$@" ;;
     list) cmd_list "$@" ;;
     branch) cmd_branch "$@" ;;
+    merge) cmd_merge "$@" ;;
     open) cmd_open "$@" ;;
     status) cmd_status "$@" ;;
     skill) cmd_skill "$@" ;;

@@ -68,12 +68,65 @@ mcrepo branch <feature-branch-name>
 
 Behavior details:
 
-- `mcrepo branch <name>` aborts if any target repo (write, and read when `--include-read`) or the meta-context repo has uncommitted changes.
+- When `<name>` already exists locally or on origin, mcrepo treats this as a **branch jump** — no parent is recorded. When `<name>` is new, it's a **fork** — the current branch is recorded as parent.
+- If forking, mcrepo shows a confirmation prompt listing which repos will fork vs jump.
+- If any target repo has uncommitted changes, mcrepo offers interactive options:
+  - **Abort** — stop and handle manually
+  - **Commit** — auto-commit to current branch before switching
+  - **Carry** — carry changes into the target branch (stash + pop, with dry-run safety check)
+  - **Discard** — discard all uncommitted changes
 - If `<name>` exists on `origin` but not locally, mcrepo creates a local tracking branch from `origin/<name>`.
-- If `<name>` does not exist locally or on `origin`, mcrepo creates a new local branch.
 - After updating target repos, mcrepo switches the meta-context repo to the same branch as the final step.
+- Each repo's previous branch is automatically recorded as its parent branch in `mcrepo.yaml`, enabling `mcrepo merge` later (only on fork, not on jump).
 
 This keeps feature work aligned and makes later per-repo commits and pull requests easier to coordinate.
+
+To turn off coordinated branching (last-resort fallback):
+
+```bash
+mcrepo branch --off
+```
+
+After `--off`, repos remain on their current branches without coordination. For a cleaner workflow, prefer `mcrepo merge` (integrate changes) or `mcrepo branch --delete` (discard branch).
+
+### Discarding a Branch
+
+To discard the current global branch and switch all repos back to their parent branches:
+
+```bash
+mcrepo branch --delete
+```
+
+This is the counterpart to `mcrepo merge`. While `merge` saves work into the parent, `--delete` discards the feature branch entirely:
+- Aborts if any repo has uncommitted changes
+- Switches each repo back to its immediate parent branch
+- Deletes the feature branch locally
+- Pops the parent stack one level (nested branches supported)
+
+### Merging Back
+
+After feature work is complete, merge the coordinated branch back into each repo's parent branch:
+
+```bash
+mcrepo merge
+```
+
+If the dry-run detects conflicts, sync with the parent branch first:
+
+```bash
+mcrepo merge --rebase
+```
+
+Behavior details:
+
+- `mcrepo merge` requires a global branch to be set.
+- Parent branches are recorded automatically by `mcrepo branch` — each repo can have a different parent.
+- The meta-context repo (`.`) participates in both branching and merging with its own parent tracking (`meta-parent:` in `mcrepo.yaml`).
+- `merge` performs a dry-run across ALL repos first. If any would conflict, no merges happen.
+- `merge --rebase` merges the parent INTO the current branch, auto-stashing uncommitted work (including untracked files).
+- Merges are local only (no push). Review and push per-repo when ready.
+- Nested branches are supported: `main → feature → sub-feature`. Each `merge` pops one level.
+- When no parent is recorded, mcrepo falls back to detecting the default branch (via `origin/HEAD`, remote query, or heuristic).
 
 ## VS Code Workflow
 
