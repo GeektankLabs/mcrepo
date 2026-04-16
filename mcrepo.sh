@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.3.9"
+MCREPO_VERSION="0.4.0"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -62,6 +62,10 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh branch --delete                        # Delete global branch, switch repos back to parent branches
   ./mcrepo.sh merge                                  # Merge global branch into each repo's parent branch (local only)
   ./mcrepo.sh merge --rebase                         # Sync: merge parent branch into current global branch (auto-stashes)
+  ./mcrepo.sh pull                                   # Fetch + fast-forward pull from origin for all active repos
+  ./mcrepo.sh pull --rebase                          # Auto-stash, pull, pop stash (handles dirty repos safely)
+  ./mcrepo.sh pull --reset                           # Discard local changes and reset to origin state (destructive!)
+  ./mcrepo.sh push [-m "message"]                    # Commit (if -m given) and push all write-mode repos to origin
   ./mcrepo.sh open <repo-name>                    # Open a write-mode repository in VS Code
   ./mcrepo.sh status                              # Show list output plus clean/dirty working tree state
   ./mcrepo.sh skill [repo-name] <list|new|install|enable|disable|validate> [args] # Manage workspace or sub-repo skills (OpenCode-compatible)
@@ -858,7 +862,7 @@ _mcrepo_repo_names() {
 
 _mcrepo_complete() {
   local cur prev
-  local commands="init add remove write read sleep off list branch merge open status skill update install-extension export-patch create-patch help"
+  local commands="init add remove write read sleep off list branch merge pull push open status skill update install-extension export-patch create-patch help"
   local skill_commands="list new install enable disable validate"
   local repo_commands="remove write read sleep off open"
 
@@ -885,6 +889,12 @@ _mcrepo_complete() {
       ;;
     merge)
       COMPREPLY=( $(compgen -W "--rebase" -- "$cur") )
+      ;;
+    pull)
+      COMPREPLY=( $(compgen -W "--rebase --reset" -- "$cur") )
+      ;;
+    push)
+      COMPREPLY=( $(compgen -W "-m" -- "$cur") )
       ;;
     skill)
       if [ "$COMP_CWORD" -eq 2 ]; then
@@ -959,7 +969,7 @@ _mcrepo_complete() {
   local subcmd
   local -a commands repos skill_commands
 
-  commands=(init add remove write read sleep off list branch merge open status skill update install-extension export-patch create-patch help)
+  commands=(init add remove write read sleep off list branch merge pull push open status skill update install-extension export-patch create-patch help)
   skill_commands=(list new install enable disable validate)
   repos=("${(@f)$(_mcrepo_repo_names)}")
 
@@ -982,6 +992,16 @@ _mcrepo_complete() {
     merge)
       if (( CURRENT == 3 )); then
         compadd -- --rebase
+      fi
+      ;;
+    pull)
+      if (( CURRENT == 3 )); then
+        compadd -- --rebase --reset
+      fi
+      ;;
+    push)
+      if (( CURRENT == 3 )); then
+        compadd -- -m
       fi
       ;;
     skill)
@@ -1058,6 +1078,11 @@ It provides workspace governance across repos, shared documentation, tests, and 
 - Parent branches are recorded automatically when `mcrepo branch` forks a new branch. Each repo can have a different parent.
 - `mcrepo merge` merges the global branch into each write repo's parent branch (local only, no push). Performs a dry-run first.
 - `mcrepo merge --rebase` syncs the current branch with its parent by merging parent INTO the current branch. Auto-stashes uncommitted work.
+- `mcrepo pull` fetches and fast-forward pulls from origin for all non-sleep repos. Skips dirty repos (fetch only).
+- `mcrepo pull --rebase` auto-stashes uncommitted changes, pulls, then pops stash. Safe for dirty repos.
+- `mcrepo pull --reset` discards all local changes and resets to origin state. Destructive — requires interactive confirmation.
+- `mcrepo push` pushes all write-mode repos with committed changes to origin.
+- `mcrepo push -m "message"` commits uncommitted changes in all dirty write-mode repos with the given message, then pushes.
 - `🧠 skills/` stores project and company specific agent skills.
 - Skills can include colocated helper scripts (for example `run.sh` or `check.sh`) next to `skill.md`.
 - ClawHub URL installs are scanned by default; `CRITICAL` blocks install and `HIGH` warns.
@@ -1106,6 +1131,8 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 - `mcrepo branch <name>` distinguishes fork (new branch, records parent) from jump (existing branch, no parent change).
 - `mcrepo branch --delete` discards the global branch and reverts repos to their parent branches.
 - `mcrepo branch --off` is a fallback that turns off coordination without switching branches.
+- `mcrepo pull` fetches and pulls from origin for all active repos (ff-only). Use `pull --rebase` to auto-stash dirty repos.
+- `mcrepo push [-m "message"]` pushes write-mode repos. With `-m`, also commits uncommitted changes first.
 - When `branch:` is empty, branch coordination is off and repos manage branches independently.
 - When running non-interactively (e.g., from scripts or agents), `mcrepo branch` aborts if uncommitted changes exist. Ensure clean working trees before switching branches.
 
@@ -1970,6 +1997,20 @@ repo_dirty_state() {
   fi
 }
 
+generate_commit_message() {
+  local repo_dir="$1"
+  local branch_name="$2"
+  local repo_name="$3"
+  local diff_summary
+  diff_summary="$(git -C "$repo_dir" diff --stat HEAD 2>/dev/null | tail -1 | sed 's/^ *//')"
+  if [ -z "$diff_summary" ]; then
+    local file_count
+    file_count="$(git -C "$repo_dir" status --short 2>/dev/null | wc -l | tr -d ' ')"
+    diff_summary="$file_count file(s) changed"
+  fi
+  printf 'mcrepo push: %s on %s (%s)' "$repo_name" "$branch_name" "$diff_summary"
+}
+
 cmd_list() {
   load_repos
   if [ -n "$GLOBAL_BRANCH" ]; then
@@ -2035,6 +2076,565 @@ cmd_status() {
       meta_parent_info=" parent=$META_PARENT"
     fi
     printf '%-20s %-11s local=%-3s branch=%-20s state=%s%s\n' "(meta-context)" "" "yes" "$meta_branch" "$meta_dirty" "$meta_parent_info"
+  fi
+}
+
+cmd_pull() {
+  local pull_mode="default"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --rebase) pull_mode="rebase" ;;
+      --reset) pull_mode="reset" ;;
+      *) die "Unknown pull option: $1" ;;
+    esac
+    shift
+  done
+
+  load_repos
+
+  # --- Phase 1: Pre-flight - collect target repos ---
+  local -a pull_dirs=()
+  local -a pull_names=()
+  local -a pull_branches=()
+  local -a pull_dirty=()
+  local -a pull_has_upstream=()
+
+  local i repo_dir branch dirty
+  for i in "${!REPO_NAMES[@]}"; do
+    [ "${REPO_MODES[$i]}" != "sleep" ] || continue
+    repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
+    [ -d "$repo_dir/.git" ] || continue
+    branch="$(repo_branch "$repo_dir")"
+    dirty="$(repo_dirty_state "$repo_dir")"
+    local has_up=0
+    if git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+      has_up=1
+    fi
+    pull_dirs+=("$repo_dir")
+    pull_names+=("${REPO_NAMES[$i]}")
+    pull_branches+=("$branch")
+    pull_dirty+=("$dirty")
+    pull_has_upstream+=("$has_up")
+  done
+
+  # Meta-context repo
+  local meta_dir="" meta_branch="" meta_dirty="" meta_has_upstream=0
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    meta_dir="."
+    meta_branch="$(repo_branch ".")"
+    meta_dirty="$(repo_dirty_state ".")"
+    if git -C . rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+      meta_has_upstream=1
+    fi
+  fi
+
+  if [ "${#pull_dirs[@]}" -eq 0 ] && [ -z "$meta_dir" ]; then
+    log "No active repos to pull."
+    return 0
+  fi
+
+  # --- Phase 2: Handle --reset confirmation ---
+  if [ "$pull_mode" = "reset" ]; then
+    local -a reset_dirty_names=()
+    for i in "${!pull_dirs[@]}"; do
+      [ "${pull_dirty[$i]}" = "dirty" ] && reset_dirty_names+=("${pull_names[$i]}")
+    done
+    [ -n "$meta_dir" ] && [ "$meta_dirty" = "dirty" ] && reset_dirty_names+=("(meta-context)")
+
+    if [ "${#reset_dirty_names[@]}" -gt 0 ]; then
+      warn "WARNING: This will DISCARD all uncommitted changes in:"
+      for rn in "${reset_dirty_names[@]}"; do
+        warn "  $rn"
+      done
+      warn ""
+      if [ -t 0 ] && [ -t 1 ]; then
+        printf 'This action cannot be undone. Proceed? [y/N] ' >&2
+        local confirm
+        IFS= read -r confirm
+        case "$confirm" in
+          y|Y|yes) ;;
+          *) log "Aborted."; return 0 ;;
+        esac
+      else
+        die "pull --reset requires interactive confirmation. Aborting."
+      fi
+    fi
+  fi
+
+  # --- Phase 3: Plan display ---
+  log "=== Pull ==="
+  for i in "${!pull_dirs[@]}"; do
+    local action
+    if [ "${pull_has_upstream[$i]}" -eq 0 ]; then
+      action="fetch only (no upstream)"
+    elif [ "$pull_mode" = "default" ] && [ "${pull_dirty[$i]}" = "dirty" ]; then
+      action="fetch only (dirty)"
+    elif [ "$pull_mode" = "reset" ]; then
+      if [ "${pull_dirty[$i]}" = "dirty" ]; then
+        action="discard + reset"
+      else
+        action="fetch + pull"
+      fi
+    elif [ "$pull_mode" = "rebase" ]; then
+      if [ "${pull_dirty[$i]}" = "dirty" ]; then
+        action="stash + pull + pop"
+      else
+        action="fetch + pull"
+      fi
+    else
+      action="fetch + pull"
+    fi
+    printf '  %-20s branch=%-20s state=%-6s -> %s\n' "${pull_names[$i]}" "${pull_branches[$i]}" "${pull_dirty[$i]}" "$action"
+  done
+  if [ -n "$meta_dir" ]; then
+    local meta_action
+    if [ "$meta_has_upstream" -eq 0 ]; then
+      meta_action="fetch only (no upstream)"
+    elif [ "$pull_mode" = "default" ] && [ "$meta_dirty" = "dirty" ]; then
+      meta_action="fetch only (dirty)"
+    elif [ "$pull_mode" = "reset" ] && [ "$meta_dirty" = "dirty" ]; then
+      meta_action="discard + reset"
+    elif [ "$pull_mode" = "rebase" ] && [ "$meta_dirty" = "dirty" ]; then
+      meta_action="stash + pull + pop"
+    else
+      meta_action="fetch + pull"
+    fi
+    printf '  %-20s branch=%-20s state=%-6s -> %s\n' "(meta-context)" "$meta_branch" "$meta_dirty" "$meta_action"
+  fi
+  log ""
+
+  # --- Phase 4: Execution ---
+  local -a updated_repos=()
+  local -a fetch_only_repos=()
+  local -a stash_conflict_repos=()
+  local -a failed_repos=()
+  local had_dirty=0
+
+  for i in "${!pull_dirs[@]}"; do
+    local rd="${pull_dirs[$i]}"
+    local rn="${pull_names[$i]}"
+    local rb="${pull_branches[$i]}"
+    local rdirty="${pull_dirty[$i]}"
+    local rup="${pull_has_upstream[$i]}"
+
+    # Always fetch
+    if ! git -C "$rd" fetch origin --prune 2>/dev/null; then
+      warn "Fetch failed for '$rn'"
+      failed_repos+=("$rn")
+      continue
+    fi
+
+    if [ "$rup" -eq 0 ]; then
+      fetch_only_repos+=("$rn (no upstream)")
+      continue
+    fi
+
+    if [ "$pull_mode" = "reset" ] && [ "$rdirty" = "dirty" ]; then
+      git -C "$rd" checkout -- . 2>/dev/null || true
+      git -C "$rd" clean -fd 2>/dev/null || true
+      if git -C "$rd" pull --ff-only 2>/dev/null; then
+        updated_repos+=("$rn")
+      else
+        # Diverged: hard reset to origin
+        git -C "$rd" reset --hard "origin/$rb" 2>/dev/null || { warn "Reset failed for '$rn'"; failed_repos+=("$rn"); continue; }
+        updated_repos+=("$rn")
+      fi
+      continue
+    fi
+
+    if [ "$pull_mode" = "reset" ] && [ "$rdirty" = "clean" ]; then
+      if git -C "$rd" pull --ff-only 2>/dev/null; then
+        updated_repos+=("$rn")
+      else
+        git -C "$rd" reset --hard "origin/$rb" 2>/dev/null || { warn "Reset failed for '$rn'"; failed_repos+=("$rn"); continue; }
+        updated_repos+=("$rn")
+      fi
+      continue
+    fi
+
+    if [ "$pull_mode" = "rebase" ] && [ "$rdirty" = "dirty" ]; then
+      local stashed=0
+      if git -C "$rd" stash push --include-untracked -m "mcrepo: auto-stash before pull" 2>/dev/null; then
+        stashed=1
+      fi
+      if git -C "$rd" pull --ff-only 2>/dev/null; then
+        if [ "$stashed" -eq 1 ]; then
+          if ! git -C "$rd" stash pop 2>/dev/null; then
+            warn "Stash pop conflict in '$rn'. Stash preserved — resolve manually with: cd $rd && git stash pop"
+            stash_conflict_repos+=("$rn")
+            continue
+          fi
+        fi
+        updated_repos+=("$rn")
+      else
+        warn "Pull failed for '$rn' (diverged). Restoring stash."
+        [ "$stashed" -eq 1 ] && git -C "$rd" stash pop 2>/dev/null || true
+        failed_repos+=("$rn")
+      fi
+      continue
+    fi
+
+    if [ "$rdirty" = "dirty" ]; then
+      had_dirty=1
+      fetch_only_repos+=("$rn (dirty)")
+      continue
+    fi
+
+    # Default/rebase clean: ff-only pull
+    if git -C "$rd" pull --ff-only 2>/dev/null; then
+      updated_repos+=("$rn")
+    else
+      warn "Pull failed for '$rn' (diverged or conflict)"
+      failed_repos+=("$rn")
+    fi
+  done
+
+  # Meta-context repo
+  if [ -n "$meta_dir" ]; then
+    if ! git -C . fetch origin --prune 2>/dev/null; then
+      warn "Fetch failed for (meta-context)"
+      failed_repos+=("(meta-context)")
+    elif [ "$meta_has_upstream" -eq 0 ]; then
+      fetch_only_repos+=("(meta-context) (no upstream)")
+    elif [ "$pull_mode" = "reset" ] && [ "$meta_dirty" = "dirty" ]; then
+      git -C . checkout -- . 2>/dev/null || true
+      git -C . clean -fd 2>/dev/null || true
+      if git -C . pull --ff-only 2>/dev/null; then
+        updated_repos+=("(meta-context)")
+      else
+        git -C . reset --hard "origin/$meta_branch" 2>/dev/null || { warn "Reset failed for (meta-context)"; failed_repos+=("(meta-context)"); }
+        updated_repos+=("(meta-context)")
+      fi
+    elif [ "$pull_mode" = "rebase" ] && [ "$meta_dirty" = "dirty" ]; then
+      local meta_stashed=0
+      if git -C . stash push --include-untracked -m "mcrepo: auto-stash before pull" 2>/dev/null; then
+        meta_stashed=1
+      fi
+      if git -C . pull --ff-only 2>/dev/null; then
+        if [ "$meta_stashed" -eq 1 ]; then
+          if ! git -C . stash pop 2>/dev/null; then
+            warn "Stash pop conflict in (meta-context). Resolve manually: git stash pop"
+            stash_conflict_repos+=("(meta-context)")
+          else
+            updated_repos+=("(meta-context)")
+          fi
+        else
+          updated_repos+=("(meta-context)")
+        fi
+      else
+        warn "Pull failed for (meta-context) (diverged). Restoring stash."
+        [ "$meta_stashed" -eq 1 ] && git -C . stash pop 2>/dev/null || true
+        failed_repos+=("(meta-context)")
+      fi
+    elif [ "$meta_dirty" = "dirty" ]; then
+      had_dirty=1
+      fetch_only_repos+=("(meta-context) (dirty)")
+    else
+      if git -C . pull --ff-only 2>/dev/null; then
+        updated_repos+=("(meta-context)")
+      else
+        warn "Pull failed for (meta-context) (diverged or conflict)"
+        failed_repos+=("(meta-context)")
+      fi
+    fi
+  fi
+
+  # --- Phase 5: Summary ---
+  log "=== Pull summary ==="
+  if [ "${#updated_repos[@]}" -gt 0 ]; then
+    log "  Updated:          ${updated_repos[*]}"
+  fi
+  if [ "${#fetch_only_repos[@]}" -gt 0 ]; then
+    log "  Fetch only:       ${fetch_only_repos[*]}"
+  fi
+  if [ "${#stash_conflict_repos[@]}" -gt 0 ]; then
+    warn "  Stash conflicts:  ${stash_conflict_repos[*]}"
+  fi
+  if [ "${#failed_repos[@]}" -gt 0 ]; then
+    warn "  Failed:           ${failed_repos[*]}"
+  fi
+  if [ "${#updated_repos[@]}" -eq 0 ] && [ "${#fetch_only_repos[@]}" -eq 0 ] && [ "${#failed_repos[@]}" -eq 0 ] && [ "${#stash_conflict_repos[@]}" -eq 0 ]; then
+    log "  Everything up to date."
+  fi
+
+  if [ "$had_dirty" -eq 1 ] && [ "$pull_mode" = "default" ]; then
+    log ""
+    log "Some repos skipped (dirty). Use 'mcrepo pull --rebase' to auto-stash and pull,"
+    log "or 'mcrepo pull --reset' to discard local changes."
+  fi
+}
+
+cmd_push() {
+  local commit_message=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -m) shift; commit_message="${1:-}"; [ -n "$commit_message" ] || die "-m requires a message" ;;
+      *) die "Unknown push option: $1" ;;
+    esac
+    shift
+  done
+
+  load_repos
+
+  # --- Phase 1: Pre-flight - collect target repos ---
+  local -a push_dirs=()
+  local -a push_names=()
+  local -a push_branches=()
+  local -a push_dirty=()
+  local -a push_has_upstream=()
+  local -a push_ahead_count=()
+
+  local i repo_dir branch dirty
+  for i in "${!REPO_NAMES[@]}"; do
+    [ "${REPO_MODES[$i]}" = "write" ] || continue
+    repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
+    [ -d "$repo_dir/.git" ] || continue
+    branch="$(repo_branch "$repo_dir")"
+    dirty="$(repo_dirty_state "$repo_dir")"
+    local has_up=0 ahead=0
+    if git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+      has_up=1
+      ahead="$(git -C "$repo_dir" rev-list --count '@{u}..HEAD' 2>/dev/null || printf '0')"
+    fi
+    push_dirs+=("$repo_dir")
+    push_names+=("${REPO_NAMES[$i]}")
+    push_branches+=("$branch")
+    push_dirty+=("$dirty")
+    push_has_upstream+=("$has_up")
+    push_ahead_count+=("$ahead")
+  done
+
+  # Meta-context repo
+  local meta_dir="" meta_branch="" meta_dirty="" meta_has_upstream=0 meta_ahead=0
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    meta_dir="."
+    meta_branch="$(repo_branch ".")"
+    meta_dirty="$(repo_dirty_state ".")"
+    if git -C . rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+      meta_has_upstream=1
+      meta_ahead="$(git -C . rev-list --count '@{u}..HEAD' 2>/dev/null || printf '0')"
+    fi
+  fi
+
+  # --- Phase 2: Classify repos ---
+  local -a dirty_indexes=()
+  local -a ahead_indexes=()
+  local -a uptodate_indexes=()
+  local meta_class="skip" # dirty, ahead, uptodate, skip
+
+  for i in "${!push_dirs[@]}"; do
+    if [ "${push_dirty[$i]}" = "dirty" ]; then
+      dirty_indexes+=("$i")
+    elif [ "${push_ahead_count[$i]}" -gt 0 ] || [ "${push_has_upstream[$i]}" -eq 0 ]; then
+      ahead_indexes+=("$i")
+    else
+      uptodate_indexes+=("$i")
+    fi
+  done
+
+  if [ -n "$meta_dir" ]; then
+    if [ "$meta_dirty" = "dirty" ]; then
+      meta_class="dirty"
+    elif [ "$meta_ahead" -gt 0 ] || [ "$meta_has_upstream" -eq 0 ]; then
+      meta_class="ahead"
+    else
+      meta_class="uptodate"
+    fi
+  fi
+
+  # Check if there is anything to do
+  local has_work=0
+  if [ "${#dirty_indexes[@]}" -gt 0 ] || [ "${#ahead_indexes[@]}" -gt 0 ]; then
+    has_work=1
+  fi
+  if [ "$meta_class" = "dirty" ] || [ "$meta_class" = "ahead" ]; then
+    has_work=1
+  fi
+  if [ "$has_work" -eq 0 ]; then
+    log "Nothing to push. All write-mode repos are up to date."
+    return 0
+  fi
+
+  # --- Phase 3: Plan display ---
+  log "=== Push plan ==="
+  for i in "${!push_dirs[@]}"; do
+    local action
+    if [ "${push_dirty[$i]}" = "dirty" ]; then
+      if [ -n "$commit_message" ]; then
+        action="commit + push"
+      else
+        action="dirty (needs -m or interactive commit message)"
+      fi
+    elif [ "${push_has_upstream[$i]}" -eq 0 ]; then
+      action="push (new upstream)"
+    elif [ "${push_ahead_count[$i]}" -gt 0 ]; then
+      action="${push_ahead_count[$i]} ahead -> push"
+    else
+      action="up to date -> skip"
+    fi
+    printf '  %-20s branch=%-20s -> %s\n' "${push_names[$i]}" "${push_branches[$i]}" "$action"
+  done
+  if [ -n "$meta_dir" ]; then
+    local meta_action
+    if [ "$meta_class" = "dirty" ]; then
+      if [ -n "$commit_message" ]; then
+        meta_action="commit + push"
+      else
+        meta_action="dirty (needs -m or interactive commit message)"
+      fi
+    elif [ "$meta_has_upstream" -eq 0 ]; then
+      meta_action="push (new upstream)"
+    elif [ "$meta_class" = "ahead" ]; then
+      meta_action="$meta_ahead ahead -> push"
+    else
+      meta_action="up to date -> skip"
+    fi
+    printf '  %-20s branch=%-20s -> %s\n' "(meta-context)" "$meta_branch" "$meta_action"
+  fi
+  log ""
+
+  # --- Phase 4: Handle dirty repos - get commit message ---
+  if [ "${#dirty_indexes[@]}" -gt 0 ] || [ "$meta_class" = "dirty" ]; then
+    if [ -z "$commit_message" ]; then
+      if [ -t 0 ] && [ -t 1 ]; then
+        printf 'Uncommitted changes found. Enter commit message (empty = auto-generate): ' >&2
+        IFS= read -r commit_message
+      fi
+      # commit_message may still be empty -> auto-generate per repo
+    fi
+  fi
+
+  # --- Phase 5: Commit dirty repos ---
+  local -a committed_pushed=()
+  local -a pushed_repos=()
+  local -a skipped_dirty=()
+  local -a skipped_uptodate=()
+  local -a failed_repos=()
+
+  if [ "${#dirty_indexes[@]}" -gt 0 ]; then
+    for i in "${dirty_indexes[@]}"; do
+      local rd="${push_dirs[$i]}"
+      local rn="${push_names[$i]}"
+      local rb="${push_branches[$i]}"
+      local msg="$commit_message"
+      if [ -z "$msg" ]; then
+        msg="$(generate_commit_message "$rd" "$rb" "$rn")"
+      fi
+      git -C "$rd" add -A
+      if ! git -C "$rd" commit -m "$msg"; then
+        warn "Commit failed in '$rn'. Skipping."
+        failed_repos+=("$rn")
+        continue
+      fi
+      log "  Committed '$rn'"
+      push_dirty[$i]="committed"
+    done
+  fi
+
+  # Commit meta-context if dirty
+  if [ "$meta_class" = "dirty" ]; then
+    local meta_msg="$commit_message"
+    if [ -z "$meta_msg" ]; then
+      meta_msg="$(generate_commit_message "." "$meta_branch" "(meta-context)")"
+    fi
+    git -C . add -A
+    if ! git -C . commit -m "$meta_msg"; then
+      warn "Commit failed in (meta-context). Skipping."
+      failed_repos+=("(meta-context)")
+      meta_class="failed"
+    else
+      log "  Committed (meta-context)"
+      meta_class="ahead"
+    fi
+  fi
+
+  # --- Phase 6: Push repos ---
+  # Push sub-repos first, then meta-context last
+  for i in "${!push_dirs[@]}"; do
+    local rd="${push_dirs[$i]}"
+    local rn="${push_names[$i]}"
+    local rb="${push_branches[$i]}"
+    local was_dirty="${push_dirty[$i]}"
+
+    # Skip up-to-date repos
+    if [ "$was_dirty" != "committed" ] && [ "${push_ahead_count[$i]}" -eq 0 ] && [ "${push_has_upstream[$i]}" -eq 1 ]; then
+      skipped_uptodate+=("$rn")
+      continue
+    fi
+
+    # Skip dirty repos that were not committed (no -m given, non-interactive)
+    if [ "$was_dirty" = "dirty" ]; then
+      skipped_dirty+=("$rn")
+      continue
+    fi
+
+    # Push
+    if [ "${push_has_upstream[$i]}" -eq 0 ]; then
+      if ! git -C "$rd" push -u origin "$rb" 2>/dev/null; then
+        warn "Push failed for '$rn'"
+        failed_repos+=("$rn")
+        continue
+      fi
+    else
+      if ! git -C "$rd" push 2>/dev/null; then
+        warn "Push failed for '$rn'"
+        failed_repos+=("$rn")
+        continue
+      fi
+    fi
+
+    if [ "$was_dirty" = "committed" ]; then
+      committed_pushed+=("$rn")
+    else
+      pushed_repos+=("$rn")
+    fi
+  done
+
+  # Push meta-context last
+  if [ -n "$meta_dir" ] && [ "$meta_class" = "ahead" ]; then
+    if [ "$meta_has_upstream" -eq 0 ]; then
+      if ! git -C . push -u origin "$meta_branch" 2>/dev/null; then
+        warn "Push failed for (meta-context)"
+        failed_repos+=("(meta-context)")
+      else
+        if [ "$meta_dirty" = "dirty" ]; then
+          committed_pushed+=("(meta-context)")
+        else
+          pushed_repos+=("(meta-context)")
+        fi
+      fi
+    else
+      if ! git -C . push 2>/dev/null; then
+        warn "Push failed for (meta-context)"
+        failed_repos+=("(meta-context)")
+      else
+        if [ "$meta_dirty" = "dirty" ]; then
+          committed_pushed+=("(meta-context)")
+        else
+          pushed_repos+=("(meta-context)")
+        fi
+      fi
+    fi
+  elif [ -n "$meta_dir" ] && [ "$meta_class" = "uptodate" ]; then
+    skipped_uptodate+=("(meta-context)")
+  fi
+
+  # --- Phase 7: Summary ---
+  log "=== Push summary ==="
+  if [ "${#committed_pushed[@]}" -gt 0 ]; then
+    log "  Committed + pushed:    ${committed_pushed[*]}"
+  fi
+  if [ "${#pushed_repos[@]}" -gt 0 ]; then
+    log "  Pushed:                ${pushed_repos[*]}"
+  fi
+  if [ "${#skipped_uptodate[@]}" -gt 0 ]; then
+    log "  Skipped (up to date):  ${skipped_uptodate[*]}"
+  fi
+  if [ "${#skipped_dirty[@]}" -gt 0 ]; then
+    warn "  Skipped (dirty, no -m): ${skipped_dirty[*]}"
+  fi
+  if [ "${#failed_repos[@]}" -gt 0 ]; then
+    warn "  Failed:                ${failed_repos[*]}"
   fi
 }
 
@@ -4408,6 +5008,8 @@ main() {
     list) cmd_list "$@" ;;
     branch) cmd_branch "$@" ;;
     merge) cmd_merge "$@" ;;
+    pull) cmd_pull "$@" ;;
+    push) cmd_push "$@" ;;
     open) cmd_open "$@" ;;
     status) cmd_status "$@" ;;
     skill) cmd_skill "$@" ;;
