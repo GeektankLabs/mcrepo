@@ -2494,13 +2494,14 @@ cmd_push() {
   log ""
 
   # --- Phase 4: Handle dirty repos - get commit message ---
+  local do_commit=0
   if [ "${#dirty_indexes[@]}" -gt 0 ] || [ "$meta_class" = "dirty" ]; then
-    if [ -z "$commit_message" ]; then
-      if [ -t 0 ] && [ -t 1 ]; then
-        printf 'Uncommitted changes found. Enter commit message (empty = auto-generate): ' >&2
-        IFS= read -r commit_message
-      fi
-      # commit_message may still be empty -> auto-generate per repo
+    if [ -n "$commit_message" ]; then
+      do_commit=1
+    elif [ -t 0 ] && [ -t 1 ]; then
+      printf 'Uncommitted changes found. Enter commit message (empty = auto-generate): ' >&2
+      IFS= read -r commit_message
+      do_commit=1
     fi
   fi
 
@@ -2511,7 +2512,7 @@ cmd_push() {
   local -a skipped_uptodate=()
   local -a failed_repos=()
 
-  if [ "${#dirty_indexes[@]}" -gt 0 ]; then
+  if [ "$do_commit" -eq 1 ] && [ "${#dirty_indexes[@]}" -gt 0 ]; then
     for i in "${dirty_indexes[@]}"; do
       local rd="${push_dirs[$i]}"
       local rn="${push_names[$i]}"
@@ -2532,7 +2533,7 @@ cmd_push() {
   fi
 
   # Commit meta-context if dirty
-  if [ "$meta_class" = "dirty" ]; then
+  if [ "$do_commit" -eq 1 ] && [ "$meta_class" = "dirty" ]; then
     local meta_msg="$commit_message"
     if [ -z "$meta_msg" ]; then
       meta_msg="$(generate_commit_message "." "$meta_branch" "(meta-context)")"
@@ -2617,6 +2618,8 @@ cmd_push() {
     fi
   elif [ -n "$meta_dir" ] && [ "$meta_class" = "uptodate" ]; then
     skipped_uptodate+=("(meta-context)")
+  elif [ -n "$meta_dir" ] && [ "$meta_class" = "dirty" ]; then
+    skipped_dirty+=("(meta-context)")
   fi
 
   # --- Phase 7: Summary ---
