@@ -2635,6 +2635,8 @@ cmd_push() {
   fi
   if [ "${#skipped_dirty[@]}" -gt 0 ]; then
     warn "  Skipped (dirty, no -m): ${skipped_dirty[*]}"
+    log ""
+    log "Use 'mcrepo push -m \"message\"' to commit and push dirty repos."
   fi
   if [ "${#failed_repos[@]}" -gt 0 ]; then
     warn "  Failed:                ${failed_repos[*]}"
