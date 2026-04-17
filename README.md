@@ -128,6 +128,65 @@ Behavior details:
 - Nested branches are supported: `main → feature → sub-feature`. Each `merge` pops one level.
 - When no parent is recorded, mcrepo falls back to detecting the default branch (via `origin/HEAD`, remote query, or heuristic).
 
+### Resuming or Aborting Mid-Operation Repos
+
+If `mcrepo merge`, `mcrepo merge --rebase`, or any per-repo `git` operation
+left some repos mid-merge / mid-rebase / mid-cherry-pick / mid-revert, you can
+drive the recovery across all affected repos at once:
+
+```bash
+mcrepo continue   # runs git <op> --continue in every mid-op repo
+mcrepo abort      # runs git <op> --abort in every mid-op repo
+```
+
+Resolve the conflicts inside each repo first (the per-repo paths are visible
+via `mcrepo status` under `inprogress=…`), then run `mcrepo continue`. Sleep
+mode repos are skipped. The meta-context repo participates as well.
+
+## Pushing
+
+```bash
+mcrepo push                # fetch, refuse if behind, then push ahead repos
+mcrepo push -m "message"   # also commit dirty write-mode repos before pushing
+mcrepo push --no-fetch     # skip the safety fetch (faster, less safe)
+```
+
+Behavior details:
+
+- Before pushing, mcrepo fetches `origin` for every push target (write-mode
+  sub-repos plus meta-context). It then computes both **ahead** and **behind**
+  per repo.
+- If any target is behind its upstream, `push` aborts before any commit or
+  push happens, and suggests `mcrepo pull` / `mcrepo pull --rebase` to sync
+  first. This avoids partial-success runs where the first repos succeed and
+  the rest get rejected mid-run.
+- Failures from `git push` (auth, branch protection, hooks, non-fast-forward)
+  are now printed verbatim above the summary so the cause is visible.
+- Without `-m` and in non-interactive context, dirty repos are skipped (not
+  silently committed). With `-m "msg"` (or interactive prompt) dirty repos
+  are auto-committed via `git add -A`.
+- The meta-context repo is pushed last so that sub-repo references in the
+  meta-context can capture the freshly pushed sub-repo states.
+
+## Status
+
+```bash
+mcrepo status
+```
+
+Per repo, mcrepo prints:
+
+- `mode` (read/write/sleep), `local` (checked out yes/no), `branch`
+- `state` — `clean` / `dirty`
+- `upstream=<…>` — `in-sync`, `ahead=N behind=M`, or `no-upstream`
+  (computed from local refs only — run `mcrepo pull` or `mcrepo push` to
+  refresh first if you need the latest remote state)
+- `inprogress=<…>` — `MERGING` / `REBASING` / `CHERRY-PICKING` / `REVERTING`
+  / `BISECTING` when the repo is mid-operation
+- `OFF-GLOBAL` — when the global branch is set but this repo sits on a
+  different branch
+- `parent=<stack>` — recorded parent branch stack (see Branch Coordination)
+
 ## VS Code Workflow
 
 - Keep the meta-context root open in one VS Code window to see all repositories and shared coordination folders.

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.4.0"
+MCREPO_VERSION="0.4.1"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -65,9 +65,11 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh pull                                   # Fetch + fast-forward pull from origin for all active repos
   ./mcrepo.sh pull --rebase                          # Auto-stash, pull, pop stash (handles dirty repos safely)
   ./mcrepo.sh pull --reset                           # Discard local changes and reset to origin state (destructive!)
-  ./mcrepo.sh push [-m "message"]                    # Commit (if -m given) and push all write-mode repos to origin
+  ./mcrepo.sh push [-m "message"] [--no-fetch]       # Fetch + abort if behind, then commit (if -m) and push write-mode repos
+  ./mcrepo.sh continue                               # Resume any mid-merge/rebase/cherry-pick/revert across repos (--continue)
+  ./mcrepo.sh abort                                  # Abort any mid-merge/rebase/cherry-pick/revert across repos (--abort)
   ./mcrepo.sh open <repo-name>                    # Open a write-mode repository in VS Code
-  ./mcrepo.sh status                              # Show list output plus clean/dirty working tree state
+  ./mcrepo.sh status                              # Repo state + ahead/behind, mid-op, OFF-GLOBAL divergence, parent stack
   ./mcrepo.sh skill [repo-name] <list|new|install|enable|disable|validate> [args] # Manage workspace or sub-repo skills (OpenCode-compatible)
                                               # Browse public skills: https://clawhub.ai/skills
   ./mcrepo.sh update                              # Update mcrepo.sh from canonical upstream when newer version is available
@@ -1997,6 +1999,47 @@ repo_dirty_state() {
   fi
 }
 
+# Reports MERGING / REBASING / CHERRY-PICKING / REVERTING / BISECTING
+# when the repo is mid-operation; empty string otherwise.
+repo_inprogress_state() {
+  local repo_dir="$1"
+  local git_dir
+  git_dir="$(git -C "$repo_dir" rev-parse --git-dir 2>/dev/null)" || return 0
+  if [ "${git_dir#/}" = "$git_dir" ]; then
+    git_dir="$repo_dir/$git_dir"
+  fi
+  if [ -d "$git_dir/rebase-merge" ] || [ -d "$git_dir/rebase-apply" ]; then
+    printf 'REBASING'
+  elif [ -f "$git_dir/MERGE_HEAD" ]; then
+    printf 'MERGING'
+  elif [ -f "$git_dir/CHERRY_PICK_HEAD" ]; then
+    printf 'CHERRY-PICKING'
+  elif [ -f "$git_dir/REVERT_HEAD" ]; then
+    printf 'REVERTING'
+  elif [ -f "$git_dir/BISECT_LOG" ]; then
+    printf 'BISECTING'
+  fi
+}
+
+# Reports "in-sync", "ahead=N behind=M", or "no-upstream" without fetching.
+# Counts are based on locally-known refs only.
+repo_upstream_state() {
+  local repo_dir="$1"
+  if ! git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    printf 'no-upstream'
+    return 0
+  fi
+  local ab behind ahead
+  ab="$(git -C "$repo_dir" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null)" || { printf '?'; return 0; }
+  behind="$(printf '%s' "$ab" | awk '{print $1+0}')"
+  ahead="$(printf '%s' "$ab" | awk '{print $2+0}')"
+  if [ "$ahead" -eq 0 ] && [ "$behind" -eq 0 ]; then
+    printf 'in-sync'
+  else
+    printf 'ahead=%s behind=%s' "$ahead" "$behind"
+  fi
+}
+
 generate_commit_message() {
   local repo_dir="$1"
   local branch_name="$2"
@@ -2051,7 +2094,7 @@ cmd_status() {
   else
     log "Global branch: (off - per-repo branches)"
   fi
-  local i local_state branch dirty repo_dir parent_info
+  local i local_state branch dirty repo_dir parent_info upstream inprogress diverged extras
   for i in "${!REPO_NAMES[@]}"; do
     repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
     if [ -d "$repo_dir/.git" ]; then
@@ -2065,18 +2108,109 @@ cmd_status() {
     if [ -n "${REPO_PARENTS[$i]:-}" ]; then
       parent_info=" parent=${REPO_PARENTS[$i]}"
     fi
-    printf '%-20s mode=%-5s local=%-3s branch=%-20s state=%s%s\n' "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}" "$local_state" "$branch" "$dirty" "$parent_info"
+    extras=""
+    if [ "$local_state" = "yes" ]; then
+      upstream="$(repo_upstream_state "$repo_dir")"
+      [ -n "$upstream" ] && extras="$extras upstream=$upstream"
+      inprogress="$(repo_inprogress_state "$repo_dir")"
+      [ -n "$inprogress" ] && extras="$extras inprogress=$inprogress"
+      if [ -n "$GLOBAL_BRANCH" ] && [ "${REPO_MODES[$i]}" != "sleep" ] && [ -n "$branch" ] && [ "$branch" != "$GLOBAL_BRANCH" ]; then
+        extras="$extras OFF-GLOBAL"
+      fi
+    fi
+    printf '%-20s mode=%-5s local=%-3s branch=%-20s state=%s%s%s\n' "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}" "$local_state" "$branch" "$dirty" "$extras" "$parent_info"
   done
   if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    local meta_branch meta_dirty meta_parent_info
+    local meta_branch meta_dirty meta_parent_info meta_upstream meta_inprogress meta_extras
     meta_branch="$(repo_branch ".")"
     meta_dirty="$(repo_dirty_state ".")"
     meta_parent_info=""
     if [ -n "$META_PARENT" ]; then
       meta_parent_info=" parent=$META_PARENT"
     fi
-    printf '%-20s %-11s local=%-3s branch=%-20s state=%s%s\n' "(meta-context)" "" "yes" "$meta_branch" "$meta_dirty" "$meta_parent_info"
+    meta_extras=""
+    meta_upstream="$(repo_upstream_state ".")"
+    [ -n "$meta_upstream" ] && meta_extras="$meta_extras upstream=$meta_upstream"
+    meta_inprogress="$(repo_inprogress_state ".")"
+    [ -n "$meta_inprogress" ] && meta_extras="$meta_extras inprogress=$meta_inprogress"
+    if [ -n "$GLOBAL_BRANCH" ] && [ -n "$meta_branch" ] && [ "$meta_branch" != "$GLOBAL_BRANCH" ]; then
+      meta_extras="$meta_extras OFF-GLOBAL"
+    fi
+    printf '%-20s %-11s local=%-3s branch=%-20s state=%s%s%s\n' "(meta-context)" "" "yes" "$meta_branch" "$meta_dirty" "$meta_extras" "$meta_parent_info"
   fi
+}
+
+# Resume or abort a single repo's mid-operation. action is "continue" or "abort".
+# Returns 0 if a state was handled, 1 if no in-progress state was found.
+_resume_inprogress() {
+  local repo_dir="$1"
+  local repo_name="$2"
+  local action="$3"
+  local state
+  state="$(repo_inprogress_state "$repo_dir")"
+  case "$state" in
+    MERGING)
+      log "  $repo_name: git merge --$action"
+      git -C "$repo_dir" merge "--$action" || warn "merge --$action failed in '$repo_name' (see git output above)"
+      return 0
+      ;;
+    REBASING)
+      log "  $repo_name: git rebase --$action"
+      git -C "$repo_dir" rebase "--$action" || warn "rebase --$action failed in '$repo_name' (see git output above)"
+      return 0
+      ;;
+    CHERRY-PICKING)
+      log "  $repo_name: git cherry-pick --$action"
+      git -C "$repo_dir" cherry-pick "--$action" || warn "cherry-pick --$action failed in '$repo_name' (see git output above)"
+      return 0
+      ;;
+    REVERTING)
+      log "  $repo_name: git revert --$action"
+      git -C "$repo_dir" revert "--$action" || warn "revert --$action failed in '$repo_name' (see git output above)"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Iterate write+read repos plus meta-context, applying continue/abort to any
+# repo that is mid-merge, mid-rebase, mid-cherry-pick, or mid-revert.
+_iterate_inprogress() {
+  local action="$1"
+  load_repos
+  local handled=0 i repo_dir
+  for i in "${!REPO_NAMES[@]}"; do
+    [ "${REPO_MODES[$i]}" != "sleep" ] || continue
+    repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
+    [ -d "$repo_dir/.git" ] || continue
+    if _resume_inprogress "$repo_dir" "${REPO_NAMES[$i]}" "$action"; then
+      handled=$((handled + 1))
+    fi
+  done
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if _resume_inprogress "." "(meta-context)" "$action"; then
+      handled=$((handled + 1))
+    fi
+  fi
+  if [ "$handled" -eq 0 ]; then
+    log "No repository is mid-merge / mid-rebase / mid-cherry-pick / mid-revert."
+  fi
+}
+
+cmd_continue() {
+  if [ "$#" -gt 0 ]; then
+    die "Unknown continue option: $1"
+  fi
+  _iterate_inprogress continue
+}
+
+cmd_abort() {
+  if [ "$#" -gt 0 ]; then
+    die "Unknown abort option: $1"
+  fi
+  _iterate_inprogress abort
 }
 
 cmd_pull() {
@@ -2366,9 +2500,11 @@ cmd_pull() {
 
 cmd_push() {
   local commit_message=""
+  local do_fetch=1
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -m) shift; commit_message="${1:-}"; [ -n "$commit_message" ] || die "-m requires a message" ;;
+      --no-fetch) do_fetch=0 ;;
       *) die "Unknown push option: $1" ;;
     esac
     shift
@@ -2383,6 +2519,7 @@ cmd_push() {
   local -a push_dirty=()
   local -a push_has_upstream=()
   local -a push_ahead_count=()
+  local -a push_behind_count=()
 
   local i repo_dir branch dirty
   for i in "${!REPO_NAMES[@]}"; do
@@ -2391,28 +2528,49 @@ cmd_push() {
     [ -d "$repo_dir/.git" ] || continue
     branch="$(repo_branch "$repo_dir")"
     dirty="$(repo_dirty_state "$repo_dir")"
-    local has_up=0 ahead=0
-    if git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
-      has_up=1
-      ahead="$(git -C "$repo_dir" rev-list --count '@{u}..HEAD' 2>/dev/null || printf '0')"
-    fi
     push_dirs+=("$repo_dir")
     push_names+=("${REPO_NAMES[$i]}")
     push_branches+=("$branch")
     push_dirty+=("$dirty")
-    push_has_upstream+=("$has_up")
-    push_ahead_count+=("$ahead")
+    push_has_upstream+=(0)
+    push_ahead_count+=(0)
+    push_behind_count+=(0)
   done
 
   # Meta-context repo
-  local meta_dir="" meta_branch="" meta_dirty="" meta_has_upstream=0 meta_ahead=0
+  local meta_dir="" meta_branch="" meta_dirty="" meta_has_upstream=0 meta_ahead=0 meta_behind=0
   if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     meta_dir="."
     meta_branch="$(repo_branch ".")"
     meta_dirty="$(repo_dirty_state ".")"
+  fi
+
+  # --- Phase 1b: Pre-push fetch + ahead/behind from remote tip ---
+  if [ "$do_fetch" -eq 1 ] && { [ "${#push_dirs[@]}" -gt 0 ] || [ -n "$meta_dir" ]; }; then
+    log "Fetching origin for all push targets..."
+  fi
+  for i in "${!push_dirs[@]}"; do
+    if [ "$do_fetch" -eq 1 ]; then
+      git -C "${push_dirs[$i]}" fetch --quiet 2>/dev/null || warn "Fetch failed for '${push_names[$i]}' (continuing with local refs)"
+    fi
+    if git -C "${push_dirs[$i]}" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+      push_has_upstream[$i]=1
+      local ab
+      ab="$(git -C "${push_dirs[$i]}" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null || printf '0\t0')"
+      push_behind_count[$i]="$(printf '%s' "$ab" | awk '{print $1+0}')"
+      push_ahead_count[$i]="$(printf '%s' "$ab" | awk '{print $2+0}')"
+    fi
+  done
+  if [ -n "$meta_dir" ]; then
+    if [ "$do_fetch" -eq 1 ]; then
+      git -C . fetch --quiet 2>/dev/null || warn "Fetch failed for (meta-context) (continuing with local refs)"
+    fi
     if git -C . rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
       meta_has_upstream=1
-      meta_ahead="$(git -C . rev-list --count '@{u}..HEAD' 2>/dev/null || printf '0')"
+      local meta_ab
+      meta_ab="$(git -C . rev-list --left-right --count '@{u}...HEAD' 2>/dev/null || printf '0\t0')"
+      meta_behind="$(printf '%s' "$meta_ab" | awk '{print $1+0}')"
+      meta_ahead="$(printf '%s' "$meta_ab" | awk '{print $2+0}')"
     fi
   fi
 
@@ -2457,6 +2615,7 @@ cmd_push() {
 
   # --- Phase 3: Plan display ---
   log "=== Push plan ==="
+  local -a behind_repos=()
   for i in "${!push_dirs[@]}"; do
     local action
     if [ "${push_dirty[$i]}" = "dirty" ]; then
@@ -2471,6 +2630,10 @@ cmd_push() {
       action="${push_ahead_count[$i]} ahead -> push"
     else
       action="up to date -> skip"
+    fi
+    if [ "${push_behind_count[$i]}" -gt 0 ]; then
+      action="$action  [BEHIND ${push_behind_count[$i]}]"
+      behind_repos+=("${push_names[$i]} (${push_behind_count[$i]} behind)")
     fi
     printf '  %-20s branch=%-20s -> %s\n' "${push_names[$i]}" "${push_branches[$i]}" "$action"
   done
@@ -2489,9 +2652,29 @@ cmd_push() {
     else
       meta_action="up to date -> skip"
     fi
+    if [ "$meta_behind" -gt 0 ]; then
+      meta_action="$meta_action  [BEHIND $meta_behind]"
+      behind_repos+=("(meta-context) ($meta_behind behind)")
+    fi
     printf '  %-20s branch=%-20s -> %s\n' "(meta-context)" "$meta_branch" "$meta_action"
   fi
   log ""
+
+  # --- Phase 3b: Abort if any target repo is behind origin ---
+  if [ "${#behind_repos[@]}" -gt 0 ]; then
+    warn "Some repos are behind their upstream:"
+    local br
+    for br in "${behind_repos[@]}"; do
+      warn "  - $br"
+    done
+    log ""
+    log "Refusing to push to avoid mid-run rejections."
+    log "Sync first with one of:"
+    log "  mcrepo pull           # fast-forward where possible"
+    log "  mcrepo pull --rebase  # rebase local commits on top of upstream"
+    log "Or rerun with --no-fetch to skip this safety check (still rejected by remote on real conflicts)."
+    return 1
+  fi
 
   # --- Phase 4: Handle dirty repos - get commit message ---
   local do_commit=0
@@ -2571,14 +2754,14 @@ cmd_push() {
 
     # Push
     if [ "${push_has_upstream[$i]}" -eq 0 ]; then
-      if ! git -C "$rd" push -u origin "$rb" 2>/dev/null; then
-        warn "Push failed for '$rn'"
+      if ! git -C "$rd" push -u origin "$rb"; then
+        warn "Push failed for '$rn' (see git output above)"
         failed_repos+=("$rn")
         continue
       fi
     else
-      if ! git -C "$rd" push 2>/dev/null; then
-        warn "Push failed for '$rn'"
+      if ! git -C "$rd" push; then
+        warn "Push failed for '$rn' (see git output above)"
         failed_repos+=("$rn")
         continue
       fi
@@ -2594,8 +2777,8 @@ cmd_push() {
   # Push meta-context last
   if [ -n "$meta_dir" ] && [ "$meta_class" = "ahead" ]; then
     if [ "$meta_has_upstream" -eq 0 ]; then
-      if ! git -C . push -u origin "$meta_branch" 2>/dev/null; then
-        warn "Push failed for (meta-context)"
+      if ! git -C . push -u origin "$meta_branch"; then
+        warn "Push failed for (meta-context) (see git output above)"
         failed_repos+=("(meta-context)")
       else
         if [ "$meta_dirty" = "dirty" ]; then
@@ -2605,8 +2788,8 @@ cmd_push() {
         fi
       fi
     else
-      if ! git -C . push 2>/dev/null; then
-        warn "Push failed for (meta-context)"
+      if ! git -C . push; then
+        warn "Push failed for (meta-context) (see git output above)"
         failed_repos+=("(meta-context)")
       else
         if [ "$meta_dirty" = "dirty" ]; then
@@ -5015,6 +5198,8 @@ main() {
     merge) cmd_merge "$@" ;;
     pull) cmd_pull "$@" ;;
     push) cmd_push "$@" ;;
+    continue) cmd_continue "$@" ;;
+    abort) cmd_abort "$@" ;;
     open) cmd_open "$@" ;;
     status) cmd_status "$@" ;;
     skill) cmd_skill "$@" ;;
