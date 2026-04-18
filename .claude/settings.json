@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(command -v node)",
-      "Bash(command -v npm)"
+      "Bash(command -v npm)",
+      "Bash(grep -n 'case.*$CMD' /Users/rotzoll/Documents/rootzoll-github/mcrepo/mcrepo.sh)"
     ]
   }
 }

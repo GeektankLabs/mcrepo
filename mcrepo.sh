@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.4.2"
+MCREPO_VERSION="0.4.3"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -4054,19 +4054,27 @@ cmd_branch() {
 
   # --- Phase 2: Fork confirmation (interactive, only if at least one fork) ---
   if [ "${#fork_names[@]}" -gt 0 ]; then
-    local current_display
-    if [ -n "$GLOBAL_BRANCH" ]; then
-      current_display="$GLOBAL_BRANCH"
-    else
-      current_display="$(repo_branch "." 2>/dev/null || echo "unknown")"
-    fi
-
     log ""
     log "Branch '$branch_name' would be NEW (fork) in: ${fork_names[*]}"
     if [ "${#jump_names[@]}" -gt 0 ]; then
       log "Branch '$branch_name' already exists (jump) in: ${jump_names[*]}"
     fi
-    log "Parent branch for new forks: $current_display"
+    log "Parent branch per fork (current branch → recorded as parent):"
+    for idx in "${!target_indexes[@]}"; do
+      if [ "${target_is_fork[$idx]}" -eq 1 ]; then
+        local ti="${target_indexes[$idx]}"
+        local rname="${REPO_NAMES[$ti]}"
+        local rdir="${target_dirs[$idx]}"
+        local rcur
+        rcur="$(repo_branch "$rdir" 2>/dev/null || echo "unknown")"
+        log "  $rname → $rcur"
+      fi
+    done
+    if [ "$meta_is_target" -eq 1 ] && [ "$meta_is_fork" -eq 1 ]; then
+      local meta_cur
+      meta_cur="$(repo_branch "." 2>/dev/null || echo "unknown")"
+      log "  (meta-context) → $meta_cur"
+    fi
     log ""
 
     if [ -t 0 ] && [ -t 1 ]; then
