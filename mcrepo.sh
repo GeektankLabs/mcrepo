@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.4.1"
+MCREPO_VERSION="0.4.2"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -51,7 +51,7 @@ usage() {
 Usage:  # Show available mcrepo commands
   ./mcrepo.sh init [organization] [--no-shell-install] # Initialize MC-Repo structure and optionally sync repos from a GitHub organization
   ./mcrepo.sh add <git-url> [name]                # Add a repository to mcrepo.yaml (default mode: read) and clone it if needed
-  ./mcrepo.sh remove <name-or-url>                # Remove a repository from mcrepo management configuration
+  ./mcrepo.sh remove <name-or-url> [--keep-files] [--force] # Remove a repository: drops YAML entry and deletes local folder (after confirming uncommitted/unpushed work); --keep-files preserves folder, --force skips prompts
   ./mcrepo.sh write <repo-name>                   # Switch a repository to write mode and auto-align to global branch (if configured)
   ./mcrepo.sh read <repo-name>                    # Switch a repository to read mode (read-only context)
   ./mcrepo.sh sleep <repo-name> [--force]         # Switch a repository to sleep mode and clear its local folder contents
@@ -770,12 +770,22 @@ ensure_gitignore_repo_entry() {
 remove_gitignore_repo_entry() {
   local repo_name="$1"
   [ -f .gitignore ] || return 0
-  local line tmp
+  local variant tmp
+  local -a variants=(
+    "/$repo_name/"
+    "/✏️ $repo_name/"
+    "/👀 $repo_name/"
+    "/💤 $repo_name/"
+    "/write $repo_name/"
+    "/read $repo_name/"
+    "/sleep $repo_name/"
+  )
 
-  line="/$repo_name/"
-  tmp="$(mktemp)"
-  grep -Fvx "$line" .gitignore >"$tmp" || true
-  mv "$tmp" .gitignore
+  for variant in "${variants[@]}"; do
+    tmp="$(mktemp)"
+    grep -Fvx "$variant" .gitignore >"$tmp" || true
+    mv "$tmp" .gitignore
+  done
 }
 
 clone_repo_if_needed() {
@@ -916,6 +926,8 @@ _mcrepo_complete() {
         else
           COMPREPLY=( $(compgen -W "$(_mcrepo_repo_names)" -- "$cur") )
         fi
+      elif [ "$COMP_CWORD" -ge 3 ] && [ "${COMP_WORDS[1]}" = "remove" ]; then
+        COMPREPLY=( $(compgen -W "--keep-files --force -force" -- "$cur") )
       elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "sleep" -o "${COMP_WORDS[1]}" = "off" ]; then
         COMPREPLY=( $(compgen -W "--force -force" -- "$cur") )
       fi
@@ -1025,6 +1037,8 @@ _mcrepo_complete() {
         else
           compadd -- "${repos[@]}"
         fi
+      elif (( CURRENT >= 4 )) && [[ "$cmd" == "remove" ]]; then
+        compadd -- --keep-files --force -force
       elif (( CURRENT == 4 )) && [[ "$cmd" == "sleep" || "$cmd" == "off" ]]; then
         compadd -- --force -force
       fi
@@ -1359,7 +1373,7 @@ ensure_vscode_workspace_settings() {
   cat >"$vscode_settings_file" <<'EOF'
 {
   "scm.alwaysShowRepositories": true,
-  "scm.repositories.selectionMode": "multi",
+  "scm.repositories.selectionMode": "multiple",
   "git.autoRepositoryDetection": "subFolders",
   "git.repositoryScanMaxDepth": 2
 }
@@ -1820,14 +1834,133 @@ cmd_add() {
 }
 
 cmd_remove() {
-  [ "$#" -eq 1 ] || die "Usage: ./mcrepo.sh remove <name-or-url>"
-  local target="$1"
+  local target=""
+  local force=0
+  local keep_files=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --force|-force)
+        force=1
+        ;;
+      --keep-files)
+        keep_files=1
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "Unknown option for remove: $1"
+        ;;
+      *)
+        if [ -n "$target" ]; then
+          die "Usage: ./mcrepo.sh remove <name-or-url> [--keep-files] [--force]"
+        fi
+        target="$1"
+        ;;
+    esac
+    shift
+  done
+
+  [ -n "$target" ] || die "Usage: ./mcrepo.sh remove <name-or-url> [--keep-files] [--force]"
 
   load_repos
   local idx
   idx="$(find_repo_index "$target")" || die "Repo not found: $target"
 
   local removed_name="${REPO_NAMES[$idx]}"
+  local removed_mode="${REPO_MODES[$idx]}"
+
+  local repo_dir=""
+  if repo_dir="$(find_existing_repo_dir "$removed_name")"; then
+    :
+  else
+    repo_dir=""
+  fi
+
+  local delete_dir=0
+  if [ "$keep_files" -eq 0 ] && [ -n "$repo_dir" ] && [ -e "$repo_dir" ]; then
+    local -a concerns=()
+    local is_git_repo=0
+    local dirty=0
+    local untracked=0
+    local unpushed=0
+    local no_upstream=0
+    local has_stash=0
+    local is_sleep_placeholder=0
+
+    if [ -d "$repo_dir/.git" ]; then
+      is_git_repo=1
+      if [ -n "$(git -C "$repo_dir" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+        dirty=1
+      fi
+      if [ -n "$(git -C "$repo_dir" ls-files --others --exclude-standard 2>/dev/null)" ]; then
+        untracked=1
+      fi
+      if git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+        local ahead
+        ahead="$(git -C "$repo_dir" rev-list --count '@{u}..HEAD' 2>/dev/null || printf '0')"
+        if [ "${ahead:-0}" -gt 0 ]; then
+          unpushed=1
+        fi
+      else
+        local head_branch
+        head_branch="$(git -C "$repo_dir" symbolic-ref --quiet --short HEAD 2>/dev/null || printf '')"
+        if [ -n "$head_branch" ]; then
+          no_upstream=1
+        fi
+      fi
+      if [ -n "$(git -C "$repo_dir" stash list 2>/dev/null)" ]; then
+        has_stash=1
+      fi
+    elif [ -f "$repo_dir/.mcrepo-sleep" ]; then
+      is_sleep_placeholder=1
+    fi
+
+    [ "$dirty" -eq 1 ] && concerns+=("uncommitted changes")
+    [ "$untracked" -eq 1 ] && concerns+=("untracked files")
+    [ "$unpushed" -eq 1 ] && concerns+=("unpushed commits")
+    [ "$no_upstream" -eq 1 ] && concerns+=("no upstream configured (local commits would be lost)")
+    [ "$has_stash" -eq 1 ] && concerns+=("stashed changes")
+    if [ "$is_git_repo" -eq 0 ] && [ "$is_sleep_placeholder" -eq 0 ] && ! directory_is_empty "$repo_dir"; then
+      concerns+=("directory is not a git repo")
+    fi
+
+    log "Local folder '$repo_dir' still exists (mode: $removed_mode)."
+    if [ "${#concerns[@]}" -gt 0 ]; then
+      warn "Detected concerns before deleting '$repo_dir':"
+      local c
+      for c in "${concerns[@]}"; do
+        warn "  - $c"
+      done
+    fi
+
+    if [ "$force" -eq 1 ]; then
+      delete_dir=1
+    elif [ -t 0 ] && [ -t 1 ]; then
+      local prompt_text
+      if [ "${#concerns[@]}" -gt 0 ]; then
+        prompt_text="Delete '$repo_dir' anyway? This cannot be undone. [y/N] "
+      else
+        prompt_text="Delete local folder '$repo_dir'? [y/N] "
+      fi
+      printf '%s' "$prompt_text" >&2
+      local confirm
+      IFS= read -r confirm
+      case "$confirm" in
+        y|Y|yes|YES) delete_dir=1 ;;
+        *) delete_dir=0 ;;
+      esac
+    else
+      if [ "${#concerns[@]}" -gt 0 ]; then
+        die "Local folder '$repo_dir' has unsaved work and no TTY for confirmation. Re-run with --force to delete, or --keep-files to preserve the folder."
+      else
+        warn "No TTY for confirmation; keeping '$repo_dir'. Pass --force to delete or --keep-files to suppress this check."
+        delete_dir=0
+      fi
+    fi
+  fi
 
   local old_urls=("${REPO_URLS[@]}")
   local old_names=("${REPO_NAMES[@]}")
@@ -1852,6 +1985,13 @@ cmd_remove() {
     fi
   done
   save_repos
+
+  if [ "$delete_dir" -eq 1 ] && [ -n "$repo_dir" ] && [ -e "$repo_dir" ]; then
+    rm -rf -- "$repo_dir"
+    log "Deleted local folder: $repo_dir"
+  elif [ "$keep_files" -eq 0 ] && [ -n "$repo_dir" ] && [ -e "$repo_dir" ]; then
+    log "Kept local folder: $repo_dir"
+  fi
 
   remove_gitignore_repo_entry "$removed_name"
 

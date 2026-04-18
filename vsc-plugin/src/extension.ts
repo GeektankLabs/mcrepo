@@ -54,7 +54,7 @@ const MODE_COLORS: Record<string, vscode.ThemeColor | undefined> = {
 
 const WORKSPACE_SETTING_DEFAULTS: Record<string, unknown> = {
   "scm.alwaysShowRepositories": true,
-  "scm.repositories.selectionMode": "multi",
+  "scm.repositories.selectionMode": "multiple",
   "git.autoRepositoryDetection": "subFolders",
   "git.repositoryScanMaxDepth": 2
 };
@@ -485,6 +485,10 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
   }
 }
 
+const LEGACY_SETTING_MIGRATIONS: Record<string, Record<string, unknown>> = {
+  "scm.repositories.selectionMode": { multi: "multiple" }
+};
+
 async function ensureWorkspaceSettings(): Promise<void> {
   for (const [key, defaultValue] of Object.entries(WORKSPACE_SETTING_DEFAULTS)) {
     const dotIndex = key.indexOf(".");
@@ -492,8 +496,16 @@ async function ensureWorkspaceSettings(): Promise<void> {
     const leaf = key.substring(dotIndex + 1);
     const config = vscode.workspace.getConfiguration(section);
     const inspection = config.inspect(leaf);
-    if (inspection && inspection.workspaceValue === undefined) {
+    const workspaceValue = inspection?.workspaceValue;
+
+    if (workspaceValue === undefined) {
       await config.update(leaf, defaultValue, vscode.ConfigurationTarget.Workspace);
+      continue;
+    }
+
+    const migrations = LEGACY_SETTING_MIGRATIONS[key];
+    if (migrations && typeof workspaceValue === "string" && workspaceValue in migrations) {
+      await config.update(leaf, migrations[workspaceValue], vscode.ConfigurationTarget.Workspace);
     }
   }
 }
