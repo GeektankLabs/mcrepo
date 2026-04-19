@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.4.3"
+MCREPO_VERSION="0.4.6"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -49,7 +49,15 @@ die() {
 usage() {
   cat <<'EOF'
 Usage:  # Show available mcrepo commands
+
+═══════════════════════════════════════════════════════════════════════════════
+  WORKSPACE SETUP
+═══════════════════════════════════════════════════════════════════════════════
   ./mcrepo.sh init [organization] [--no-shell-install] # Initialize MC-Repo structure and optionally sync repos from a GitHub organization
+
+═══════════════════════════════════════════════════════════════════════════════
+  REPOSITORY MANAGEMENT
+═══════════════════════════════════════════════════════════════════════════════
   ./mcrepo.sh add <git-url> [name]                # Add a repository to mcrepo.yaml (default mode: read) and clone it if needed
   ./mcrepo.sh remove <name-or-url> [--keep-files] [--force] # Remove a repository: drops YAML entry and deletes local folder (after confirming uncommitted/unpushed work); --keep-files preserves folder, --force skips prompts
   ./mcrepo.sh write <repo-name>                   # Switch a repository to write mode and auto-align to global branch (if configured)
@@ -57,7 +65,14 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh sleep <repo-name> [--force]         # Switch a repository to sleep mode and clear its local folder contents
   ./mcrepo.sh sleep --wakeall                     # Wake all sleeping repositories and set them to read mode
   ./mcrepo.sh list                                # List configured repositories with mode, local clone state, and current branch
-  ./mcrepo.sh branch <branch-name> [--include-read] # Switch/create global branch (interactive dirty-change handling)
+
+═══════════════════════════════════════════════════════════════════════════════
+  COORDINATED GIT MANAGEMENT
+═══════════════════════════════════════════════════════════════════════════════
+  ./mcrepo.sh commit [-m "msg"] [--include-read]     # Coordinated commit across dirty write repos + meta-context
+  ./mcrepo.sh commit --revert [--include-read] [--force]  # Peel the highest-#N coordinated commit off HEAD (reset --hard HEAD~1)
+  ./mcrepo.sh commit --reset  [--include-read] [--force]  # Discard uncommitted changes across all target repos
+  ./mcrepo.sh branch <branch-name> [--include-read]  # Switch/create global branch (interactive dirty-change handling)
   ./mcrepo.sh branch --off                           # Turn off branch coordination (fallback — see merge/--delete)
   ./mcrepo.sh branch --delete                        # Delete global branch, switch repos back to parent branches
   ./mcrepo.sh merge                                  # Merge global branch into each repo's parent branch (local only)
@@ -66,12 +81,28 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh pull --rebase                          # Auto-stash, pull, pop stash (handles dirty repos safely)
   ./mcrepo.sh pull --reset                           # Discard local changes and reset to origin state (destructive!)
   ./mcrepo.sh push [-m "message"] [--no-fetch]       # Fetch + abort if behind, then commit (if -m) and push write-mode repos
-  ./mcrepo.sh continue                               # Resume any mid-merge/rebase/cherry-pick/revert across repos (--continue)
-  ./mcrepo.sh abort                                  # Abort any mid-merge/rebase/cherry-pick/revert across repos (--abort)
-  ./mcrepo.sh open <repo-name>                    # Open a write-mode repository in VS Code
+
+═══════════════════════════════════════════════════════════════════════════════
+  MID-OPERATION RECOVERY
+═══════════════════════════════════════════════════════════════════════════════
+  ./mcrepo.sh continue                            # Resume any mid-merge/rebase/cherry-pick/revert across repos (--continue)
+  ./mcrepo.sh abort                               # Abort any mid-merge/rebase/cherry-pick/revert across repos (--abort)
+
+═══════════════════════════════════════════════════════════════════════════════
+  INSPECTION & NAVIGATION
+═══════════════════════════════════════════════════════════════════════════════
   ./mcrepo.sh status                              # Repo state + ahead/behind, mid-op, OFF-GLOBAL divergence, parent stack
+  ./mcrepo.sh open <repo-name>                    # Open a write-mode repository in VS Code
+
+═══════════════════════════════════════════════════════════════════════════════
+  SKILLS
+═══════════════════════════════════════════════════════════════════════════════
   ./mcrepo.sh skill [repo-name] <list|new|install|enable|disable|validate> [args] # Manage workspace or sub-repo skills (OpenCode-compatible)
-                                              # Browse public skills: https://clawhub.ai/skills
+                                                  # Browse public skills: https://clawhub.ai/skills
+
+═══════════════════════════════════════════════════════════════════════════════
+  TOOLING & MAINTENANCE
+═══════════════════════════════════════════════════════════════════════════════
   ./mcrepo.sh update                              # Update mcrepo.sh from canonical upstream when newer version is available
   ./mcrepo.sh install-extension                   # Download and install the mcrepo VS Code extension from GitHub
   ./mcrepo.sh create-patch [--strategy intent|legacy] [topic] # Print a ready-to-submit GitHub issue body (with embedded patch) to stdout
@@ -874,7 +905,7 @@ _mcrepo_repo_names() {
 
 _mcrepo_complete() {
   local cur prev
-  local commands="init add remove write read sleep off list branch merge pull push open status skill update install-extension export-patch create-patch help"
+  local commands="init add remove write read sleep off list branch merge pull push commit open status skill update install-extension export-patch create-patch help"
   local skill_commands="list new install enable disable validate"
   local repo_commands="remove write read sleep off open"
 
@@ -907,6 +938,9 @@ _mcrepo_complete() {
       ;;
     push)
       COMPREPLY=( $(compgen -W "-m" -- "$cur") )
+      ;;
+    commit)
+      COMPREPLY=( $(compgen -W "-m --include-read --revert --reset --force" -- "$cur") )
       ;;
     skill)
       if [ "$COMP_CWORD" -eq 2 ]; then
@@ -983,7 +1017,7 @@ _mcrepo_complete() {
   local subcmd
   local -a commands repos skill_commands
 
-  commands=(init add remove write read sleep off list branch merge pull push open status skill update install-extension export-patch create-patch help)
+  commands=(init add remove write read sleep off list branch merge pull push commit open status skill update install-extension export-patch create-patch help)
   skill_commands=(list new install enable disable validate)
   repos=("${(@f)$(_mcrepo_repo_names)}")
 
@@ -1017,6 +1051,9 @@ _mcrepo_complete() {
       if (( CURRENT == 3 )); then
         compadd -- -m
       fi
+      ;;
+    commit)
+      compadd -- -m --include-read --revert --reset --force
       ;;
     skill)
       if (( CURRENT == 3 )); then
@@ -1135,7 +1172,7 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 4. Treat repositories marked `mode: sleep` as strictly inactive: do not implement, do not research inside them, do not include them in active scope.
 5. For cross-repo changes, check `🧩 contracts/` and `🧾 docs/` first.
 6. Coordinate changes across all `write` repositories.
-7. Do not execute git commits.
+7. Do not run `git commit`, `git push`, or `mcrepo commit` yourself. When a meaningful step of a feature or fix is reached — or at the start of a new plan/session when uncommitted changes already exist in write repos — tell the user to run `mcrepo commit -m "<short summary>"` so the working state is captured as a coordinated, revertable checkpoint. Leave the final decision with the user.
 8. Always wrap paths in quotes to handle spaces correctly.
 
 ## Branch Coordination and Merging
@@ -1148,9 +1185,20 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 - `mcrepo branch --delete` discards the global branch and reverts repos to their parent branches.
 - `mcrepo branch --off` is a fallback that turns off coordination without switching branches.
 - `mcrepo pull` fetches and pulls from origin for all active repos (ff-only). Use `pull --rebase` to auto-stash dirty repos.
-- `mcrepo push [-m "message"]` pushes write-mode repos. With `-m`, also commits uncommitted changes first.
+- `mcrepo push [-m "message"]` pushes write-mode repos. With `-m`, also commits uncommitted changes first (same coordinated-commit format as `mcrepo commit`).
 - When `branch:` is empty, branch coordination is off and repos manage branches independently.
 - When running non-interactively (e.g., from scripts or agents), `mcrepo branch` aborts if uncommitted changes exist. Ensure clean working trees before switching branches.
+
+## Coordinated Commits (User-Driven)
+
+- All commits in this workspace must go through `mcrepo commit`. The agent does not run this itself — it suggests the user run it.
+- Suggest `mcrepo commit -m "<short summary>"` when:
+  - a meaningful step of a feature or fix is done (so it can serve as a rollback point), or
+  - starting a new plan/session with pre-existing uncommitted changes (so the starting state is captured).
+- Coordinated commits use a single shared subject across every write repo and the meta-context: `mcrepo commit #<N> @<timestamp>: <message>`. This makes them revertable as one unit.
+- To undo the most recent coordinated commit, the user runs `mcrepo commit --revert`. It peels only the top layer: only repos whose HEAD carries the highest `#N` are reset (`git reset --hard HEAD~1`); repos at a lower `#N` or not at a coordinated HEAD are left alone.
+- To discard uncommitted work across all write repos, the user runs `mcrepo commit --reset` (destructive, user-confirmed).
+- Never invoke `git commit`, `git push`, or `git reset --hard` on behalf of the user.
 
 ## Ordering and Shared Folders
 
@@ -2194,6 +2242,48 @@ generate_commit_message() {
   printf 'mcrepo push: %s on %s (%s)' "$repo_name" "$branch_name" "$diff_summary"
 }
 
+# --- Coordinated-commit helpers (shared by cmd_commit, cmd_merge, cmd_branch) ---
+
+mcrepo_new_batch_id() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+mcrepo_next_seq() {
+  local count
+  count="$(git -C . log --format='%s' 2>/dev/null | grep -c '^mcrepo commit #' || true)"
+  [ -z "$count" ] && count=0
+  printf '%d' "$((count + 1))"
+}
+
+mcrepo_commit_subject() {
+  local seq="$1" batch="$2" msg="$3"
+  [ -z "$msg" ] && msg="stopping point"
+  printf 'mcrepo commit #%s @%s: %s' "$seq" "$batch" "$msg"
+}
+
+mcrepo_parse_batch_id() {
+  printf '%s' "$1" | sed -n 's/^mcrepo commit #[0-9][0-9]* @\([^ ]*\):.*/\1/p'
+}
+
+mcrepo_parse_n() {
+  printf '%s' "$1" | sed -n 's/^mcrepo commit #\([0-9][0-9]*\) @[^ ]*:.*/\1/p'
+}
+
+# git add -A && git commit -m <subject>. Returns 0 on success or clean-after-add.
+# Args: repo_dir label subject
+mcrepo_do_commit() {
+  local dir="$1" label="$2" subject="$3"
+  git -C "$dir" add -A
+  if git -C "$dir" diff --cached --quiet; then
+    log "  $label: nothing to commit (clean after add)"
+    return 0
+  fi
+  if git -C "$dir" commit -m "$subject" >/dev/null; then
+    log "  $label: committed"
+    return 0
+  fi
+  warn "$label: commit failed"
+  return 1
+}
+
 cmd_list() {
   load_repos
   if [ -n "$GLOBAL_BRANCH" ]; then
@@ -2635,6 +2725,317 @@ cmd_pull() {
     log ""
     log "Some repos skipped (dirty). Use 'mcrepo pull --rebase' to auto-stash and pull,"
     log "or 'mcrepo pull --reset' to discard local changes."
+  fi
+}
+
+# Gather target repos (write; read if include_read=1) + meta-context.
+# Populates global-named arrays: CC_DIRS, CC_NAMES, and scalar CC_META_DIR.
+_cc_gather_targets() {
+  local include_read="$1"
+  CC_DIRS=()
+  CC_NAMES=()
+  CC_META_DIR=""
+  local i mode repo_dir
+  for i in "${!REPO_NAMES[@]}"; do
+    mode="${REPO_MODES[$i]}"
+    if [ "$mode" = "write" ] || { [ "$include_read" -eq 1 ] && [ "$mode" = "read" ]; }; then
+      repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "$mode")"
+      [ -d "$repo_dir/.git" ] || continue
+      CC_DIRS+=("$repo_dir")
+      CC_NAMES+=("${REPO_NAMES[$i]}")
+    fi
+  done
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    CC_META_DIR="."
+  fi
+}
+
+_commit_forward() {
+  local user_msg="$1"
+  local include_read="$2"
+
+  _cc_gather_targets "$include_read"
+
+  local -a dirty_dirs=()
+  local -a dirty_names=()
+  local i
+  for i in "${!CC_DIRS[@]}"; do
+    if [ -n "$(git -C "${CC_DIRS[$i]}" status --porcelain 2>/dev/null)" ]; then
+      dirty_dirs+=("${CC_DIRS[$i]}")
+      dirty_names+=("${CC_NAMES[$i]}")
+    fi
+  done
+  local meta_dirty=0
+  if [ -n "$CC_META_DIR" ] && [ -n "$(git -C . status --porcelain 2>/dev/null)" ]; then
+    meta_dirty=1
+  fi
+
+  if [ "${#dirty_dirs[@]}" -eq 0 ] && [ "$meta_dirty" -eq 0 ]; then
+    log "Nothing to commit."
+    return 0
+  fi
+
+  local batch seq subject
+  batch="$(mcrepo_new_batch_id)"
+  seq="$(mcrepo_next_seq)"
+  subject="$(mcrepo_commit_subject "$seq" "$batch" "$user_msg")"
+
+  log ""
+  log "Coordinated commit #$seq @$batch"
+  log "Subject: $subject"
+  log "Repos to commit:"
+  if [ "${#dirty_names[@]}" -gt 0 ]; then
+    for n in "${dirty_names[@]}"; do
+      log "  $n"
+    done
+  fi
+  [ "$meta_dirty" -eq 1 ] && log "  (meta-context)"
+  log ""
+
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf 'Proceed? [Y/n] ' >&2
+    local reply; IFS= read -r reply
+    case "$reply" in
+      ""|y|Y|yes) ;;
+      *) log "Aborted."; return 0 ;;
+    esac
+  fi
+
+  local had_failure=0
+  if [ "${#dirty_dirs[@]}" -gt 0 ]; then
+    for i in "${!dirty_dirs[@]}"; do
+      mcrepo_do_commit "${dirty_dirs[$i]}" "${dirty_names[$i]}" "$subject" || had_failure=1
+    done
+  fi
+  if [ "$meta_dirty" -eq 1 ]; then
+    mcrepo_do_commit "." "(meta-context)" "$subject" || had_failure=1
+  fi
+
+  if [ "$had_failure" -eq 1 ]; then
+    warn "One or more commits failed. Inspect repos and resolve manually."
+    return 1
+  fi
+  log "Coordinated commit #$seq complete."
+}
+
+_commit_revert() {
+  local include_read="$1"
+  local force="$2"
+
+  _cc_gather_targets "$include_read"
+
+  local -a all_dirs=() all_names=()
+  local i
+  if [ "${#CC_DIRS[@]}" -gt 0 ]; then
+    for i in "${!CC_DIRS[@]}"; do
+      all_dirs+=("${CC_DIRS[$i]}")
+      all_names+=("${CC_NAMES[$i]}")
+    done
+  fi
+  if [ -n "$CC_META_DIR" ]; then
+    all_dirs+=(".")
+    all_names+=("(meta-context)")
+  fi
+
+  if [ "${#all_dirs[@]}" -eq 0 ]; then
+    die "No target repos to inspect."
+  fi
+
+  # Collect (N, batch_id) per repo. Empty N means not coordinated.
+  local -a head_n=() head_batch=()
+  local max_n=0
+  for i in "${!all_dirs[@]}"; do
+    local subj n batch
+    subj="$(git -C "${all_dirs[$i]}" log -1 --format=%s 2>/dev/null || printf '')"
+    n="$(mcrepo_parse_n "$subj")"
+    batch="$(mcrepo_parse_batch_id "$subj")"
+    head_n+=("$n")
+    head_batch+=("$batch")
+    if [ -n "$n" ] && [ "$n" -gt "$max_n" ]; then
+      max_n="$n"
+    fi
+  done
+
+  if [ "$max_n" -eq 0 ]; then
+    die "No coordinated commit at HEAD in any target repo; nothing to revert."
+  fi
+
+  local -a peel_dirs=() peel_names=() peel_batches=()
+  local -a skip_names=() skip_reasons=()
+  for i in "${!all_dirs[@]}"; do
+    if [ -n "${head_n[$i]}" ] && [ "${head_n[$i]}" -eq "$max_n" ]; then
+      peel_dirs+=("${all_dirs[$i]}")
+      peel_names+=("${all_names[$i]}")
+      peel_batches+=("${head_batch[$i]}")
+    elif [ -z "${head_n[$i]}" ]; then
+      skip_names+=("${all_names[$i]}")
+      skip_reasons+=("HEAD not coordinated")
+    else
+      skip_names+=("${all_names[$i]}")
+      skip_reasons+=("HEAD at #${head_n[$i]} (< #$max_n)")
+    fi
+  done
+
+  # Sanity: all peel repos should share the same batch id.
+  local ref_batch=""
+  if [ "${#peel_batches[@]}" -gt 0 ]; then
+    ref_batch="${peel_batches[0]}"
+    local batch_mismatch=0
+    local b
+    for b in "${peel_batches[@]}"; do
+      [ "$b" != "$ref_batch" ] && batch_mismatch=1
+    done
+    [ "$batch_mismatch" -eq 1 ] && warn "Peel repos at #$max_n do not share a single batch id — proceeding anyway on #N match."
+  fi
+
+  # Pushed-check: refuse without --force if HEAD == upstream anywhere in peel.
+  if [ "$force" -ne 1 ] && [ "${#peel_dirs[@]}" -gt 0 ]; then
+    local pushed_blockers=0
+    for i in "${!peel_dirs[@]}"; do
+      local rd="${peel_dirs[$i]}"
+      if git -C "$rd" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+        local head_sha up_sha
+        head_sha="$(git -C "$rd" rev-parse HEAD 2>/dev/null || printf '')"
+        up_sha="$(git -C "$rd" rev-parse '@{u}' 2>/dev/null || printf '')"
+        if [ -n "$head_sha" ] && [ "$head_sha" = "$up_sha" ]; then
+          warn "HEAD is pushed in ${peel_names[$i]}."
+          pushed_blockers=1
+        fi
+      fi
+    done
+    if [ "$pushed_blockers" -eq 1 ]; then
+      die "Refusing to rewrite pushed history. Re-run with --force to proceed."
+    fi
+  fi
+
+  log ""
+  log "Would revert (git reset --hard HEAD~1) coordinated commit #$max_n @$ref_batch in:"
+  if [ "${#peel_names[@]}" -gt 0 ]; then
+    for n in "${peel_names[@]}"; do log "  $n"; done
+  fi
+  if [ "${#skip_names[@]}" -gt 0 ]; then
+    log "Skipping (not at top):"
+    for i in "${!skip_names[@]}"; do
+      log "  ${skip_names[$i]} — ${skip_reasons[$i]}"
+    done
+  fi
+  log ""
+
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf 'This is destructive. Proceed? [y/N] ' >&2
+    local reply; IFS= read -r reply
+    case "$reply" in
+      y|Y|yes) ;;
+      *) log "Aborted."; return 0 ;;
+    esac
+  elif [ "$force" -ne 1 ]; then
+    die "Non-interactive run requires --force."
+  fi
+
+  if [ "${#peel_dirs[@]}" -gt 0 ]; then
+    for i in "${!peel_dirs[@]}"; do
+      if git -C "${peel_dirs[$i]}" reset --hard HEAD~1 >/dev/null; then
+        log "  ${peel_names[$i]}: reverted"
+      else
+        warn "  ${peel_names[$i]}: reset failed"
+      fi
+    done
+  fi
+  log "Reverted coordinated commit #$max_n in ${#peel_dirs[@]} repo(s); ${#skip_names[@]} skipped."
+}
+
+_commit_reset() {
+  local include_read="$1"
+  local force="$2"
+
+  _cc_gather_targets "$include_read"
+
+  local -a dirty_dirs=() dirty_names=()
+  local i
+  if [ "${#CC_DIRS[@]}" -gt 0 ]; then
+    for i in "${!CC_DIRS[@]}"; do
+      if [ -n "$(git -C "${CC_DIRS[$i]}" status --porcelain 2>/dev/null)" ]; then
+        dirty_dirs+=("${CC_DIRS[$i]}")
+        dirty_names+=("${CC_NAMES[$i]}")
+      fi
+    done
+  fi
+  local meta_dirty=0
+  if [ -n "$CC_META_DIR" ] && [ -n "$(git -C . status --porcelain 2>/dev/null)" ]; then
+    meta_dirty=1
+  fi
+
+  if [ "${#dirty_dirs[@]}" -eq 0 ] && [ "$meta_dirty" -eq 0 ]; then
+    log "Nothing to reset."
+    return 0
+  fi
+
+  log ""
+  warn "WARNING: This will DISCARD all uncommitted changes in:"
+  if [ "${#dirty_names[@]}" -gt 0 ]; then
+    for n in "${dirty_names[@]}"; do warn "  $n"; done
+  fi
+  [ "$meta_dirty" -eq 1 ] && warn "  (meta-context)"
+  warn ""
+
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf 'This action cannot be undone. Proceed? [y/N] ' >&2
+    local reply; IFS= read -r reply
+    case "$reply" in
+      y|Y|yes) ;;
+      *) log "Aborted."; return 0 ;;
+    esac
+  elif [ "$force" -ne 1 ]; then
+    die "Non-interactive run requires --force."
+  fi
+
+  if [ "${#dirty_dirs[@]}" -gt 0 ]; then
+    for i in "${!dirty_dirs[@]}"; do
+      git -C "${dirty_dirs[$i]}" reset --hard HEAD >/dev/null 2>&1 || true
+      git -C "${dirty_dirs[$i]}" clean -fd >/dev/null 2>&1 || true
+      log "  ${dirty_names[$i]}: reset"
+    done
+  fi
+  if [ "$meta_dirty" -eq 1 ]; then
+    git -C . reset --hard HEAD >/dev/null 2>&1 || true
+    git -C . clean -fd >/dev/null 2>&1 || true
+    log "  (meta-context): reset"
+  fi
+}
+
+cmd_commit() {
+  local user_msg=""
+  local include_read=0
+  local do_revert=0
+  local do_reset=0
+  local force=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -m) shift; user_msg="${1:-}"; [ -n "$user_msg" ] || die "-m requires a message" ;;
+      --include-read) include_read=1 ;;
+      --revert) do_revert=1 ;;
+      --reset)  do_reset=1 ;;
+      --force)  force=1 ;;
+      -h|--help) log "Usage: mcrepo commit [-m <msg>] [--include-read]"; log "       mcrepo commit --revert [--include-read] [--force]"; log "       mcrepo commit --reset  [--include-read] [--force]"; return 0 ;;
+      *) die "Unknown commit option: $1" ;;
+    esac
+    shift
+  done
+  if [ "$do_revert" -eq 1 ] && [ "$do_reset" -eq 1 ]; then
+    die "--revert and --reset are mutually exclusive."
+  fi
+  if [ "$do_reset" -eq 1 ] && [ -n "$user_msg" ]; then
+    die "--reset does not accept -m."
+  fi
+  if [ "$do_revert" -eq 1 ] && [ -n "$user_msg" ]; then
+    die "--revert does not accept -m."
+  fi
+
+  load_repos
+
+  if   [ "$do_revert" -eq 1 ]; then _commit_revert "$include_read" "$force"
+  elif [ "$do_reset"  -eq 1 ]; then _commit_reset  "$include_read" "$force"
+  else                              _commit_forward "$user_msg"    "$include_read"
   fi
 }
 
@@ -4143,14 +4544,14 @@ cmd_branch() {
     fi
 
     if [ "$dirty_action" = "commit" ]; then
-      log "Auto-committing changes before switching ..."
+      local _bb _bs _bsubj
+      _bb="$(mcrepo_new_batch_id)"
+      _bs="$(mcrepo_next_seq)"
+      _bsubj="$(mcrepo_commit_subject "$_bs" "$_bb" "pre-branch-switch to $branch_name")"
+      log "Coordinated commit #$_bs before switching ..."
       for ddir in "${dirty_repo_dirs[@]}"; do
         if [ -n "$(git -C "$ddir" status --porcelain 2>/dev/null)" ]; then
-          git -C "$ddir" add -A
-          if ! git -C "$ddir" commit -m "WIP: auto-commit before switching to $branch_name"; then
-            die "Auto-commit failed in '$ddir'. Please commit manually."
-          fi
-          log "  Committed in $ddir"
+          mcrepo_do_commit "$ddir" "$ddir" "$_bsubj" || die "Coordinated commit failed in '$ddir'. Please commit manually."
         fi
       done
     fi
@@ -4617,6 +5018,7 @@ cmd_merge() {
   local -a merge_parents=()
   local -a preflight_errors=()
   local -a dirty_repos=()
+  local -a dirty_repo_dirs=()
 
   for i in "${!REPO_NAMES[@]}"; do
     mode="${REPO_MODES[$i]}"
@@ -4663,6 +5065,7 @@ cmd_merge() {
     # Dirty check
     if [ -n "$(git -C "$repo_dir" status --porcelain 2>/dev/null)" ]; then
       dirty_repos+=("$repo_name ($repo_dir)")
+      dirty_repo_dirs+=("$repo_dir")
     fi
 
     merge_indexes+=("$i")
@@ -4689,13 +5092,40 @@ cmd_merge() {
       fi
       if [ -n "$(git -C . status --porcelain 2>/dev/null)" ]; then
         dirty_repos+=("meta-context repo (.)")
+        dirty_repo_dirs+=(".")
       fi
       meta_included=1
     fi
   fi
 
   if [ "${#dirty_repos[@]}" -gt 0 ]; then
-    die "Uncommitted changes found in: ${dirty_repos[*]}. Commit or stash them first."
+    log ""
+    log "Uncommitted changes in: ${dirty_repos[*]}"
+    local merge_dirty_choice="abort"
+    if [ -t 0 ] && [ -t 1 ]; then
+      printf 'How would you like to handle uncommitted changes?\n' >&2
+      printf '  [a] Abort  — stop and handle manually\n' >&2
+      printf '  [c] Commit — coordinated commit now, then continue merge\n' >&2
+      printf 'Choice [a/c]: ' >&2
+      local md_reply; IFS= read -r md_reply
+      case "$md_reply" in c|C) merge_dirty_choice="commit" ;; esac
+    fi
+    case "$merge_dirty_choice" in
+      abort)
+        die "Uncommitted changes found in: ${dirty_repos[*]}. Commit or stash them first."
+        ;;
+      commit)
+        local _mb _ms _msubj
+        _mb="$(mcrepo_new_batch_id)"
+        _ms="$(mcrepo_next_seq)"
+        _msubj="$(mcrepo_commit_subject "$_ms" "$_mb" "pre-merge stopping point")"
+        log "Creating coordinated commit #$_ms @$_mb before merge."
+        local _md
+        for _md in "${dirty_repo_dirs[@]}"; do
+          mcrepo_do_commit "$_md" "$_md" "$_msubj" || die "Coordinated pre-merge commit failed in $_md."
+        done
+        ;;
+    esac
   fi
 
   if [ "${#preflight_errors[@]}" -gt 0 ]; then
@@ -5346,6 +5776,7 @@ main() {
     merge) cmd_merge "$@" ;;
     pull) cmd_pull "$@" ;;
     push) cmd_push "$@" ;;
+    commit) cmd_commit "$@" ;;
     continue) cmd_continue "$@" ;;
     abort) cmd_abort "$@" ;;
     open) cmd_open "$@" ;;

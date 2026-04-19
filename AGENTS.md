@@ -39,6 +39,7 @@ This file defines how AI agents should work in this repository, which develops `
 - Make focused, minimal changes.
 - Avoid unrelated refactors in the same change.
 - Keep user-facing messages clear and action-oriented.
+- When testing `mcrepo commit` locally, prefer sandbox directories (per "Testing Rules"); `commit --revert` and `commit --reset` are destructive.
 
 ## Versioning Rule
 
