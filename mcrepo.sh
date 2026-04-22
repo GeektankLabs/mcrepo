@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.4.6"
+MCREPO_VERSION="0.4.7"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -5304,8 +5304,41 @@ cmd_merge() {
   trap - EXIT
   save_repos
 
+  # Phase 4.5: Offer to clean up the merged source branch locally.
+  local do_delete=0
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf "Delete merged branch '%s' from all repos? [Y/n] " "$source_branch" >&2
+    local del_reply; IFS= read -r del_reply
+    case "$del_reply" in n|N) do_delete=0 ;; *) do_delete=1 ;; esac
+  fi
+
+  if [ "$do_delete" -eq 1 ]; then
+    log ""
+    log "Deleting '$source_branch' ..."
+    for idx in "${!merge_indexes[@]}"; do
+      local ri="${merge_indexes[$idx]}"
+      repo_name="${REPO_NAMES[$ri]}"
+      repo_dir="${merge_dirs[$idx]}"
+      if git -C "$repo_dir" branch -d "$source_branch" 2>/dev/null; then
+        log "  $repo_name: deleted."
+      else
+        warn "  $repo_name: could not safe-delete '$source_branch' (has unmerged commits). Run 'mcrepo branch --delete' to force."
+      fi
+    done
+    if [ "$meta_included" -eq 1 ]; then
+      if git -C . branch -d "$source_branch" 2>/dev/null; then
+        log "  (meta-context): deleted."
+      else
+        warn "  (meta-context): could not safe-delete '$source_branch'. Run 'mcrepo branch --delete' to force."
+      fi
+    fi
+  fi
+
   log ""
   log "Merge complete. Changes are local only — review and push when ready."
+  if [ "$do_delete" -eq 0 ]; then
+    log "Hint: run 'mcrepo branch --delete' to remove '$source_branch' when you're ready."
+  fi
   if [ -n "$GLOBAL_BRANCH" ]; then
     local has_more_parents=0
     for i in "${!REPO_PARENTS[@]}"; do
