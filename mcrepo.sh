@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.4.7"
+MCREPO_VERSION="0.4.8"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -72,6 +72,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh commit [-m "msg"] [--include-read]     # Coordinated commit across dirty write repos + meta-context
   ./mcrepo.sh commit --revert [--include-read] [--force]  # Peel the highest-#N coordinated commit off HEAD (reset --hard HEAD~1)
   ./mcrepo.sh commit --reset  [--include-read] [--force]  # Discard uncommitted changes across all target repos
+  ./mcrepo.sh branch                                 # List coordinated branches across write repos (alias: 'branch list')
   ./mcrepo.sh branch <branch-name> [--include-read]  # Switch/create global branch (interactive dirty-change handling)
   ./mcrepo.sh branch --off                           # Turn off branch coordination (fallback — see merge/--delete)
   ./mcrepo.sh branch --delete                        # Delete global branch, switch repos back to parent branches
@@ -925,7 +926,7 @@ _mcrepo_complete() {
       ;;
     branch)
       if [ "$COMP_CWORD" -eq 2 ]; then
-        COMPREPLY=( $(compgen -W "--off --delete --include-read" -- "$cur") )
+        COMPREPLY=( $(compgen -W "list --off --delete --include-read" -- "$cur") )
       else
         COMPREPLY=( $(compgen -W "--include-read" -- "$cur") )
       fi
@@ -1032,7 +1033,7 @@ _mcrepo_complete() {
       ;;
     branch)
       if (( CURRENT == 3 )); then
-        compadd -- --off --delete --include-read
+        compadd -- list --off --delete --include-read
       elif (( CURRENT == 4 )); then
         compadd -- --include-read
       fi
@@ -4333,14 +4334,131 @@ switch_repo_branch() {
   git -C "$repo_dir" checkout -b "$target_branch"
 }
 
+# List branches across write-mode repos (and meta-context). Shows the currently
+# active global/coordinated branch, branches present in every participating
+# repo (fully coordinated), and branches only present in some repos (partial).
+cmd_branch_list() {
+  load_repos
+
+  log ""
+  log "=== Coordinated branches ==="
+  log ""
+
+  if [ -n "$GLOBAL_BRANCH" ]; then
+    log "Active global branch: $GLOBAL_BRANCH"
+  else
+    log "Active global branch: (none — repos are on their default/parent branches)"
+  fi
+
+  local i mode repo_name repo_dir
+  local -a part_names=()
+  local -a part_dirs=()
+
+  for i in "${!REPO_NAMES[@]}"; do
+    mode="${REPO_MODES[$i]}"
+    [ "$mode" = "write" ] || continue
+    repo_name="${REPO_NAMES[$i]}"
+    repo_dir="$(get_repo_dir "$repo_name" "$mode")"
+    [ -d "$repo_dir/.git" ] || continue
+    part_names+=("$repo_name")
+    part_dirs+=("$repo_dir")
+  done
+
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    part_names+=("(meta-context)")
+    part_dirs+=(".")
+  fi
+
+  local repo_count="${#part_names[@]}"
+  if [ "$repo_count" -eq 0 ]; then
+    log ""
+    log "No write-mode repositories available to list branches from."
+    return 0
+  fi
+
+  log ""
+  log "Participating repos ($repo_count):"
+  for i in "${!part_names[@]}"; do
+    log "  - ${part_names[$i]}"
+  done
+
+  local -a branch_list=()
+  local -a branch_counts=()
+  local j k dir branch found
+  for j in "${!part_dirs[@]}"; do
+    dir="${part_dirs[$j]}"
+    while IFS= read -r branch; do
+      [ -n "$branch" ] || continue
+      found=-1
+      for k in "${!branch_list[@]}"; do
+        if [ "${branch_list[$k]}" = "$branch" ]; then
+          found="$k"
+          break
+        fi
+      done
+      if [ "$found" = "-1" ]; then
+        branch_list+=("$branch")
+        branch_counts+=(1)
+      else
+        branch_counts[$found]=$(( ${branch_counts[$found]} + 1 ))
+      fi
+    done < <(git -C "$dir" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)
+  done
+
+  if [ "${#branch_list[@]}" -eq 0 ]; then
+    log ""
+    log "No local branches found in participating repos."
+    return 0
+  fi
+
+  local -a full_lines=()
+  local -a partial_lines=()
+  local b c marker
+  for k in "${!branch_list[@]}"; do
+    b="${branch_list[$k]}"
+    c="${branch_counts[$k]}"
+    marker=" "
+    if [ -n "$GLOBAL_BRANCH" ] && [ "$b" = "$GLOBAL_BRANCH" ]; then
+      marker="*"
+    fi
+    if [ "$c" -eq "$repo_count" ]; then
+      full_lines+=("  $marker $b")
+    else
+      partial_lines+=("  $marker $b  ($c/$repo_count repos)")
+    fi
+  done
+
+  log ""
+  if [ "${#full_lines[@]}" -gt 0 ]; then
+    log "Branches present in all $repo_count repo(s):"
+    printf '%s\n' "${full_lines[@]}" | LC_ALL=C sort
+  else
+    log "No branches are present across all $repo_count repo(s)."
+  fi
+
+  if [ "${#partial_lines[@]}" -gt 0 ]; then
+    log ""
+    log "Branches present in some repos only:"
+    printf '%s\n' "${partial_lines[@]}" | LC_ALL=C sort
+  fi
+
+  log ""
+  log "Legend: '*' marks the currently active coordinated branch."
+  log "Use './mcrepo.sh branch <name>' to switch or create a coordinated branch."
+}
+
 # Switch all target repos (and meta-context) to a branch. Handles two modes:
 #   Fork (new branch): confirms with user, records current branch as parent.
 #   Jump (existing branch): switches without recording parent.
 # If uncommitted changes exist, offers interactive options:
 #   [a]bort, [c]ommit, [r] carry (dry-run stash+pop), [d]iscard.
-# Also handles --off (disable coordination) and --delete (discard branch).
+# Also handles --off (disable coordination), --delete (discard branch),
+# and 'list' / no args (list coordinated branches).
 cmd_branch() {
-  [ "$#" -ge 1 ] || die "Usage: ./mcrepo.sh branch <branch-name|--off|--delete> [--include-read]"
+  if [ "$#" -eq 0 ] || [ "${1:-}" = "list" ] || [ "${1:-}" = "--list" ]; then
+    cmd_branch_list
+    return 0
+  fi
   local branch_name="$1"
   shift
 
@@ -4454,6 +4572,12 @@ cmd_branch() {
   fi
 
   # --- Phase 2: Fork confirmation (interactive, only if at least one fork) ---
+  if [ "${#fork_names[@]}" -eq 0 ] && [ "${#jump_names[@]}" -gt 0 ]; then
+    log ""
+    log "Branch '$branch_name' already exists in all target repos — switching to existing branch (no new branch will be created)."
+    log "  Jump targets: ${jump_names[*]}"
+    log ""
+  fi
   if [ "${#fork_names[@]}" -gt 0 ]; then
     log ""
     log "Branch '$branch_name' would be NEW (fork) in: ${fork_names[*]}"
@@ -4665,11 +4789,14 @@ cmd_branch() {
   for idx in "${!target_indexes[@]}"; do
     local ti="${target_indexes[$idx]}"
     repo_dir="${target_dirs[$idx]}"
+    local rname="${REPO_NAMES[$ti]}"
+    local parent_for_log=""
 
     # Only record parent when actually forking a new branch (not jumping)
     if [ "${target_is_fork[$idx]}" -eq 1 ]; then
       local current_branch
       current_branch="$(repo_branch "$repo_dir")"
+      parent_for_log="$current_branch"
       # Push current branch onto this repo's parent stack before switching.
       # Stack format: "grandparent,parent" — rightmost is immediate parent.
       if [ -n "${REPO_PARENTS[$ti]:-}" ]; then
@@ -4680,13 +4807,21 @@ cmd_branch() {
     fi
 
     switch_repo_branch "$repo_dir" "$branch_name"
+
+    if [ "${target_is_fork[$idx]}" -eq 1 ]; then
+      log "  '$rname': created NEW branch '$branch_name' off parent '$parent_for_log'."
+    else
+      log "  '$rname': switched to EXISTING branch '$branch_name' (no parent recorded)."
+    fi
   done
 
   # Meta-context repo: fork-vs-jump parent tracking + switch
   if [ "$meta_is_target" -eq 1 ]; then
+    local meta_parent_for_log=""
     if [ "$meta_is_fork" -eq 1 ]; then
       local meta_current
       meta_current="$(repo_branch ".")"
+      meta_parent_for_log="$meta_current"
       # Push meta-context repo's current branch onto its parent stack
       if [ -n "$META_PARENT" ]; then
         META_PARENT="${META_PARENT},$meta_current"
@@ -4695,6 +4830,12 @@ cmd_branch() {
       fi
     fi
     switch_repo_branch "." "$branch_name"
+
+    if [ "$meta_is_fork" -eq 1 ]; then
+      log "  '(meta-context)': created NEW branch '$branch_name' off parent '$meta_parent_for_log'."
+    else
+      log "  '(meta-context)': switched to EXISTING branch '$branch_name' (no parent recorded)."
+    fi
   fi
 
   # --- Phase 6: Pop stash if carry was chosen ---
@@ -4995,7 +5136,7 @@ cmd_merge() {
   load_repos
 
   if [ -z "$GLOBAL_BRANCH" ]; then
-    die "No global branch set. Use './mcrepo.sh branch <name>' first."
+    die "No feature branch active — repos are on their default/parent branch already, so there is nothing to merge here. Use 'mcrepo commit' and 'mcrepo push' to send changes directly to origin, or run 'mcrepo branch <name>' to start a new feature branch first."
   fi
 
   local source_branch="$GLOBAL_BRANCH"
