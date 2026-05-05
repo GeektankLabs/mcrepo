@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.4.9"
+MCREPO_VERSION="0.4.11"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -90,7 +90,8 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh branch <branch-name> [--include-read]  # Switch/create global branch (interactive dirty-change handling)
   ./mcrepo.sh branch --off                           # Turn off branch coordination (fallback — see merge/--delete)
   ./mcrepo.sh branch --delete                        # Delete global branch, switch repos back to parent branches
-  ./mcrepo.sh merge                                  # Merge global branch into each repo's parent branch (local only)
+  ./mcrepo.sh merge [-m "subject"]                   # Squash-merge global branch into each repo's parent (default subject = branch name)
+  ./mcrepo.sh merge --no-squash                      # Legacy: --no-ff merge commit instead of squash
   ./mcrepo.sh merge --rebase                         # Sync: merge parent branch into current global branch (auto-stashes)
   ./mcrepo.sh pull                                   # Fetch + fast-forward pull from origin for all active repos
   ./mcrepo.sh pull --rebase                          # Auto-stash, pull, pop stash (handles dirty repos safely)
@@ -5135,15 +5136,24 @@ cmd_branch_delete() {
 # Merge the global branch into each write-repo's parent branch (local only, no push).
 # Dispatches to cmd_merge_rebase() when --rebase is given.
 #
+# Default strategy is squash: collapses all commits on the source branch into a single
+# commit on the parent, with the branch name as the default subject. Use --no-squash
+# to fall back to the legacy `git merge --no-ff` behavior.
+#
 # Workflow: pre-flight → dry-run → execute → update parent stacks.
 # If dry-run detects conflicts, aborts and suggests 'merge --rebase'.
 # After merge, pops each repo's parent stack one level (nested branch support).
 cmd_merge() {
   local do_rebase=0
+  local do_squash=1
+  local commit_message=""
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --rebase) do_rebase=1 ;;
+      --no-squash) do_squash=0 ;;
+      --squash) do_squash=1 ;;
+      -m) shift; commit_message="${1:-}"; [ -n "$commit_message" ] || die "-m requires a message" ;;
       *) die "Unknown merge option: $1" ;;
     esac
     shift
@@ -5391,6 +5401,15 @@ cmd_merge() {
   log "=== Executing merges ==="
   log ""
 
+  local strategy_label
+  if [ "$do_squash" -eq 1 ]; then
+    strategy_label="squash"
+  else
+    strategy_label="merge commit (--no-ff)"
+  fi
+  log "Strategy: $strategy_label"
+  log ""
+
   for idx in "${!merge_indexes[@]}"; do
     local ri="${merge_indexes[$idx]}"
     repo_name="${REPO_NAMES[$ri]}"
@@ -5399,20 +5418,52 @@ cmd_merge() {
 
     log "Merging in '$repo_name' ($source_branch -> $target) ..."
     git -C "$repo_dir" checkout "$target"
-    if ! git -C "$repo_dir" merge --no-ff "$source_branch" -m "Merge branch '$source_branch' into $target"; then
-      die "Merge failed in '$repo_name'. Resolve conflicts manually."
+    if [ "$do_squash" -eq 1 ]; then
+      local subject="${commit_message:-$source_branch}"
+      if ! git -C "$repo_dir" merge --squash "$source_branch"; then
+        die "Squash-merge failed in '$repo_name'. Resolve conflicts manually."
+      fi
+      if git -C "$repo_dir" diff --cached --quiet; then
+        log "  Already up to date."
+      else
+        if ! git -C "$repo_dir" commit -m "$subject"; then
+          die "Squash commit failed in '$repo_name'."
+        fi
+        log "  Done."
+      fi
+    else
+      local nf_subject="${commit_message:-Merge branch '$source_branch' into $target}"
+      if ! git -C "$repo_dir" merge --no-ff "$source_branch" -m "$nf_subject"; then
+        die "Merge failed in '$repo_name'. Resolve conflicts manually."
+      fi
+      log "  Done."
     fi
-    log "  Done."
   done
 
   # Merge meta-context
   if [ "$meta_included" -eq 1 ]; then
     log "Merging in '(meta-context)' ($source_branch -> $meta_parent_branch) ..."
     git -C . checkout "$meta_parent_branch"
-    if ! git -C . merge --no-ff "$source_branch" -m "Merge branch '$source_branch' into $meta_parent_branch"; then
-      die "Merge failed in meta-context repo. Resolve conflicts manually."
+    if [ "$do_squash" -eq 1 ]; then
+      local meta_subject="${commit_message:-$source_branch}"
+      if ! git -C . merge --squash "$source_branch"; then
+        die "Squash-merge failed in meta-context repo. Resolve conflicts manually."
+      fi
+      if git -C . diff --cached --quiet; then
+        log "  Already up to date."
+      else
+        if ! git -C . commit -m "$meta_subject"; then
+          die "Squash commit failed in meta-context repo."
+        fi
+        log "  Done."
+      fi
+    else
+      local meta_nf_subject="${commit_message:-Merge branch '$source_branch' into $meta_parent_branch}"
+      if ! git -C . merge --no-ff "$source_branch" -m "$meta_nf_subject"; then
+        die "Merge failed in meta-context repo. Resolve conflicts manually."
+      fi
+      log "  Done."
     fi
-    log "  Done."
   fi
 
   # Phase 4: Post-merge state update
@@ -5461,12 +5512,44 @@ cmd_merge() {
   trap - EXIT
   save_repos
 
+  # Phase 4.4: Commit the post-merge state in mcrepo.yaml so it lives in git
+  # history and can be pushed alongside the merge — instead of sitting as an
+  # orphan dirty change in the meta-context right after a successful merge.
+  # Stages ONLY mcrepo.yaml so unrelated dirty files (if any) are left alone.
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1 && \
+     [ -n "$(git -C . status --porcelain -- "$REPOS_FILE" 2>/dev/null)" ]; then
+    log ""
+    local yaml_subject
+    if [ "$all_same" -eq 1 ] && [ -n "$first_target" ]; then
+      yaml_subject="mcrepo: post-merge state — '$source_branch' merged into '$first_target'"
+    else
+      yaml_subject="mcrepo: post-merge state — '$source_branch' merged"
+    fi
+    log "Committing post-merge state to '$REPOS_FILE' in meta-context ..."
+    if ! git -C . add -- "$REPOS_FILE"; then
+      warn "  git add of '$REPOS_FILE' failed; commit it manually."
+    elif ! git -C . commit -m "$yaml_subject"; then
+      warn "  git commit of '$REPOS_FILE' failed; unstaging."
+      git -C . reset HEAD -- "$REPOS_FILE" >/dev/null 2>&1 || true
+    else
+      log "  Done."
+    fi
+  fi
+
   # Phase 4.5: Offer to clean up the merged source branch locally.
+  # Squash-merge breaks `git branch -d` reachability, so the squash path uses
+  # force-delete with an explicit prompt; the --no-ff path keeps safe-delete.
   local do_delete=0
   if [ -t 0 ] && [ -t 1 ]; then
-    printf "Delete merged branch '%s' from all repos? [Y/n] " "$source_branch" >&2
-    local del_reply; IFS= read -r del_reply
-    case "$del_reply" in n|N) do_delete=0 ;; *) do_delete=1 ;; esac
+    if [ "$do_squash" -eq 1 ]; then
+      printf "Branch '%s' was squash-merged; safe-delete won't detect it — force-delete from all repos? [y/N] " "$source_branch" >&2
+      local del_reply; IFS= read -r del_reply
+      case "$del_reply" in y|Y|yes) do_delete=1 ;; *) do_delete=0 ;; esac
+    else
+      printf "Delete merged branch '%s' from all repos? [Y/n] " "$source_branch" >&2
+      local del_reply; IFS= read -r del_reply
+      case "$del_reply" in n|N) do_delete=0 ;; *) do_delete=1 ;; esac
+    fi
   fi
 
   if [ "$do_delete" -eq 1 ]; then
@@ -5476,17 +5559,33 @@ cmd_merge() {
       local ri="${merge_indexes[$idx]}"
       repo_name="${REPO_NAMES[$ri]}"
       repo_dir="${merge_dirs[$idx]}"
-      if git -C "$repo_dir" branch -d "$source_branch" 2>/dev/null; then
-        log "  $repo_name: deleted."
+      if [ "$do_squash" -eq 1 ]; then
+        if git -C "$repo_dir" branch -D "$source_branch" 2>/dev/null; then
+          log "  $repo_name: deleted (forced)."
+        else
+          warn "  $repo_name: could not delete '$source_branch'."
+        fi
       else
-        warn "  $repo_name: could not safe-delete '$source_branch' (has unmerged commits). Run 'mcrepo branch --delete' to force."
+        if git -C "$repo_dir" branch -d "$source_branch" 2>/dev/null; then
+          log "  $repo_name: deleted."
+        else
+          warn "  $repo_name: could not safe-delete '$source_branch' (has unmerged commits). Run 'mcrepo branch --delete' to force."
+        fi
       fi
     done
     if [ "$meta_included" -eq 1 ]; then
-      if git -C . branch -d "$source_branch" 2>/dev/null; then
-        log "  (meta-context): deleted."
+      if [ "$do_squash" -eq 1 ]; then
+        if git -C . branch -D "$source_branch" 2>/dev/null; then
+          log "  (meta-context): deleted (forced)."
+        else
+          warn "  (meta-context): could not delete '$source_branch'."
+        fi
       else
-        warn "  (meta-context): could not safe-delete '$source_branch'. Run 'mcrepo branch --delete' to force."
+        if git -C . branch -d "$source_branch" 2>/dev/null; then
+          log "  (meta-context): deleted."
+        else
+          warn "  (meta-context): could not safe-delete '$source_branch'. Run 'mcrepo branch --delete' to force."
+        fi
       fi
     fi
   fi

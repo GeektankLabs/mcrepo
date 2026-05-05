@@ -105,10 +105,12 @@ This is the counterpart to `mcrepo merge`. While `merge` saves work into the par
 
 ### Merging Back
 
-After feature work is complete, merge the coordinated branch back into each repo's parent branch:
+After feature work is complete, squash the coordinated branch back into each repo's parent branch:
 
 ```bash
-mcrepo merge
+mcrepo merge                  # squash; subject defaults to the source branch name
+mcrepo merge -m "feat: ..."   # squash with explicit subject
+mcrepo merge --no-squash      # legacy: --no-ff merge commit per repo
 ```
 
 If the dry-run detects conflicts, sync with the parent branch first:
@@ -120,12 +122,15 @@ mcrepo merge --rebase
 Behavior details:
 
 - `mcrepo merge` requires a global branch to be set.
+- **Default strategy is squash.** Each repo gets one new commit on its parent whose subject is either `-m "..."` or the source branch name. WIP commits on the feature branch are collapsed away. Use `--no-squash` for the previous `git merge --no-ff` behavior.
 - Parent branches are recorded automatically by `mcrepo branch` — each repo can have a different parent.
 - The meta-context repo (`.`) participates in both branching and merging with its own parent tracking (`meta-parent:` in `mcrepo.yaml`).
 - `merge` performs a dry-run across ALL repos first. If any would conflict, no merges happen.
 - `merge --rebase` merges the parent INTO the current branch, auto-stashing uncommitted work (including untracked files).
 - Merges are local only (no push). Review and push per-repo when ready.
 - Nested branches are supported: `main → feature → sub-feature`. Each `merge` pops one level.
+- After a squash merge, the source branch's tip is no longer reachable from the parent, so the post-merge cleanup uses **force-delete** (`git branch -D`) with an explicit confirmation defaulting to **No**. The `--no-squash` path keeps the previous safe-delete (`git branch -d`) prompt.
+- The merge auto-commits the updated `mcrepo.yaml` in the meta-context (subject: `mcrepo: post-merge state — '<source>' merged into '<target>'`) so the popped parent stack and updated global branch land in git history immediately. Run `mcrepo push` afterward to publish the merge along with this state commit. Only `mcrepo.yaml` is staged — unrelated dirty files in the meta-context are left alone.
 - When no parent is recorded, mcrepo falls back to detecting the default branch (via `origin/HEAD`, remote query, or heuristic).
 
 ### Resuming or Aborting Mid-Operation Repos
