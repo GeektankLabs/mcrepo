@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.4.8"
+MCREPO_VERSION="0.4.9"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -23,6 +23,20 @@ log() {
 
 warn() {
   printf 'Warning: %s\n' "$*" >&2
+}
+
+# Run a command, capturing its stdout and prefixing each line with "  [name] ".
+# Stderr is suppressed (matches the existing per-repo git fetch/pull behavior).
+# Returns the wrapped command's exit status.
+run_with_repo_prefix() {
+  local rn="$1"
+  shift
+  local out rc=0
+  out="$("$@" 2>/dev/null)" || rc=$?
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out" | awk -v rn="$rn" '{ printf("  [%s] %s\n", rn, $0) }'
+  fi
+  return "$rc"
 }
 
 supports_color() {
@@ -2597,7 +2611,7 @@ cmd_pull() {
     if [ "$pull_mode" = "reset" ] && [ "$rdirty" = "dirty" ]; then
       git -C "$rd" checkout -- . 2>/dev/null || true
       git -C "$rd" clean -fd 2>/dev/null || true
-      if git -C "$rd" pull --ff-only 2>/dev/null; then
+      if run_with_repo_prefix "$rn" git -C "$rd" pull --ff-only; then
         updated_repos+=("$rn")
       else
         # Diverged: hard reset to origin
@@ -2608,7 +2622,7 @@ cmd_pull() {
     fi
 
     if [ "$pull_mode" = "reset" ] && [ "$rdirty" = "clean" ]; then
-      if git -C "$rd" pull --ff-only 2>/dev/null; then
+      if run_with_repo_prefix "$rn" git -C "$rd" pull --ff-only; then
         updated_repos+=("$rn")
       else
         git -C "$rd" reset --hard "origin/$rb" 2>/dev/null || { warn "Reset failed for '$rn'"; failed_repos+=("$rn"); continue; }
@@ -2622,7 +2636,7 @@ cmd_pull() {
       if git -C "$rd" stash push --include-untracked -m "mcrepo: auto-stash before pull" 2>/dev/null; then
         stashed=1
       fi
-      if git -C "$rd" pull --ff-only 2>/dev/null; then
+      if run_with_repo_prefix "$rn" git -C "$rd" pull --ff-only; then
         if [ "$stashed" -eq 1 ]; then
           if ! git -C "$rd" stash pop 2>/dev/null; then
             warn "Stash pop conflict in '$rn'. Stash preserved — resolve manually with: cd $rd && git stash pop"
@@ -2646,7 +2660,7 @@ cmd_pull() {
     fi
 
     # Default/rebase clean: ff-only pull
-    if git -C "$rd" pull --ff-only 2>/dev/null; then
+    if run_with_repo_prefix "$rn" git -C "$rd" pull --ff-only; then
       updated_repos+=("$rn")
     else
       warn "Pull failed for '$rn' (diverged or conflict)"
@@ -2664,7 +2678,7 @@ cmd_pull() {
     elif [ "$pull_mode" = "reset" ] && [ "$meta_dirty" = "dirty" ]; then
       git -C . checkout -- . 2>/dev/null || true
       git -C . clean -fd 2>/dev/null || true
-      if git -C . pull --ff-only 2>/dev/null; then
+      if run_with_repo_prefix "(meta-context)" git -C . pull --ff-only; then
         updated_repos+=("(meta-context)")
       else
         git -C . reset --hard "origin/$meta_branch" 2>/dev/null || { warn "Reset failed for (meta-context)"; failed_repos+=("(meta-context)"); }
@@ -2675,7 +2689,7 @@ cmd_pull() {
       if git -C . stash push --include-untracked -m "mcrepo: auto-stash before pull" 2>/dev/null; then
         meta_stashed=1
       fi
-      if git -C . pull --ff-only 2>/dev/null; then
+      if run_with_repo_prefix "(meta-context)" git -C . pull --ff-only; then
         if [ "$meta_stashed" -eq 1 ]; then
           if ! git -C . stash pop 2>/dev/null; then
             warn "Stash pop conflict in (meta-context). Resolve manually: git stash pop"
@@ -2695,7 +2709,7 @@ cmd_pull() {
       had_dirty=1
       fetch_only_repos+=("(meta-context) (dirty)")
     else
-      if git -C . pull --ff-only 2>/dev/null; then
+      if run_with_repo_prefix "(meta-context)" git -C . pull --ff-only; then
         updated_repos+=("(meta-context)")
       else
         warn "Pull failed for (meta-context) (diverged or conflict)"
@@ -3295,6 +3309,7 @@ cmd_push() {
     fi
 
     # Push
+    log "--- Pushing $rn ---"
     if [ "${push_has_upstream[$i]}" -eq 0 ]; then
       if ! git -C "$rd" push -u origin "$rb"; then
         warn "Push failed for '$rn' (see git output above)"
@@ -3318,6 +3333,7 @@ cmd_push() {
 
   # Push meta-context last
   if [ -n "$meta_dir" ] && [ "$meta_class" = "ahead" ]; then
+    log "--- Pushing (meta-context) ---"
     if [ "$meta_has_upstream" -eq 0 ]; then
       if ! git -C . push -u origin "$meta_branch"; then
         warn "Push failed for (meta-context) (see git output above)"
