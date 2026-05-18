@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.4.11"
+MCREPO_VERSION="0.4.12"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -93,8 +93,8 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh merge [-m "subject"]                   # Squash-merge global branch into each repo's parent (default subject = branch name)
   ./mcrepo.sh merge --no-squash                      # Legacy: --no-ff merge commit instead of squash
   ./mcrepo.sh merge --rebase                         # Sync: merge parent branch into current global branch (auto-stashes)
-  ./mcrepo.sh pull                                   # Fetch + fast-forward pull from origin for all active repos
-  ./mcrepo.sh pull --rebase                          # Auto-stash, pull, pop stash (handles dirty repos safely)
+  ./mcrepo.sh pull                                   # Fetch + ff-pull all active repos; meta-context auto-stashes on dirty, sub-repos skip on dirty
+  ./mcrepo.sh pull --rebase                          # Auto-stash, pull, pop stash for ALL repos (handles dirty sub-repos safely)
   ./mcrepo.sh pull --reset                           # Discard local changes and reset to origin state (destructive!)
   ./mcrepo.sh push [-m "message"] [--no-fetch]       # Fetch + abort if behind, then commit (if -m) and push write-mode repos
 
@@ -1147,8 +1147,8 @@ It provides workspace governance across repos, shared documentation, tests, and 
 - Parent branches are recorded automatically when `mcrepo branch` forks a new branch. Each repo can have a different parent.
 - `mcrepo merge` merges the global branch into each write repo's parent branch (local only, no push). Performs a dry-run first.
 - `mcrepo merge --rebase` syncs the current branch with its parent by merging parent INTO the current branch. Auto-stashes uncommitted work.
-- `mcrepo pull` fetches and fast-forward pulls from origin for all non-sleep repos. Skips dirty repos (fetch only).
-- `mcrepo pull --rebase` auto-stashes uncommitted changes, pulls, then pops stash. Safe for dirty repos.
+- `mcrepo pull` fetches and fast-forward pulls from origin for all non-sleep repos. Meta-context is auto-stashed when dirty (so it always tracks upstream); dirty sub-repos are skipped (fetch only).
+- `mcrepo pull --rebase` auto-stashes uncommitted changes, pulls, then pops stash for ALL repos (including sub-repos). Safe for dirty repos.
 - `mcrepo pull --reset` discards all local changes and resets to origin state. Destructive — requires interactive confirmation.
 - `mcrepo push` pushes all write-mode repos with committed changes to origin.
 - `mcrepo push -m "message"` commits uncommitted changes in all dirty write-mode repos with the given message, then pushes.
@@ -1200,7 +1200,7 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 - `mcrepo branch <name>` distinguishes fork (new branch, records parent) from jump (existing branch, no parent change).
 - `mcrepo branch --delete` discards the global branch and reverts repos to their parent branches.
 - `mcrepo branch --off` is a fallback that turns off coordination without switching branches.
-- `mcrepo pull` fetches and pulls from origin for all active repos (ff-only). Use `pull --rebase` to auto-stash dirty repos.
+- `mcrepo pull` fetches and pulls from origin for all active repos (ff-only). Meta-context auto-stashes on dirty; dirty sub-repos skip — use `pull --rebase` to auto-stash sub-repos too.
 - `mcrepo push [-m "message"]` pushes write-mode repos. With `-m`, also commits uncommitted changes first (same coordinated-commit format as `mcrepo commit`).
 - When `branch:` is empty, branch coordination is off and repos manage branches independently.
 - When running non-interactively (e.g., from scripts or agents), `mcrepo branch` aborts if uncommitted changes exist. Ensure clean working trees before switching branches.
@@ -2570,11 +2570,9 @@ cmd_pull() {
     local meta_action
     if [ "$meta_has_upstream" -eq 0 ]; then
       meta_action="fetch only (no upstream)"
-    elif [ "$pull_mode" = "default" ] && [ "$meta_dirty" = "dirty" ]; then
-      meta_action="fetch only (dirty)"
     elif [ "$pull_mode" = "reset" ] && [ "$meta_dirty" = "dirty" ]; then
       meta_action="discard + reset"
-    elif [ "$pull_mode" = "rebase" ] && [ "$meta_dirty" = "dirty" ]; then
+    elif [ "$meta_dirty" = "dirty" ]; then
       meta_action="stash + pull + pop"
     else
       meta_action="fetch + pull"
@@ -2685,7 +2683,8 @@ cmd_pull() {
         git -C . reset --hard "origin/$meta_branch" 2>/dev/null || { warn "Reset failed for (meta-context)"; failed_repos+=("(meta-context)"); }
         updated_repos+=("(meta-context)")
       fi
-    elif [ "$pull_mode" = "rebase" ] && [ "$meta_dirty" = "dirty" ]; then
+    elif [ "$meta_dirty" = "dirty" ]; then
+      # Meta-context always auto-stashes on dirty so generator/unrelated edits don't block its pull.
       local meta_stashed=0
       if git -C . stash push --include-untracked -m "mcrepo: auto-stash before pull" 2>/dev/null; then
         meta_stashed=1
@@ -2706,9 +2705,6 @@ cmd_pull() {
         [ "$meta_stashed" -eq 1 ] && git -C . stash pop 2>/dev/null || true
         failed_repos+=("(meta-context)")
       fi
-    elif [ "$meta_dirty" = "dirty" ]; then
-      had_dirty=1
-      fetch_only_repos+=("(meta-context) (dirty)")
     else
       if run_with_repo_prefix "(meta-context)" git -C . pull --ff-only; then
         updated_repos+=("(meta-context)")
