@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.4.13"
+MCREPO_VERSION="0.4.14"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -824,6 +824,23 @@ ensure_gitignore_base() {
   if [ ! -f .gitignore ]; then
     : >.gitignore
   fi
+  ensure_gitignore_standard_entries
+}
+
+# Standard ignore entries that every mcrepo base workspace should carry,
+# regardless of which sub-repos are registered. Idempotent: only appends
+# entries that are not already present as exact lines.
+ensure_gitignore_standard_entries() {
+  [ -f .gitignore ] || : >.gitignore
+  local entry
+  local -a standard_entries=(
+    "graphify-out/"
+  )
+  for entry in "${standard_entries[@]}"; do
+    if ! grep -Fqx "$entry" .gitignore; then
+      printf '%s\n' "$entry" >>.gitignore
+    fi
+  done
 }
 
 ensure_gitignore_repo_entry() {
