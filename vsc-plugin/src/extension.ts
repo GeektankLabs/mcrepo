@@ -58,7 +58,7 @@ const SUPPORT_FOLDER_BADGES: Record<string, { badge: string; tooltip: string }> 
   "+-tests":     { badge: "🧪", tooltip: "MC-Repo Tests" },
   "+-skills":    { badge: "🧠", tooltip: "MC-Repo Skills" }
 };
-const SUPPORT_FOLDER_COLOR = new vscode.ThemeColor("descriptionForeground");
+const SUPPORT_FOLDER_COLOR = new vscode.ThemeColor("charts.purple");
 
 const WORKSPACE_SETTING_DEFAULTS: Record<string, unknown> = {
   "scm.alwaysShowRepositories": true,
