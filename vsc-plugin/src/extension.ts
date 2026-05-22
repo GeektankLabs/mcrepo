@@ -52,6 +52,14 @@ const MODE_COLORS: Record<string, vscode.ThemeColor | undefined> = {
   sleep: new vscode.ThemeColor("gitDecoration.ignoredResourceForeground")
 };
 
+const SUPPORT_FOLDER_BADGES: Record<string, { badge: string; tooltip: string }> = {
+  "+-contracts": { badge: "🧩", tooltip: "MC-Repo Contracts" },
+  "+-docs":      { badge: "🧾", tooltip: "MC-Repo Docs" },
+  "+-tests":     { badge: "🧪", tooltip: "MC-Repo Tests" },
+  "+-skills":    { badge: "🧠", tooltip: "MC-Repo Skills" }
+};
+const SUPPORT_FOLDER_COLOR = new vscode.ThemeColor("descriptionForeground");
+
 const WORKSPACE_SETTING_DEFAULTS: Record<string, unknown> = {
   "scm.alwaysShowRepositories": true,
   "scm.repositories.selectionMode": "multiple",
@@ -288,6 +296,10 @@ class McrepoDecorationProvider implements vscode.FileDecorationProvider {
     const map = new Map<string, FolderDecoration>();
     const repoNameByPath = new Map<string, string>();
     const repoSnapshot = new Map<string, RepoSnapshotEntry>();
+
+    for (const [folderName, meta] of Object.entries(SUPPORT_FOLDER_BADGES)) {
+      map.set(folderName, { badge: meta.badge, tooltip: meta.tooltip, color: SUPPORT_FOLDER_COLOR });
+    }
 
     const reposUri = vscode.Uri.joinPath(workspaceFolder.uri, REPOS_FILE);
     let rawContent: Uint8Array;

@@ -264,18 +264,19 @@ mcrepo open <repo-name>
 
 `init` generates coordination directories in the meta-context root:
 
-- `🧩 contracts/`: cross-repo interfaces and contracts
-- `🧾 docs/`: architecture, integration notes, and generated overviews
-- `🧪 tests/`: integration test setup and shared test assets
-- `🧠 skills/`: company and project specific skills (`skill.md`) with optional colocated helper scripts
+- `+-contracts/`: cross-repo interfaces and contracts
+- `+-docs/`: architecture, integration notes, and generated overviews
+- `+-tests/`: integration test setup and shared test assets
+- `+-skills/`: company and project specific skills (`skill.md`) with optional colocated helper scripts
 - `mcrepo.yaml`: source of truth for repos, modes, descriptions, and branch
 - `AGENTS.md`: generated workspace instructions that enforce mode gates and proactively point agents to RepoMapper MCP for codebase overview and Playwright for browser validation when available
 
 Design ordering principle:
 
 - Repositories use clean top-level names.
-- Shared folders (`🧩 contracts`, `🧾 docs`, `🧪 tests`, `🧠 skills`) are created directly at the top level.
-- The old visual separator directory is no longer created.
+- Shared folders (`+-contracts`, `+-docs`, `+-tests`, `+-skills`) are created directly at the top level.
+- The `+-` prefix is ASCII-only and shell-friendly (no quoting needed). VS Code shows emoji badges (🧩 🧾 🧪 🧠) next to each folder when the mcrepo plugin is installed.
+- The old visual separator directory is no longer created. Legacy schemes (`🧪 tests/`, `tests/`, etc.) are migrated automatically on `init`.
 
 ## Skills and Workspace Governance
 
@@ -307,15 +308,15 @@ ClawHub scan policy defaults:
 
 Activation behavior:
 
-- If `🧠 skills/skills.yaml` exists, enable/disable state is taken from that file.
-- If `🧠 skills/skills.yaml` is missing, every `🧠 skills/<id>/skill.md` is treated as active.
+- If `+-skills/skills.yaml` exists, enable/disable state is taken from that file.
+- If `+-skills/skills.yaml` is missing, every `+-skills/<id>/skill.md` is treated as active.
 - MC workspace skills are mirrored into `.opencode/skills/` so OpenCode can auto-discover them.
 - For sub-repositories, use standard `.opencode/skills/` (no emoji folder) for local skill installs.
 
 Skill layout (colocated docs + helpers):
 
 ```text
-🧠 skills/
++-skills/
   skills.yaml
   _templates/
     skill-template.md
@@ -326,7 +327,7 @@ Skill layout (colocated docs + helpers):
 
 Authoring notes:
 
-- Keep each skill self-contained in `🧠 skills/<id>/`.
+- Keep each skill self-contained in `+-skills/<id>/`.
 - Put process and guardrails in `skill.md`.
 - Put optional executable helpers (`run.sh`, `check.sh`) next to `skill.md`.
 - Use lowercase kebab-case skill IDs (for example: `release-prep`, `test-gate`).
@@ -345,8 +346,8 @@ These are starter skills meant to be edited or replaced with your company-specif
 
 After adding repositories, useful first tasks are:
 
-1. Ask your agent to scan all `read` repos and write an interface map into `🧾 docs/`.
-2. Ask your agent to scaffold an integration test setup (for example Docker Compose) in `🧪 tests/`.
+1. Ask your agent to scan all `read` repos and write an interface map into `+-docs/`.
+2. Ask your agent to scaffold an integration test setup (for example Docker Compose) in `+-tests/`.
 3. Ask your agent which repos should be switched to `write` for your next feature.
 
 ## Why This Instead of a Monorepo?

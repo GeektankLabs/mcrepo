@@ -2,16 +2,16 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.4.14"
+MCREPO_VERSION="0.5.0"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
 REPOS_FILE="mcrepo.yaml"
 LEGACY_SUPPORT_SCRIPTS_DIR="🛠 scripts"
-SUPPORT_CONTRACTS_DIR="🧩 contracts"
-SUPPORT_DOCS_DIR="🧾 docs"
-SUPPORT_TESTS_DIR="🧪 tests"
-SUPPORT_SKILLS_DIR="🧠 skills"
+SUPPORT_CONTRACTS_DIR="+-contracts"
+SUPPORT_DOCS_DIR="+-docs"
+SUPPORT_TESTS_DIR="+-tests"
+SUPPORT_SKILLS_DIR="+-skills"
 SKILLS_CONFIG_FILE="$SUPPORT_SKILLS_DIR/skills.yaml"
 OPENCODE_PROJECT_SKILLS_DIR=".opencode/skills"
 COMPLETION_BASH_FILE=".mcrepo-completion.bash"
@@ -1228,14 +1228,14 @@ It provides workspace governance across repos, shared documentation, tests, and 
 - `mcrepo pull --reset` discards all local changes and resets to origin state. Destructive — requires interactive confirmation.
 - `mcrepo push` pushes all write-mode repos with committed changes to origin.
 - `mcrepo push -m "message"` commits uncommitted changes in all dirty write-mode repos with the given message, then pushes.
-- `🧠 skills/` stores project and company specific agent skills.
+- `+-skills/` stores project and company specific agent skills.
 - Skills can include colocated helper scripts (for example `run.sh` or `check.sh`) next to `skill.md`.
 - ClawHub URL installs are scanned by default; `CRITICAL` blocks install and `HIGH` warns.
 
 ## Human Workflow
 
 - Commits, pull requests, and merges are done per repository.
-- Cross-repo changes should start by checking `🧩 contracts/` and `🧾 docs/`.
+- Cross-repo changes should start by checking `+-contracts/` and `+-docs/`.
 EOF
 }
 
@@ -1262,7 +1262,7 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 2. Edit **only** repositories marked `mode: write`.
 3. Treat repositories marked `mode: read` as strictly read-only (never modify files there).
 4. Treat repositories marked `mode: sleep` as strictly inactive: do not implement, do not research inside them, do not include them in active scope.
-5. For cross-repo changes, check `🧩 contracts/` and `🧾 docs/` first.
+5. For cross-repo changes, check `+-contracts/` and `+-docs/` first.
 6. Coordinate changes across all `write` repositories.
 7. Do not run `git commit`, `git push`, or `mcrepo commit` yourself. When a meaningful step of a feature or fix is reached — or at the start of a new plan/session when uncommitted changes already exist in write repos — tell the user to run `mcrepo commit -m "<short summary>"` so the working state is captured as a coordinated, revertable checkpoint. Leave the final decision with the user.
 8. Always wrap paths in quotes to handle spaces correctly.
@@ -1300,10 +1300,10 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 ## Skills Loading
 
 1. Enforce `mcrepo.yaml` mode gates first.
-2. Load active skills from `🧠 skills/`:
-   - If `🧠 skills/skills.yaml` exists, use its enable/disable lists.
-   - If no config exists, treat each `🧠 skills/<id>/skill.md` as active by default.
-3. `🧠 skills/` is the workspace source of truth and is mirrored to `.opencode/skills/` for OpenCode auto-discovery.
+2. Load active skills from `+-skills/`:
+   - If `+-skills/skills.yaml` exists, use its enable/disable lists.
+   - If no config exists, treat each `+-skills/<id>/skill.md` as active by default.
+3. `+-skills/` is the workspace source of truth and is mirrored to `.opencode/skills/` for OpenCode auto-discovery.
 4. For sub-repo write/change tasks, apply `subproject-skill-loader` and load repo-local skills only for repos in write scope.
 5. For each active skill, read `skill.md` first and run colocated helper scripts only when needed.
 
@@ -1374,7 +1374,7 @@ Coordinate cross-repo feature changes with explicit contract and docs checks.
 
 ## Procedure
 1. Read `mcrepo.yaml` and identify writable repositories.
-2. Check `🧩 contracts/` and `🧾 docs/` for existing agreements.
+2. Check `+-contracts/` and `+-docs/` for existing agreements.
 3. Implement only in writable repositories.
 4. Update contracts/docs if behavior changes.
 5. Validate repository-level tests before finishing.
@@ -1696,6 +1696,19 @@ remove_legacy_separator_dirs() {
 
 ensure_base_structure() {
   remove_legacy_separator_dirs
+
+  if [ -d "🧠 skills" ] && [ ! -e "$SUPPORT_SKILLS_DIR" ]; then
+    mv "🧠 skills" "$SUPPORT_SKILLS_DIR"
+  fi
+  if [ -d "🧩 contracts" ] && [ ! -e "$SUPPORT_CONTRACTS_DIR" ]; then
+    mv "🧩 contracts" "$SUPPORT_CONTRACTS_DIR"
+  fi
+  if [ -d "🧾 docs" ] && [ ! -e "$SUPPORT_DOCS_DIR" ]; then
+    mv "🧾 docs" "$SUPPORT_DOCS_DIR"
+  fi
+  if [ -d "🧪 tests" ] && [ ! -e "$SUPPORT_TESTS_DIR" ]; then
+    mv "🧪 tests" "$SUPPORT_TESTS_DIR"
+  fi
 
   if [ -d "🧠skills" ] && [ ! -e "$SUPPORT_SKILLS_DIR" ]; then
     mv "🧠skills" "$SUPPORT_SKILLS_DIR"

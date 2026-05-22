@@ -2,7 +2,7 @@
   "name": "mcrepo-multi-context",
   "displayName": "mcrepo (Multi-Context)",
   "description": "Explorer mode badges for mcrepo multi-context repositories",
-  "version": "0.0.6",
+  "version": "0.1.0",
   "publisher": "local",
   "engines": {
     "vscode": "^1.90.0"
@@ -38,17 +38,17 @@
         {
           "command": "mcrepoDecorations.setWrite",
           "group": "navigation@mcrepo",
-          "when": "explorerResourceIsFolder && resourceScheme == file && resourceFilename != '🧩 contracts' && resourceFilename != '🧾 docs' && resourceFilename != '🧪 tests' && resourceFilename != '🧠 skills'"
+          "when": "explorerResourceIsFolder && resourceScheme == file && resourceFilename != '+-contracts' && resourceFilename != '+-docs' && resourceFilename != '+-tests' && resourceFilename != '+-skills'"
         },
         {
           "command": "mcrepoDecorations.setRead",
           "group": "navigation@mcrepo",
-          "when": "explorerResourceIsFolder && resourceScheme == file && resourceFilename != '🧩 contracts' && resourceFilename != '🧾 docs' && resourceFilename != '🧪 tests' && resourceFilename != '🧠 skills'"
+          "when": "explorerResourceIsFolder && resourceScheme == file && resourceFilename != '+-contracts' && resourceFilename != '+-docs' && resourceFilename != '+-tests' && resourceFilename != '+-skills'"
         },
         {
           "command": "mcrepoDecorations.setSleep",
           "group": "navigation@mcrepo",
-          "when": "explorerResourceIsFolder && resourceScheme == file && resourceFilename != '🧩 contracts' && resourceFilename != '🧾 docs' && resourceFilename != '🧪 tests' && resourceFilename != '🧠 skills'"
+          "when": "explorerResourceIsFolder && resourceScheme == file && resourceFilename != '+-contracts' && resourceFilename != '+-docs' && resourceFilename != '+-tests' && resourceFilename != '+-skills'"
         }
       ]
     }
