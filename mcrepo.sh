@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.4.12"
+MCREPO_VERSION="0.4.13"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -68,15 +68,18 @@ Usage:  # Show available mcrepo commands
   WORKSPACE SETUP
 ═══════════════════════════════════════════════════════════════════════════════
   ./mcrepo.sh init [organization] [--no-shell-install] # Initialize MC-Repo structure and optionally sync repos from a GitHub organization
+  ./mcrepo.sh publish-base <git-url> [-m "msg"] [--force] # Git-manage this workspace (init if needed) and push to an empty remote; reconciles .gitignore before the first commit
 
 ═══════════════════════════════════════════════════════════════════════════════
   REPOSITORY MANAGEMENT
 ═══════════════════════════════════════════════════════════════════════════════
   ./mcrepo.sh add <git-url> [name]                # Add a repository to mcrepo.yaml (default mode: read) and clone it if needed
+  ./mcrepo.sh new <name> [-m "description"]       # Create a new LOCAL incubator sub-repo (files live committed in base mcrepo, no external remote yet)
+  ./mcrepo.sh publish <name> <git-url> [-m "msg"] [--force] # Graduate a local incubator: untrack from base, init sub-repo .git, push initial commit to empty remote
   ./mcrepo.sh remove <name-or-url> [--keep-files] [--force] # Remove a repository: drops YAML entry and deletes local folder (after confirming uncommitted/unpushed work); --keep-files preserves folder, --force skips prompts
   ./mcrepo.sh write <repo-name>                   # Switch a repository to write mode and auto-align to global branch (if configured)
   ./mcrepo.sh read <repo-name>                    # Switch a repository to read mode (read-only context)
-  ./mcrepo.sh sleep <repo-name> [--force]         # Switch a repository to sleep mode and clear its local folder contents
+  ./mcrepo.sh sleep <repo-name> [--force]         # Switch a repository to sleep mode and clear its local folder contents (local incubator repos: signal only, files preserved)
   ./mcrepo.sh sleep --wakeall                     # Wake all sleeping repositories and set them to read mode
   ./mcrepo.sh list                                # List configured repositories with mode, local clone state, and current branch
 
@@ -471,7 +474,7 @@ ensure_repos_file_exists() {
 }
 
 parse_repos_tsv() {
-  awk '
+  awk -v SEP=$'\x1f' '
     function trim(s) {
       gsub(/^[ \t]+|[ \t]+$/, "", s)
       return s
@@ -501,11 +504,13 @@ parse_repos_tsv() {
         description = v
       } else if (k == "parent") {
         parent = v
+      } else if (k == "local") {
+        local = v
       }
     }
     function emit() {
       if (in_item) {
-        print url "\t" name "\t" mode "\t" description "\t" parent
+        print url SEP name SEP mode SEP description SEP parent SEP local
       }
     }
     BEGIN {
@@ -515,6 +520,7 @@ parse_repos_tsv() {
       mode = ""
       description = ""
       parent = ""
+      local = ""
     }
     {
       line = $0
@@ -526,6 +532,7 @@ parse_repos_tsv() {
         mode = ""
         description = ""
         parent = ""
+        local = ""
         sub(/^[ \t]*-[ \t]*/, "", line)
         parse_kv(line)
         next
@@ -627,11 +634,22 @@ REPO_DESCRIPTIONS=()
 # Pushed on 'mcrepo branch', popped on 'mcrepo merge'.
 # Example: "main,feature" means feature is immediate parent, main is grandparent.
 REPO_PARENTS=()
+# Incubator flag per repo ("true"/"false"). Local repos live inside base mcrepo's
+# git history with no external remote until promoted via 'mcrepo publish'.
+REPO_LOCALS=()
 ORGANIZATION=""
 GLOBAL_BRANCH=""
 # Parent branch stack for the meta-context repo itself (same comma-separated
 # format as REPO_PARENTS). Tracked via 'meta-parent:' in mcrepo.yaml.
 META_PARENT=""
+
+is_repo_local() {
+  local idx="$1"
+  case "${REPO_LOCALS[$idx]:-false}" in
+    true|1|yes|TRUE|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 load_repos() {
   ensure_repos_file_exists
@@ -640,6 +658,7 @@ load_repos() {
   REPO_MODES=()
   REPO_DESCRIPTIONS=()
   REPO_PARENTS=()
+  REPO_LOCALS=()
   ORGANIZATION=""
   GLOBAL_BRANCH=""
   META_PARENT=""
@@ -648,12 +667,21 @@ load_repos() {
   GLOBAL_BRANCH="$(parse_branch || true)"
   META_PARENT="$(parse_meta_parent || true)"
 
-  local parsed_url parsed_name parsed_mode parsed_description parsed_parent
-  while IFS=$'\t' read -r parsed_url parsed_name parsed_mode parsed_description parsed_parent; do
-    [ -n "$parsed_url" ] || continue
-    if [ -z "$parsed_name" ]; then
-      parsed_name="$(derive_name_from_url "$parsed_url")"
+  local parsed_url parsed_name parsed_mode parsed_description parsed_parent parsed_local
+  while IFS=$'\x1f' read -r parsed_url parsed_name parsed_mode parsed_description parsed_parent parsed_local; do
+    local is_local="false"
+    case "${parsed_local:-}" in
+      true|1|yes|TRUE|YES) is_local="true" ;;
+    esac
+    if [ -z "$parsed_url" ] && [ "$is_local" != "true" ]; then
+      continue
     fi
+    if [ -z "$parsed_name" ]; then
+      if [ -n "$parsed_url" ]; then
+        parsed_name="$(derive_name_from_url "$parsed_url")"
+      fi
+    fi
+    [ -n "$parsed_name" ] || continue
     if ! validate_mode "${parsed_mode:-}"; then
       parsed_mode="read"
     fi
@@ -664,6 +692,7 @@ load_repos() {
     REPO_MODES+=("$parsed_mode")
     REPO_DESCRIPTIONS+=("$parsed_description")
     REPO_PARENTS+=("${parsed_parent:-}")
+    REPO_LOCALS+=("$is_local")
   done < <(parse_repos_tsv)
 }
 
@@ -679,20 +708,27 @@ save_repos() {
     printf 'meta-parent: %s\n' "$META_PARENT" >>"$REPOS_FILE"
   fi
 
-  if [ "${#REPO_URLS[@]}" -eq 0 ]; then
+  if [ "${#REPO_NAMES[@]}" -eq 0 ]; then
     printf 'repos: []\n' >>"$REPOS_FILE"
     return
   fi
 
   printf 'repos:\n' >>"$REPOS_FILE"
   local i
-  for i in "${!REPO_URLS[@]}"; do
-    printf '  - url: %s\n' "${REPO_URLS[$i]}" >>"$REPOS_FILE"
-    printf '    name: %s\n' "${REPO_NAMES[$i]}" >>"$REPOS_FILE"
+  for i in "${!REPO_NAMES[@]}"; do
+    if [ -n "${REPO_URLS[$i]:-}" ]; then
+      printf '  - url: %s\n' "${REPO_URLS[$i]}" >>"$REPOS_FILE"
+      printf '    name: %s\n' "${REPO_NAMES[$i]}" >>"$REPOS_FILE"
+    else
+      printf '  - name: %s\n' "${REPO_NAMES[$i]}" >>"$REPOS_FILE"
+    fi
     printf '    mode: %s\n' "${REPO_MODES[$i]}" >>"$REPOS_FILE"
     printf '    description: "%s"\n' "$(yaml_escape_double_quoted "${REPO_DESCRIPTIONS[$i]}")" >>"$REPOS_FILE"
     if [ -n "${REPO_PARENTS[$i]:-}" ]; then
       printf '    parent: %s\n' "${REPO_PARENTS[$i]}" >>"$REPOS_FILE"
+    fi
+    if is_repo_local "$i"; then
+      printf '    local: true\n' >>"$REPOS_FILE"
     fi
     printf '    localpath: %s\n' "$(repo_local_path_for_mode "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")" >>"$REPOS_FILE"
   done
@@ -759,6 +795,7 @@ sync_organization_repos() {
     REPO_MODES+=("read")
     REPO_DESCRIPTIONS+=("")
     REPO_PARENTS+=("")
+    REPO_LOCALS+=("false")
     ensure_gitignore_repo_entry "$repo_name"
     imported=$((imported + 1))
   done <<<"$repo_rows"
@@ -768,9 +805,14 @@ sync_organization_repos() {
 
 find_repo_index() {
   local needle="$1"
+  [ -n "$needle" ] || return 1
   local i
   for i in "${!REPO_NAMES[@]}"; do
-    if [ "${REPO_NAMES[$i]}" = "$needle" ] || [ "${REPO_URLS[$i]}" = "$needle" ]; then
+    if [ "${REPO_NAMES[$i]}" = "$needle" ]; then
+      printf '%s' "$i"
+      return 0
+    fi
+    if [ -n "${REPO_URLS[$i]:-}" ] && [ "${REPO_URLS[$i]}" = "$needle" ]; then
       printf '%s' "$i"
       return 0
     fi
@@ -832,6 +874,23 @@ remove_gitignore_repo_entry() {
     tmp="$(mktemp)"
     grep -Fvx "$variant" .gitignore >"$tmp" || true
     mv "$tmp" .gitignore
+  done
+}
+
+# Walks every loaded repo and reconciles base .gitignore against its kind:
+#   - External repos (local=false): must have /<name>/ entry → ensure_gitignore_repo_entry.
+#   - Local incubator repos (local=true): must NOT have /<name>/ entry → remove_gitignore_repo_entry.
+# Idempotent. Safe to call repeatedly. Must be called BEFORE the first base
+# commit during 'mcrepo publish-base' so external sub-repos don't leak in.
+reconcile_gitignore_with_repos() {
+  ensure_gitignore_base
+  local i
+  for i in "${!REPO_NAMES[@]}"; do
+    if is_repo_local "$i"; then
+      remove_gitignore_repo_entry "${REPO_NAMES[$i]}"
+    else
+      ensure_gitignore_repo_entry "${REPO_NAMES[$i]}"
+    fi
   done
 }
 
@@ -1882,6 +1941,7 @@ cmd_add() {
   REPO_MODES+=("$mode")
   REPO_DESCRIPTIONS+=("")
   REPO_PARENTS+=("")
+  REPO_LOCALS+=("false")
   save_repos
 
   ensure_gitignore_repo_entry "$name"
@@ -1935,6 +1995,10 @@ cmd_remove() {
 
   local removed_name="${REPO_NAMES[$idx]}"
   local removed_mode="${REPO_MODES[$idx]}"
+  local removed_is_local="false"
+  if is_repo_local "$idx"; then
+    removed_is_local="true"
+  fi
 
   local repo_dir=""
   if repo_dir="$(find_existing_repo_dir "$removed_name")"; then
@@ -1953,6 +2017,10 @@ cmd_remove() {
     local no_upstream=0
     local has_stash=0
     local is_sleep_placeholder=0
+
+    if [ "$removed_is_local" = "true" ]; then
+      concerns+=("local incubator repo - files are committed in base mcrepo history")
+    fi
 
     if [ -d "$repo_dir/.git" ]; then
       is_git_repo=1
@@ -1987,7 +2055,7 @@ cmd_remove() {
     [ "$unpushed" -eq 1 ] && concerns+=("unpushed commits")
     [ "$no_upstream" -eq 1 ] && concerns+=("no upstream configured (local commits would be lost)")
     [ "$has_stash" -eq 1 ] && concerns+=("stashed changes")
-    if [ "$is_git_repo" -eq 0 ] && [ "$is_sleep_placeholder" -eq 0 ] && ! directory_is_empty "$repo_dir"; then
+    if [ "$is_git_repo" -eq 0 ] && [ "$is_sleep_placeholder" -eq 0 ] && [ "$removed_is_local" != "true" ] && ! directory_is_empty "$repo_dir"; then
       concerns+=("directory is not a git repo")
     fi
 
@@ -2031,37 +2099,400 @@ cmd_remove() {
   local old_modes=("${REPO_MODES[@]}")
   local old_descriptions=("${REPO_DESCRIPTIONS[@]}")
   local old_parents=("${REPO_PARENTS[@]}")
+  local old_locals=("${REPO_LOCALS[@]}")
 
   REPO_URLS=()
   REPO_NAMES=()
   REPO_MODES=()
   REPO_DESCRIPTIONS=()
   REPO_PARENTS=()
+  REPO_LOCALS=()
 
   local i
-  for i in "${!old_urls[@]}"; do
+  for i in "${!old_names[@]}"; do
     if [ "$i" -ne "$idx" ]; then
       REPO_URLS+=("${old_urls[$i]}")
       REPO_NAMES+=("${old_names[$i]}")
       REPO_MODES+=("${old_modes[$i]}")
       REPO_DESCRIPTIONS+=("${old_descriptions[$i]}")
       REPO_PARENTS+=("${old_parents[$i]}")
+      REPO_LOCALS+=("${old_locals[$i]}")
     fi
   done
   save_repos
 
   if [ "$delete_dir" -eq 1 ] && [ -n "$repo_dir" ] && [ -e "$repo_dir" ]; then
-    rm -rf -- "$repo_dir"
-    log "Deleted local folder: $repo_dir"
+    if [ "$removed_is_local" = "true" ] && git -C . rev-parse --git-dir >/dev/null 2>&1; then
+      if git -C . ls-files --error-unmatch -- "$repo_dir/" >/dev/null 2>&1 \
+        || [ -n "$(git -C . ls-files -- "$repo_dir/" 2>/dev/null)" ]; then
+        git -C . rm -rf -- "$repo_dir" >/dev/null 2>&1 || rm -rf -- "$repo_dir"
+        log "Deleted local incubator folder and untracked from base: $repo_dir"
+        log "Run 'git commit' in base mcrepo to record the removal."
+      else
+        rm -rf -- "$repo_dir"
+        log "Deleted local folder: $repo_dir"
+      fi
+    else
+      rm -rf -- "$repo_dir"
+      log "Deleted local folder: $repo_dir"
+    fi
   elif [ "$keep_files" -eq 0 ] && [ -n "$repo_dir" ] && [ -e "$repo_dir" ]; then
     log "Kept local folder: $repo_dir"
   fi
 
-  remove_gitignore_repo_entry "$removed_name"
+  if [ "$removed_is_local" != "true" ]; then
+    remove_gitignore_repo_entry "$removed_name"
+  fi
 
   refresh_generated_files
   sync_vscode_git_ignored_repositories
   log "Removed repo '$removed_name' from management."
+}
+
+# Pick a sensible default branch name for newly-initialized git repos.
+# Order: GLOBAL_BRANCH (if mcrepo.yaml configured one), git init.defaultBranch, then "main".
+pick_default_branch() {
+  if [ -n "${GLOBAL_BRANCH:-}" ]; then
+    printf '%s' "$GLOBAL_BRANCH"
+    return 0
+  fi
+  local cfg
+  cfg="$(git config --get init.defaultBranch 2>/dev/null || true)"
+  if [ -n "$cfg" ]; then
+    printf '%s' "$cfg"
+    return 0
+  fi
+  printf 'main'
+}
+
+validate_new_repo_name() {
+  local name="$1"
+  [ -n "$name" ] || die "Repository name must not be empty"
+  case "$name" in
+    .|..|.git) die "Reserved name not allowed: $name" ;;
+  esac
+  case "$name" in
+    */*|*\\*) die "Repository name must not contain path separators: $name" ;;
+  esac
+  case "$name" in
+    .*) die "Repository name must not start with a dot: $name" ;;
+  esac
+  case "$name" in
+    *' '*|*$'\t'*|*$'\n'*) die "Repository name must not contain whitespace: $name" ;;
+  esac
+}
+
+cmd_new() {
+  local name=""
+  local description=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -m|--description)
+        shift
+        [ "$#" -ge 1 ] || die "Usage: ./mcrepo.sh new <name> [-m \"description\"]"
+        description="$1"
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "Unknown option for new: $1"
+        ;;
+      *)
+        if [ -n "$name" ]; then
+          die "Usage: ./mcrepo.sh new <name> [-m \"description\"]"
+        fi
+        name="$1"
+        ;;
+    esac
+    shift
+  done
+
+  [ -n "$name" ] || die "Usage: ./mcrepo.sh new <name> [-m \"description\"]"
+  validate_new_repo_name "$name"
+
+  load_repos
+  if find_repo_index "$name" >/dev/null 2>&1; then
+    die "A repository named '$name' is already managed by mcrepo"
+  fi
+
+  if [ -e "./$name" ]; then
+    die "Path './$name' already exists; refusing to overwrite. Use a different name or remove the existing path first."
+  fi
+
+  REPO_URLS+=("")
+  REPO_NAMES+=("$name")
+  REPO_MODES+=("write")
+  REPO_DESCRIPTIONS+=("$description")
+  REPO_PARENTS+=("")
+  REPO_LOCALS+=("true")
+  save_repos
+
+  mkdir -p "./$name"
+  if [ ! -e "./$name/README.md" ]; then
+    cat >"./$name/README.md" <<EOF
+# $name
+
+Local incubator sub-repo managed by mcrepo. Files live committed inside the
+base mcrepo until you graduate this repo with:
+
+    ./mcrepo.sh publish $name <git-url>
+EOF
+  fi
+
+  reconcile_gitignore_with_repos
+  refresh_generated_files
+  sync_vscode_git_ignored_repositories
+
+  log "Created local incubator repo '$name' at ./$name/."
+  log "Files live committed inside the base mcrepo until you run:"
+  log "  ./mcrepo.sh publish $name <git-url>"
+}
+
+cmd_publish() {
+  local name=""
+  local url=""
+  local commit_msg=""
+  local force=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -m|--message)
+        shift
+        [ "$#" -ge 1 ] || die "Usage: ./mcrepo.sh publish <name> <git-url> [-m \"initial commit message\"] [--force]"
+        commit_msg="$1"
+        ;;
+      --force|-force)
+        force=1
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "Unknown option for publish: $1"
+        ;;
+      *)
+        if [ -z "$name" ]; then
+          name="$1"
+        elif [ -z "$url" ]; then
+          url="$1"
+        else
+          die "Usage: ./mcrepo.sh publish <name> <git-url> [-m \"initial commit message\"] [--force]"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  [ -n "$name" ] && [ -n "$url" ] || die "Usage: ./mcrepo.sh publish <name> <git-url> [-m \"initial commit message\"] [--force]"
+
+  load_repos
+  local idx
+  idx="$(find_repo_index "$name")" || die "Repo not found: $name"
+  if ! is_repo_local "$idx"; then
+    die "Repo '$name' is already external (url: ${REPO_URLS[$idx]}). 'publish' only applies to local incubator repos."
+  fi
+
+  local repo_dir="./$name"
+  [ -d "$repo_dir" ] || die "Local folder '$repo_dir' is missing. Re-create it or remove the mcrepo.yaml entry."
+
+  if [ -d "$repo_dir/.git" ]; then
+    die "Folder '$repo_dir' already has a .git/ directory. Remove or rename it first; mcrepo will not overwrite an existing git repo."
+  fi
+
+  # Validate remote: reachable, and (unless --force) empty.
+  local ls_remote_output
+  if ! ls_remote_output="$(git ls-remote "$url" 2>&1)"; then
+    die "Remote not reachable: $url"$'\n'"$ls_remote_output"
+  fi
+  if [ -n "$ls_remote_output" ] && [ "$force" -eq 0 ]; then
+    die "Remote '$url' is not empty. Refusing to publish to a non-empty remote. Re-run with --force to override."
+  fi
+
+  local base_is_git=0
+  if git -C . rev-parse --git-dir >/dev/null 2>&1; then
+    base_is_git=1
+  fi
+
+  # If base is a git repo, refuse if there are uncommitted changes outside <name>/
+  if [ "$base_is_git" -eq 1 ]; then
+    local outside_dirty
+    outside_dirty="$(git -C . status --porcelain -- ":(exclude)$name/" 2>/dev/null || true)"
+    if [ -n "$outside_dirty" ]; then
+      die "Base mcrepo has uncommitted changes outside '$name/'. Commit or stash them first so the publish commit stays focused."
+    fi
+  fi
+
+  local branch
+  branch="$(pick_default_branch)"
+
+  # ---- Mutation phase ----
+
+  if [ "$base_is_git" -eq 1 ]; then
+    # Untrack from base while keeping working files.
+    if git -C . ls-files --error-unmatch -- "$repo_dir/" >/dev/null 2>&1 \
+      || [ -n "$(git -C . ls-files -- "$repo_dir/" 2>/dev/null)" ]; then
+      git -C . rm -r --cached -- "$repo_dir/" >/dev/null
+    fi
+    ensure_gitignore_repo_entry "$name"
+    git -C . add -- .gitignore >/dev/null 2>&1 || true
+    if [ -n "$(git -C . status --porcelain -- ".gitignore" "$repo_dir/" 2>/dev/null)" ]; then
+      git -C . commit -m "mcrepo: publish $name to $url" -- ".gitignore" "$repo_dir/" >/dev/null \
+        || warn "Base mcrepo commit failed. Run 'git commit' manually to record the untracking."
+    fi
+  else
+    # Base is not git-managed yet. Still keep .gitignore in shape for when it is.
+    ensure_gitignore_repo_entry "$name"
+    log "Note: base mcrepo is not a git repo yet. Skipping base-side commit."
+    log "      Run './mcrepo.sh publish-base <url>' to also git-manage the workspace itself."
+  fi
+
+  # Init the sub-repo, commit, push.
+  git -C "$repo_dir" init -q
+  git -C "$repo_dir" symbolic-ref HEAD "refs/heads/$branch"
+  git -C "$repo_dir" add -A
+  git -C "$repo_dir" commit -m "${commit_msg:-Initial commit}" -q
+  git -C "$repo_dir" remote add origin "$url"
+  if ! git -C "$repo_dir" push -u origin "$branch"; then
+    warn "Push to '$url' failed. Sub-repo is initialized locally; re-run 'git -C $repo_dir push -u origin $branch' once the remote is reachable."
+  fi
+
+  # Update YAML
+  REPO_URLS[$idx]="$url"
+  REPO_LOCALS[$idx]="false"
+  save_repos
+
+  refresh_generated_files
+  sync_vscode_git_ignored_repositories
+
+  log "Published '$name' to $url on branch '$branch'."
+  if [ "$base_is_git" -eq 1 ]; then
+    log "Base mcrepo no longer tracks '$name/' going forward (old base history still contains the files; non-destructive)."
+  fi
+}
+
+cmd_publish_base() {
+  local url=""
+  local commit_msg=""
+  local force=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -m|--message)
+        shift
+        [ "$#" -ge 1 ] || die "Usage: ./mcrepo.sh publish-base <git-url> [-m \"initial workspace commit message\"] [--force]"
+        commit_msg="$1"
+        ;;
+      --force|-force)
+        force=1
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "Unknown option for publish-base: $1"
+        ;;
+      *)
+        if [ -z "$url" ]; then
+          url="$1"
+        else
+          die "Usage: ./mcrepo.sh publish-base <git-url> [-m \"initial workspace commit message\"] [--force]"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  [ -n "$url" ] || die "Usage: ./mcrepo.sh publish-base <git-url> [-m \"initial workspace commit message\"] [--force]"
+
+  [ -f "$REPOS_FILE" ] || die "Not in an mcrepo workspace ($REPOS_FILE missing). Run './mcrepo.sh init' first."
+
+  load_repos
+
+  local base_is_git=0
+  if git -C . rev-parse --git-dir >/dev/null 2>&1; then
+    base_is_git=1
+  fi
+
+  # Detect existing origin so re-running publish-base with the same URL is
+  # idempotent (it skips the "remote must be empty" guard).
+  local existing_origin=""
+  if [ "$base_is_git" -eq 1 ]; then
+    existing_origin="$(git -C . remote get-url origin 2>/dev/null || true)"
+  fi
+
+  # Validate remote: reachable and (unless --force, or origin already matches)
+  # not already populated. Skipping the emptiness check when origin matches
+  # supports idempotent re-runs that just push new commits.
+  if [ "$existing_origin" != "$url" ]; then
+    local ls_remote_output
+    if ! ls_remote_output="$(git ls-remote "$url" 2>&1)"; then
+      die "Remote not reachable: $url"$'\n'"$ls_remote_output"
+    fi
+    if [ -n "$ls_remote_output" ] && [ "$force" -eq 0 ]; then
+      die "Remote '$url' is not empty. Refusing to publish base to a non-empty remote. Re-run with --force to override."
+    fi
+  fi
+
+  local branch
+  branch="$(pick_default_branch)"
+
+  if [ "$base_is_git" -eq 0 ]; then
+    git -C . init -q
+    git -C . symbolic-ref HEAD "refs/heads/$branch"
+    log "Initialized base mcrepo as a git repository (branch '$branch')."
+  fi
+
+  # Safety net: reconcile .gitignore so external sub-repos are excluded and local incubators are tracked,
+  # BEFORE the first commit.
+  ensure_gitignore_base
+  reconcile_gitignore_with_repos
+
+  # Origin handling. existing_origin was captured earlier so we can re-detect
+  # if a fresh `git init` above changed things.
+  existing_origin="$(git -C . remote get-url origin 2>/dev/null || true)"
+  if [ -n "$existing_origin" ]; then
+    if [ "$existing_origin" != "$url" ]; then
+      if [ "$force" -eq 1 ]; then
+        git -C . remote set-url origin "$url"
+        log "Replaced origin URL: $existing_origin -> $url"
+      else
+        die "Base already has origin set to '$existing_origin'. Re-run with --force to replace, or use 'git remote set-url' manually."
+      fi
+    fi
+  else
+    git -C . remote add origin "$url"
+  fi
+
+  # Commit if there's anything to commit (and there's no HEAD yet, or there's staged/unstaged work)
+  local has_commits=0
+  if git -C . rev-parse HEAD >/dev/null 2>&1; then
+    has_commits=1
+  fi
+
+  git -C . add -A
+  if [ -n "$(git -C . status --porcelain 2>/dev/null)" ]; then
+    git -C . commit -m "${commit_msg:-mcrepo: initial workspace commit}" -q \
+      || warn "Workspace commit failed. Run 'git commit' manually."
+  elif [ "$has_commits" -eq 0 ]; then
+    die "No files to commit in the workspace. Add some content (or run 'mcrepo new <name>') and try again."
+  fi
+
+  # Determine the actual branch to push (may have been changed by symbolic-ref or already existed).
+  local push_branch
+  push_branch="$(git -C . symbolic-ref --short HEAD 2>/dev/null || printf '%s' "$branch")"
+
+  if ! git -C . push -u origin "$push_branch"; then
+    warn "Push to '$url' failed. Workspace is git-managed locally; re-run 'git push -u origin $push_branch' once the remote is reachable."
+    return 0
+  fi
+
+  log "Workspace published to $url on branch '$push_branch'."
+  log "External sub-repos remain ignored; local incubator sub-repos are tracked in base history."
 }
 
 set_mode_command() {
@@ -2122,6 +2553,16 @@ set_mode_command() {
   local repo_dir
   repo_dir="$(ensure_repo_dir_mode "${REPO_NAMES[$idx]}" "$target_mode")"
 
+  if is_repo_local "$idx"; then
+    # Local incubator repo: mode is a pure signal. Files live in base mcrepo
+    # working tree (committed to base history) and must not be touched. No
+    # .gitignore entry, no clone, no clear.
+    refresh_generated_files
+    sync_vscode_git_ignored_repositories
+    log "Set local repo '${REPO_NAMES[$idx]}' to mode '$target_mode' (files preserved)."
+    return 0
+  fi
+
   ensure_gitignore_repo_entry "${REPO_NAMES[$idx]}"
   if [ "$target_mode" = "write" ] || [ "$target_mode" = "read" ]; then
     if ! clone_repo_if_needed "$repo_dir" "${REPO_URLS[$idx]}" "$target_mode"; then
@@ -2169,6 +2610,10 @@ wake_all_sleeping_repos_to_read() {
 
   local repo_dir
   for i in "${woke_indexes[@]}"; do
+    if is_repo_local "$i"; then
+      # Local repo: nothing to clone; mode flip already saved.
+      continue
+    fi
     repo_dir="$(ensure_repo_dir_mode "${REPO_NAMES[$i]}" "read")"
     ensure_gitignore_repo_entry "${REPO_NAMES[$i]}"
     if ! clone_repo_if_needed "$repo_dir" "${REPO_URLS[$i]}" "read"; then
@@ -2310,7 +2755,9 @@ cmd_list() {
   local i local_state branch repo_dir parent_info
   for i in "${!REPO_NAMES[@]}"; do
     repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
-    if [ -d "$repo_dir/.git" ]; then
+    if is_repo_local "$i"; then
+      local_state="🌱"
+    elif [ -d "$repo_dir/.git" ]; then
       local_state="yes"
     else
       local_state="no"
@@ -2343,7 +2790,9 @@ cmd_status() {
   local i local_state branch dirty repo_dir parent_info upstream inprogress diverged extras
   for i in "${!REPO_NAMES[@]}"; do
     repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
-    if [ -d "$repo_dir/.git" ]; then
+    if is_repo_local "$i"; then
+      local_state="🌱"
+    elif [ -d "$repo_dir/.git" ]; then
       local_state="yes"
     else
       local_state="no"
@@ -2363,6 +2812,8 @@ cmd_status() {
       if [ -n "$GLOBAL_BRANCH" ] && [ "${REPO_MODES[$i]}" != "sleep" ] && [ -n "$branch" ] && [ "$branch" != "$GLOBAL_BRANCH" ]; then
         extras="$extras OFF-GLOBAL"
       fi
+    elif [ "$local_state" = "🌱" ]; then
+      extras="$extras incubator"
     fi
     printf '%-20s mode=%-5s local=%-3s branch=%-20s state=%s%s%s\n' "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}" "$local_state" "$branch" "$dirty" "$extras" "$parent_info"
   done
@@ -6051,6 +6502,9 @@ main() {
   case "$cmd" in
     init) cmd_init "$@" ;;
     add) cmd_add "$@" ;;
+    new) cmd_new "$@" ;;
+    publish) cmd_publish "$@" ;;
+    publish-base) cmd_publish_base "$@" ;;
     remove) cmd_remove "$@" ;;
     write) set_mode_command write "$@" ;;
     read) set_mode_command read "$@" ;;

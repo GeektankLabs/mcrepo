@@ -37,6 +37,22 @@ mcrepo add <git-url>
 
 If you added all needed repositories to your Meta-Context-Repository then run the suggested prompt with your local AI agent tool of choice (OpenCode, Codex CLI, Claude Code, etc) - they have now all those repositories as context and can make coordinated feature changes, documentation and integrated dev & tests setups for you.
 
+### Publishing the workspace itself
+
+The base mcrepo workspace can be either a plain directory or a git repository. To make it git-managed and back it up to an empty external remote (e.g. a freshly-created empty GitHub repo) in one step:
+
+```bash
+mcrepo publish-base <git-url>
+```
+
+`publish-base` is safe to run whether or not the workspace already has a `.git/`:
+
+- if no `.git/` yet → `git init` first, then commit and push
+- if `.git/` exists with no `origin` → attach origin and push
+- if `.git/` exists with `origin` already pointing to `<git-url>` → just push (idempotent)
+
+Before the first commit, `publish-base` reconciles `.gitignore` against `mcrepo.yaml` so that external sub-repos stay excluded and local incubator sub-repos stay tracked. This guards against accidentally bundling an external sub-repo's working tree into the workspace's initial commit.
+
 ## Modes and Visibility
 
 Every added repository starts in `read` mode.
@@ -57,6 +73,41 @@ mcrepo status
 Repository folder names are always clean (no mode or emoji prefix in directory names). Mode visibility is tracked in `mcrepo.yaml` and can be decorated in the editor.
 
 When a repo is set to `sleep`, mcrepo clears the local checkout and leaves two placeholders in that folder: `.gitignore` and `.mcrepo-sleep`. Switching back to `read` or `write` checks out the repository again.
+
+## Incubator Sub-Repos
+
+To quickly try out a new project idea inside an mcrepo workspace - without first creating an external git repo - use `mcrepo new`:
+
+```bash
+mcrepo new my-new-idea
+```
+
+This creates `./my-new-idea/` and records it in `mcrepo.yaml` with `local: true` (no `url:`). The directory is **tracked by the base mcrepo** (not gitignored) so its files become part of the base mcrepo's git history as you work on them. There is no separate `.git/` inside the incubator yet.
+
+While a sub-repo is in local incubator state:
+
+- `mcrepo list` shows it with a 🌱 indicator.
+- Modes (`write` / `read` / `sleep`) still apply as **pure agent-intent signals**. Unlike external repos, `sleep` on a local repo is non-destructive: it just flips the mode tag; the files stay on disk and in base history.
+- Per-repo git operations (`mcrepo pull`, `push`, `branch`, `merge`, per-repo `commit`) silently skip local repos since they have no `.git/` yet.
+- You commit changes to local repo files via the base mcrepo's normal `git add` / `git commit` workflow (or just leave them as files if base isn't git-managed yet - see `publish-base` above).
+
+When the idea proves itself, graduate the repo to a fresh external remote:
+
+```bash
+# 1. Create an empty repo on GitHub (or any git service), copy its URL
+# 2. Graduate the incubator:
+mcrepo publish my-new-idea git@github.com:me/my-new-idea.git
+```
+
+`publish` will:
+
+1. Validate the remote URL is reachable and empty (refuses non-empty remotes unless `--force`).
+2. If the base mcrepo is a git repo: `git rm -r --cached` the dir to untrack, add `/my-new-idea/` to base `.gitignore`, and create a scoped commit recording the untracking. (Old base history still contains the files - non-destructive.)
+3. `git init` inside `./my-new-idea/`, stage all files, commit them as the initial commit (default message `Initial commit`, override with `-m`).
+4. Add `origin` remote pointing to the URL and push.
+5. Update `mcrepo.yaml`: remove `local: true`, add the external `url:`.
+
+From that point on, mcrepo treats the repo like any other external sub-repo (pull/push/branch/merge apply normally).
 
 ## Branch Coordination
 
