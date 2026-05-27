@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.5.0"
+MCREPO_VERSION="0.5.1"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -95,7 +95,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh branch --delete                        # Delete global branch, switch repos back to parent branches
   ./mcrepo.sh merge [-m "subject"]                   # Squash-merge global branch into each repo's parent (default subject = branch name)
   ./mcrepo.sh merge --no-squash                      # Legacy: --no-ff merge commit instead of squash
-  ./mcrepo.sh merge --rebase                         # Sync: merge parent branch into current global branch (auto-stashes)
+  ./mcrepo.sh merge --rebase                         # Sync: rebase current global branch onto parent branch (auto-stashes, prefers origin/<parent>)
   ./mcrepo.sh pull                                   # Fetch + ff-pull all active repos; meta-context auto-stashes on dirty, sub-repos skip on dirty
   ./mcrepo.sh pull --rebase                          # Auto-stash, pull, pop stash for ALL repos (handles dirty sub-repos safely)
   ./mcrepo.sh pull --reset                           # Discard local changes and reset to origin state (destructive!)
@@ -1222,7 +1222,7 @@ It provides workspace governance across repos, shared documentation, tests, and 
 - `mcrepo branch --delete` discards the global branch, switches repos back to parent branches, and deletes the branch locally.
 - Parent branches are recorded automatically when `mcrepo branch` forks a new branch. Each repo can have a different parent.
 - `mcrepo merge` merges the global branch into each write repo's parent branch (local only, no push). Performs a dry-run first.
-- `mcrepo merge --rebase` syncs the current branch with its parent by merging parent INTO the current branch. Auto-stashes uncommitted work.
+- `mcrepo merge --rebase` syncs the current branch by rebasing it onto its parent (prefers `origin/<parent>`, falls back to local `<parent>`). Auto-stashes uncommitted work. Rewrites local history — force-push if the branch was already pushed.
 - `mcrepo pull` fetches and fast-forward pulls from origin for all non-sleep repos. Meta-context is auto-stashed when dirty (so it always tracks upstream); dirty sub-repos are skipped (fetch only).
 - `mcrepo pull --rebase` auto-stashes uncommitted changes, pulls, then pops stash for ALL repos (including sub-repos). Safe for dirty repos.
 - `mcrepo pull --reset` discards all local changes and resets to origin state. Destructive — requires interactive confirmation.
@@ -6091,16 +6091,18 @@ cmd_merge() {
   fi
 }
 
-# Sync the current global branch with its parent by merging parent INTO current.
-# Per repo: fetch → stash dirty work (incl. untracked) → merge parent → pop stash.
+# Sync the current global branch by rebasing it onto its parent.
+# Per repo: fetch → stash dirty work (incl. untracked) → rebase onto parent → pop stash.
+# Prefers 'origin/<parent>' as the rebase target (freshest after fetch), falls back
+# to local '<parent>' when no origin is configured.
 # Processes ALL repos even if some conflict, giving a complete summary at the end.
-# On merge conflict the stash is left untouched; on stash-pop conflict the stash
+# On rebase conflict the stash is left untouched; on stash-pop conflict the stash
 # remains in the stack (user must 'git stash drop' after resolving).
 cmd_merge_rebase() {
   local source_branch="$1"
 
   log ""
-  log "=== Merge --rebase: syncing with parent branches ==="
+  log "=== Rebase: syncing current branch onto parent branches ==="
   log ""
 
   # Phase 1: Pre-flight
@@ -6196,12 +6198,20 @@ cmd_merge_rebase() {
     repo_dir="${rebase_dirs[$idx]}"
     local parent="${rebase_parents[$idx]}"
 
-    log "Syncing '$repo_name' ($parent -> $source_branch) ..."
-
-    # Fetch
+    # Fetch first so origin/<parent> reflects the latest state
+    local has_origin=0
     if git -C "$repo_dir" remote get-url origin >/dev/null 2>&1; then
       git -C "$repo_dir" fetch origin --prune 2>/dev/null || true
+      has_origin=1
     fi
+
+    # Prefer origin/<parent> as the rebase target (freshest), else local <parent>
+    local rebase_target="$parent"
+    if [ "$has_origin" -eq 1 ] && git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$parent"; then
+      rebase_target="origin/$parent"
+    fi
+
+    log "Rebasing '$repo_name' ($source_branch onto $rebase_target) ..."
 
     # Stash if dirty
     local did_stash=0
@@ -6212,13 +6222,13 @@ cmd_merge_rebase() {
       did_stash=1
     fi
 
-    # Merge parent INTO current
-    if ! git -C "$repo_dir" merge "$parent" -m "Merge branch '$parent' into $source_branch"; then
+    # Rebase current branch onto target
+    if ! git -C "$repo_dir" rebase "$rebase_target"; then
       merge_conflict_repos+=("$repo_name")
       if [ "$did_stash" -eq 1 ]; then
-        warn "  Merge conflicts. Resolve, commit, then run 'git -C $repo_dir stash pop' to restore your changes."
+        warn "  Rebase conflicts. Resolve, run 'mcrepo continue' (or 'git -C $repo_dir rebase --continue'), then 'git -C $repo_dir stash pop' to restore your changes."
       else
-        warn "  Merge conflicts. Resolve and commit."
+        warn "  Rebase conflicts. Resolve, then run 'mcrepo continue' (or 'git -C $repo_dir rebase --continue')."
       fi
       continue
     fi
@@ -6238,11 +6248,19 @@ cmd_merge_rebase() {
 
   # Meta-context rebase
   if [ "$meta_included" -eq 1 ]; then
-    log "Syncing '(meta-context)' ($meta_parent_branch -> $source_branch) ..."
-
+    local meta_has_origin=0
     if git -C . remote get-url origin >/dev/null 2>&1; then
       git -C . fetch origin --prune 2>/dev/null || true
+      meta_has_origin=1
     fi
+
+    # Prefer origin/<parent> as the rebase target (freshest), else local <parent>
+    local meta_rebase_target="$meta_parent_branch"
+    if [ "$meta_has_origin" -eq 1 ] && git -C . show-ref --verify --quiet "refs/remotes/origin/$meta_parent_branch"; then
+      meta_rebase_target="origin/$meta_parent_branch"
+    fi
+
+    log "Rebasing '(meta-context)' ($source_branch onto $meta_rebase_target) ..."
 
     local meta_did_stash=0
     local meta_dirty
@@ -6252,12 +6270,12 @@ cmd_merge_rebase() {
       meta_did_stash=1
     fi
 
-    if ! git -C . merge "$meta_parent_branch" -m "Merge branch '$meta_parent_branch' into $source_branch"; then
+    if ! git -C . rebase "$meta_rebase_target"; then
       merge_conflict_repos+=("(meta-context)")
       if [ "$meta_did_stash" -eq 1 ]; then
-        warn "  Merge conflicts. Resolve, commit, then run 'git stash pop' to restore your changes."
+        warn "  Rebase conflicts. Resolve, run 'mcrepo continue' (or 'git rebase --continue'), then 'git stash pop' to restore your changes."
       else
-        warn "  Merge conflicts. Resolve and commit."
+        warn "  Rebase conflicts. Resolve, then run 'mcrepo continue' (or 'git rebase --continue')."
       fi
     else
       if [ "$meta_did_stash" -eq 1 ]; then
@@ -6282,7 +6300,7 @@ cmd_merge_rebase() {
     log "Synced cleanly: ${clean_repos[*]}"
   fi
   if [ "${#merge_conflict_repos[@]}" -gt 0 ]; then
-    log "Merge conflicts (resolve, commit, then 'git stash pop' if stashed): ${merge_conflict_repos[*]}"
+    log "Rebase conflicts (resolve, run 'mcrepo continue', then 'git stash pop' if stashed): ${merge_conflict_repos[*]}"
   fi
   if [ "${#stash_conflict_repos[@]}" -gt 0 ]; then
     log "Stash conflicts (resolve, then 'git stash drop'): ${stash_conflict_repos[*]}"
@@ -6290,6 +6308,7 @@ cmd_merge_rebase() {
   if [ "${#merge_conflict_repos[@]}" -eq 0 ] && [ "${#stash_conflict_repos[@]}" -eq 0 ]; then
     log ""
     log "All repos synced. You can now run 'mcrepo merge' to merge into parent branches."
+    log "Note: this rebase rewrote local history — if you'd pushed this branch, force-push with care."
   fi
 }
 

@@ -177,7 +177,7 @@ Behavior details:
 - Parent branches are recorded automatically by `mcrepo branch` — each repo can have a different parent.
 - The meta-context repo (`.`) participates in both branching and merging with its own parent tracking (`meta-parent:` in `mcrepo.yaml`).
 - `merge` performs a dry-run across ALL repos first. If any would conflict, no merges happen.
-- `merge --rebase` merges the parent INTO the current branch, auto-stashing uncommitted work (including untracked files).
+- `merge --rebase` rebases the current branch onto its parent (prefers `origin/<parent>` so it picks up newly merged work from other PRs; falls back to local `<parent>` when no origin is configured). Auto-stashes uncommitted work (including untracked files). This rewrites local history — if the branch was already pushed, you'll need to force-push.
 - Merges are local only (no push). Review and push per-repo when ready.
 - Nested branches are supported: `main → feature → sub-feature`. Each `merge` pops one level.
 - After a squash merge, the source branch's tip is no longer reachable from the parent, so the post-merge cleanup uses **force-delete** (`git branch -D`) with an explicit confirmation defaulting to **No**. The `--no-squash` path keeps the previous safe-delete (`git branch -d`) prompt.
