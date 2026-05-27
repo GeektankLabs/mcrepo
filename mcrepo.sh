@@ -5022,12 +5022,14 @@ cmd_branch() {
   local meta_is_target=0
   local meta_is_fork=0
 
+  log "Fetching remotes to detect fork vs. jump ..."
   for i in "${!REPO_NAMES[@]}"; do
     mode="${REPO_MODES[$i]}"
     if [ "$mode" = "write" ] || { [ "$include_read" -eq 1 ] && [ "$mode" = "read" ]; }; then
       repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "$mode")"
       if [ -d "$repo_dir/.git" ]; then
         # Fetch to ensure remote refs are current for fork-vs-jump detection
+        printf '  fetching %s ...\r' "${REPO_NAMES[$i]}" >&2
         git -C "$repo_dir" fetch --all --prune 2>/dev/null || true
 
         local is_fork=1
@@ -5051,6 +5053,7 @@ cmd_branch() {
   # Meta-context repo classification
   if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     meta_is_target=1
+    printf '  fetching %s ...\r' "(meta-context)" >&2
     git -C . fetch --all --prune 2>/dev/null || true
     if git -C . show-ref --verify --quiet "refs/heads/$branch_name" || \
        git -C . show-ref --verify --quiet "refs/remotes/origin/$branch_name"; then
@@ -5661,6 +5664,7 @@ cmd_merge() {
   local -a merge_dirs=()
   local -a merge_parents=()
   local -a preflight_errors=()
+  local -a wrong_branch_actuals=()
   local -a dirty_repos=()
   local -a dirty_repo_dirs=()
 
@@ -5692,6 +5696,7 @@ cmd_merge() {
     actual_branch="$(repo_branch "$repo_dir")"
     if [ "$actual_branch" != "$source_branch" ]; then
       preflight_errors+=("'$repo_name' is on branch '$actual_branch', expected '$source_branch'.")
+      wrong_branch_actuals+=("$actual_branch")
     fi
 
     # Verify parent branch exists locally
@@ -5778,6 +5783,23 @@ cmd_merge() {
     for err in "${preflight_errors[@]}"; do
       log "  - $err"
     done
+
+    if [ "${#wrong_branch_actuals[@]}" -gt 0 ]; then
+      local common="${wrong_branch_actuals[0]}"
+      local all_same_actual=1
+      local wa
+      for wa in "${wrong_branch_actuals[@]}"; do
+        if [ "$wa" != "$common" ]; then all_same_actual=0; break; fi
+      done
+      if [ "$all_same_actual" -eq 1 ]; then
+        log ""
+        log "Hint: all repos are on '$common' but mcrepo.yaml says 'branch: $source_branch'."
+        log "  If '$common' is the branch you want to merge, run:"
+        log "    mcrepo branch $common"
+        log "  to re-align the coordinated branch state, then retry 'mcrepo merge'."
+      fi
+    fi
+
     die "Fix the above issues and try again."
   fi
 
