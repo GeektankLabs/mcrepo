@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.5.1"
+MCREPO_VERSION="0.5.2"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
