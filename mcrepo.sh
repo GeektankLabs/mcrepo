@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.5.2"
+MCREPO_VERSION="0.5.3"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -3554,14 +3554,19 @@ cmd_push() {
   local -a push_has_upstream=()
   local -a push_ahead_count=()
   local -a push_behind_count=()
+  local -a push_parents=()
+  local -a push_is_empty=()
 
-  local i repo_dir branch dirty
+  local i repo_dir branch dirty parent
   for i in "${!REPO_NAMES[@]}"; do
     [ "${REPO_MODES[$i]}" = "write" ] || continue
     repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
     [ -d "$repo_dir/.git" ] || continue
     branch="$(repo_branch "$repo_dir")"
     dirty="$(repo_dirty_state "$repo_dir")"
+    # Immediate parent = rightmost of the comma stack; fallback to default branch.
+    parent="${REPO_PARENTS[$i]##*,}"
+    [ -n "$parent" ] || parent="$(detect_default_branch "$repo_dir")"
     push_dirs+=("$repo_dir")
     push_names+=("${REPO_NAMES[$i]}")
     push_branches+=("$branch")
@@ -3569,6 +3574,8 @@ cmd_push() {
     push_has_upstream+=(0)
     push_ahead_count+=(0)
     push_behind_count+=(0)
+    push_parents+=("$parent")
+    push_is_empty+=(0)
   done
 
   # Meta-context repo
@@ -3593,6 +3600,24 @@ cmd_push() {
       ab="$(git -C "${push_dirs[$i]}" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null || printf '0\t0')"
       push_behind_count[$i]="$(printf '%s' "$ab" | awk '{print $1+0}')"
       push_ahead_count[$i]="$(printf '%s' "$ab" | awk '{print $2+0}')"
+    else
+      # No upstream yet (branch never pushed): is this branch empty vs its parent?
+      # Skip pushing branches that carry no commits beyond their parent so we don't
+      # create empty remote branches across every subrepo.
+      local parent="${push_parents[$i]}"
+      local cmp_target=""
+      if [ -n "$parent" ]; then
+        if git -C "${push_dirs[$i]}" show-ref --verify --quiet "refs/remotes/origin/$parent"; then
+          cmp_target="origin/$parent"
+        elif git -C "${push_dirs[$i]}" show-ref --verify --quiet "refs/heads/$parent"; then
+          cmp_target="$parent"
+        fi
+      fi
+      if [ -n "$cmp_target" ]; then
+        local cnt
+        cnt="$(git -C "${push_dirs[$i]}" rev-list --count "$cmp_target..HEAD" 2>/dev/null || printf -- '-1')"
+        [ "$cnt" = "0" ] && push_is_empty[$i]=1
+      fi
     fi
   done
   if [ -n "$meta_dir" ]; then
@@ -3612,11 +3637,14 @@ cmd_push() {
   local -a dirty_indexes=()
   local -a ahead_indexes=()
   local -a uptodate_indexes=()
+  local -a empty_indexes=()
   local meta_class="skip" # dirty, ahead, uptodate, skip
 
   for i in "${!push_dirs[@]}"; do
     if [ "${push_dirty[$i]}" = "dirty" ]; then
       dirty_indexes+=("$i")
+    elif [ "${push_is_empty[$i]}" -eq 1 ]; then
+      empty_indexes+=("$i")
     elif [ "${push_ahead_count[$i]}" -gt 0 ] || [ "${push_has_upstream[$i]}" -eq 0 ]; then
       ahead_indexes+=("$i")
     else
@@ -3658,6 +3686,8 @@ cmd_push() {
       else
         action="dirty (needs -m or interactive commit message)"
       fi
+    elif [ "${push_is_empty[$i]}" -eq 1 ]; then
+      action="leer (keine Commits gg. ${push_parents[$i]}) -> skip"
     elif [ "${push_has_upstream[$i]}" -eq 0 ]; then
       action="push (new upstream)"
     elif [ "${push_ahead_count[$i]}" -gt 0 ]; then
@@ -3727,6 +3757,7 @@ cmd_push() {
   local -a pushed_repos=()
   local -a skipped_dirty=()
   local -a skipped_uptodate=()
+  local -a skipped_empty=()
   local -a failed_repos=()
 
   if [ "$do_commit" -eq 1 ] && [ "${#dirty_indexes[@]}" -gt 0 ]; then
@@ -3773,6 +3804,13 @@ cmd_push() {
     local rn="${push_names[$i]}"
     local rb="${push_branches[$i]}"
     local was_dirty="${push_dirty[$i]}"
+
+    # Skip empty branches (no commits beyond their parent) so we don't create
+    # empty remote branches across subrepos that have no real changes.
+    if [ "${push_is_empty[$i]}" -eq 1 ] && [ "$was_dirty" != "committed" ]; then
+      skipped_empty+=("$rn")
+      continue
+    fi
 
     # Skip up-to-date repos
     if [ "$was_dirty" != "committed" ] && [ "${push_ahead_count[$i]}" -eq 0 ] && [ "${push_has_upstream[$i]}" -eq 1 ]; then
@@ -3851,6 +3889,9 @@ cmd_push() {
   fi
   if [ "${#skipped_uptodate[@]}" -gt 0 ]; then
     log "  Skipped (up to date):  ${skipped_uptodate[*]}"
+  fi
+  if [ "${#skipped_empty[@]}" -gt 0 ]; then
+    log "  Skipped (leer, keine Commits): ${skipped_empty[*]}"
   fi
   if [ "${#skipped_dirty[@]}" -gt 0 ]; then
     warn "  Skipped (dirty, no -m): ${skipped_dirty[*]}"
