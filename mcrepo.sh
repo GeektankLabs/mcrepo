@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.5.3"
+MCREPO_VERSION="0.5.4"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -96,6 +96,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh merge [-m "subject"]                   # Squash-merge global branch into each repo's parent (default subject = branch name)
   ./mcrepo.sh merge --no-squash                      # Legacy: --no-ff merge commit instead of squash
   ./mcrepo.sh merge --rebase                         # Sync: rebase current global branch onto parent branch (auto-stashes, prefers origin/<parent>)
+  ./mcrepo.sh pr [-m "title"] [--draft] [--no-push]  # Create coordinated GitHub PRs per write-mode repo with commits vs parent, cross-linked
   ./mcrepo.sh pull                                   # Fetch + ff-pull all active repos; meta-context auto-stashes on dirty, sub-repos skip on dirty
   ./mcrepo.sh pull --rebase                          # Auto-stash, pull, pop stash for ALL repos (handles dirty sub-repos safely)
   ./mcrepo.sh pull --reset                           # Discard local changes and reset to origin state (destructive!)
@@ -6154,6 +6155,286 @@ cmd_merge() {
   fi
 }
 
+# Markers wrapping the coordinated-PR cross-link block inside each PR body.
+MCREPO_PR_BLOCK_BEGIN='<!-- mcrepo:coordinated-prs -->'
+MCREPO_PR_BLOCK_END='<!-- /mcrepo:coordinated-prs -->'
+
+# Print $existing_body with any previous coordinated-PR block stripped and the new
+# $block appended. Idempotent across re-runs (drops the old marker block first).
+# Args: $1 = existing body (possibly multi-line/empty), $2 = new block (multi-line).
+pr_body_with_block() {
+  local existing="$1" block="$2" stripped
+  stripped="$(printf '%s' "$existing" | awk -v b="$MCREPO_PR_BLOCK_BEGIN" -v e="$MCREPO_PR_BLOCK_END" '
+    index($0, b) { skip=1 }
+    skip==0 { buf[n++]=$0 }
+    index($0, e) { skip=0 }
+    END {
+      while (n>0 && buf[n-1] ~ /^[ \t]*$/) n--
+      for (i=0;i<n;i++) print buf[i]
+    }')"
+  if [ -n "$stripped" ]; then
+    printf '%s\n\n%s\n' "$stripped" "$block"
+  else
+    printf '%s\n' "$block"
+  fi
+}
+
+# Create coordinated GitHub pull requests across write-mode repos (+ meta-context).
+# One PR per repo that has commits vs its parent (base = parent, head = GLOBAL_BRANCH),
+# then cross-link all PRs to each other inside their bodies (fallback: a comment).
+cmd_pr() {
+  local title=""
+  local do_draft=0
+  local do_push=1
+  local include_read=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -m|--title) shift; title="${1:-}"; [ -n "$title" ] || die "-m/--title requires a value" ;;
+      --draft) do_draft=1 ;;
+      --no-push) do_push=0 ;;
+      --include-read) include_read=1 ;;
+      *) die "Unknown pr option: $1" ;;
+    esac
+    shift
+  done
+
+  load_repos
+
+  if [ -z "$GLOBAL_BRANCH" ]; then
+    die "No feature branch active — start one with 'mcrepo branch <name>' first, then create coordinated PRs with 'mcrepo pr'."
+  fi
+  local source_branch="$GLOBAL_BRANCH"
+  [ -n "$title" ] || title="$source_branch"
+
+  # --- Phase 0: prerequisites ---
+  command -v gh >/dev/null 2>&1 || die "GitHub CLI 'gh' not found. Install it and run 'gh auth login'."
+  gh auth status >/dev/null 2>&1 || die "GitHub CLI is not authenticated. Run 'gh auth login' first."
+
+  # --- Phase 1: collect candidates (repos with commits vs their parent) ---
+  local i mode repo_dir repo_name parent actual cmp_target cnt
+  local -a cand_dirs=() cand_names=() cand_parents=() cand_counts=()
+  local -a skipped_empty=() skipped_other=() dirty_repos=()
+
+  for i in "${!REPO_NAMES[@]}"; do
+    mode="${REPO_MODES[$i]}"
+    if [ "$mode" != "write" ]; then
+      { [ "$include_read" -eq 1 ] && [ "$mode" = "read" ]; } || continue
+    fi
+    repo_name="${REPO_NAMES[$i]}"
+    repo_dir="$(get_repo_dir "$repo_name" "$mode")"
+    [ -d "$repo_dir/.git" ] || continue
+
+    # origin must be a GitHub remote
+    local origin_url
+    origin_url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)"
+    if [ -z "$origin_url" ] || ! printf '%s' "$origin_url" | grep -qi 'github'; then
+      warn "Skipping '$repo_name': origin is not a GitHub remote."
+      skipped_other+=("$repo_name")
+      continue
+    fi
+
+    parent="${REPO_PARENTS[$i]##*,}"
+    [ -n "$parent" ] || parent="$(detect_default_branch "$repo_dir")"
+    if [ -z "$parent" ]; then
+      warn "Skipping '$repo_name': no parent branch recorded and cannot detect default branch."
+      skipped_other+=("$repo_name")
+      continue
+    fi
+
+    actual="$(repo_branch "$repo_dir")"
+    if [ "$actual" != "$source_branch" ]; then
+      warn "Skipping '$repo_name': on '$actual', expected '$source_branch' (realign with 'mcrepo branch $actual')."
+      skipped_other+=("$repo_name")
+      continue
+    fi
+    if [ "$parent" = "$source_branch" ]; then
+      warn "Skipping '$repo_name': parent equals current branch '$source_branch'."
+      skipped_other+=("$repo_name")
+      continue
+    fi
+
+    # Has commits vs parent? Prefer origin/<parent>, fall back to local.
+    cmp_target=""
+    if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$parent"; then
+      cmp_target="origin/$parent"
+    elif git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$parent"; then
+      cmp_target="$parent"
+    fi
+    if [ -z "$cmp_target" ]; then
+      warn "Skipping '$repo_name': parent branch '$parent' not found locally or on origin."
+      skipped_other+=("$repo_name")
+      continue
+    fi
+    cnt="$(git -C "$repo_dir" rev-list --count "$cmp_target..HEAD" 2>/dev/null || printf -- '-1')"
+    if [ "$cnt" -le 0 ]; then
+      skipped_empty+=("$repo_name")
+      continue
+    fi
+
+    [ "$(repo_dirty_state "$repo_dir")" = "dirty" ] && dirty_repos+=("$repo_name")
+
+    cand_dirs+=("$repo_dir")
+    cand_names+=("$repo_name")
+    cand_parents+=("$parent")
+    cand_counts+=("$cnt")
+  done
+
+  # Meta-context repo (same handling as cmd_merge)
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    local meta_parent meta_actual meta_origin meta_cmp meta_cnt
+    meta_parent="${META_PARENT##*,}"
+    [ -n "$meta_parent" ] || meta_parent="$(detect_default_branch ".")"
+    meta_actual="$(repo_branch ".")"
+    meta_origin="$(git -C . remote get-url origin 2>/dev/null || true)"
+    if [ -n "$meta_parent" ] && [ "$meta_parent" != "$source_branch" ] && [ "$meta_actual" = "$source_branch" ] \
+       && [ -n "$meta_origin" ] && printf '%s' "$meta_origin" | grep -qi 'github'; then
+      meta_cmp=""
+      if git -C . show-ref --verify --quiet "refs/remotes/origin/$meta_parent"; then
+        meta_cmp="origin/$meta_parent"
+      elif git -C . show-ref --verify --quiet "refs/heads/$meta_parent"; then
+        meta_cmp="$meta_parent"
+      fi
+      if [ -n "$meta_cmp" ]; then
+        meta_cnt="$(git -C . rev-list --count "$meta_cmp..HEAD" 2>/dev/null || printf -- '-1')"
+        if [ "$meta_cnt" -gt 0 ]; then
+          [ "$(repo_dirty_state ".")" = "dirty" ] && dirty_repos+=("(meta-context)")
+          cand_dirs+=("."); cand_names+=("(meta-context)"); cand_parents+=("$meta_parent"); cand_counts+=("$meta_cnt")
+        else
+          skipped_empty+=("(meta-context)")
+        fi
+      fi
+    fi
+  fi
+
+  if [ "${#cand_dirs[@]}" -eq 0 ]; then
+    log "No repos with commits against their parent — nothing to open a PR for."
+    [ "${#skipped_empty[@]}" -gt 0 ] && log "  Skipped (no commits vs parent): ${skipped_empty[*]}"
+    return 0
+  fi
+
+  # --- Phase 2: plan + confirm ---
+  log "=== PR plan (branch '$source_branch') ==="
+  local idx
+  for idx in "${!cand_dirs[@]}"; do
+    printf '  %-20s %s -> %s  [%s commit(s)]\n' \
+      "${cand_names[$idx]}" "$source_branch" "${cand_parents[$idx]}" "${cand_counts[$idx]}"
+  done
+  [ "${#skipped_empty[@]}" -gt 0 ] && log "  Skipped (no commits vs parent): ${skipped_empty[*]}"
+  if [ "${#dirty_repos[@]}" -gt 0 ]; then
+    warn "Uncommitted changes in: ${dirty_repos[*]} — these will NOT be included in the PR(s)."
+  fi
+  log ""
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf 'Create %d coordinated PR(s)? [Y/n] ' "${#cand_dirs[@]}" >&2
+    local confirm; IFS= read -r confirm
+    case "$confirm" in n|N|no) log "Aborted."; return 0 ;; esac
+  fi
+
+  # --- Phase 3: auto-push feature branch (unless --no-push) ---
+  local -a pr_dirs=() pr_names=() pr_parents=() pr_urls=()
+  local -a failed=()
+  for idx in "${!cand_dirs[@]}"; do
+    repo_dir="${cand_dirs[$idx]}"; repo_name="${cand_names[$idx]}"
+    if [ "$do_push" -eq 1 ]; then
+      log "--- Pushing '$repo_name' ($source_branch) ---"
+      if ! git -C "$repo_dir" push -u origin "$source_branch"; then
+        warn "Push failed for '$repo_name' — skipping PR."
+        failed+=("$repo_name")
+        continue
+      fi
+    fi
+    pr_dirs+=("$repo_dir"); pr_names+=("$repo_name"); pr_parents+=("${cand_parents[$idx]}")
+  done
+
+  if [ "${#pr_dirs[@]}" -eq 0 ]; then
+    warn "No PRs created."
+    [ "${#failed[@]}" -gt 0 ] && warn "  Failed: ${failed[*]}"
+    return 1
+  fi
+
+  # --- Phase 4: create or reuse PRs ---
+  local -a created=() reused=()
+  for idx in "${!pr_dirs[@]}"; do
+    repo_dir="${pr_dirs[$idx]}"; repo_name="${pr_names[$idx]}"; parent="${pr_parents[$idx]}"
+    local url=""
+    url="$(cd "$repo_dir" && gh pr list --head "$source_branch" --base "$parent" --state open --json url --jq '.[0].url' 2>/dev/null || true)"
+    if [ -n "$url" ]; then
+      log "Reusing existing PR for '$repo_name': $url"
+      reused+=("$repo_name")
+    else
+      local base_body
+      base_body="Coordinated mcrepo change on branch \`$source_branch\` (repo: $repo_name)."
+      local draft_flag=()
+      [ "$do_draft" -eq 1 ] && draft_flag=(--draft)
+      # NOTE: ${arr[@]+"${arr[@]}"} is the bash 3.2 + `set -u` safe expansion for a
+      # possibly-empty array (plain "${arr[@]}" errors as "unbound variable" there).
+      url="$(cd "$repo_dir" && gh pr create --base "$parent" --head "$source_branch" \
+              --title "$title" --body "$base_body" ${draft_flag[@]+"${draft_flag[@]}"} 2>/dev/null || true)"
+      if [ -z "$url" ]; then
+        warn "Failed to create PR for '$repo_name'."
+        failed+=("$repo_name")
+        continue
+      fi
+      log "Created PR for '$repo_name': $url"
+      created+=("$repo_name")
+    fi
+    pr_urls+=("$url")
+  done
+
+  # Rebuild parallel arrays for repos that actually got a URL (filter failures).
+  local -a link_names=() link_dirs=() link_urls=()
+  local u_i=0
+  for idx in "${!pr_dirs[@]}"; do
+    repo_name="${pr_names[$idx]}"
+    case " ${failed[*]-} " in *" $repo_name "*) continue ;; esac
+    link_names+=("$repo_name"); link_dirs+=("${pr_dirs[$idx]}"); link_urls+=("${pr_urls[$u_i]}")
+    u_i=$((u_i+1))
+  done
+
+  # --- Phase 5: cross-link all PRs ---
+  local -a linked=() commented=()
+  if [ "${#link_urls[@]}" -gt 0 ]; then
+    # Build the shared cross-link block.
+    local block
+    block="$MCREPO_PR_BLOCK_BEGIN
+### Coordinated PRs (branch \`$source_branch\`)
+"
+    local li
+    for li in "${!link_names[@]}"; do
+      block="$block- ${link_names[$li]}: ${link_urls[$li]}
+"
+    done
+    block="$block$MCREPO_PR_BLOCK_END"
+
+    for li in "${!link_dirs[@]}"; do
+      repo_dir="${link_dirs[$li]}"; repo_name="${link_names[$li]}"
+      local cur_body new_body
+      cur_body="$(cd "$repo_dir" && gh pr view "$source_branch" --json body --jq '.body' 2>/dev/null || true)"
+      new_body="$(pr_body_with_block "$cur_body" "$block")"
+      if (cd "$repo_dir" && gh pr edit "$source_branch" --body "$new_body" >/dev/null 2>&1); then
+        linked+=("$repo_name")
+      elif (cd "$repo_dir" && gh pr comment "$source_branch" --body "$block" >/dev/null 2>&1); then
+        commented+=("$repo_name")
+      else
+        warn "Could not add cross-link to '$repo_name' (neither edit nor comment worked)."
+        failed+=("$repo_name")
+      fi
+    done
+  fi
+
+  # --- Phase 6: summary ---
+  log ""
+  log "=== PR summary ==="
+  [ "${#created[@]}"  -gt 0 ] && log "  Created:     ${created[*]}"
+  [ "${#reused[@]}"   -gt 0 ] && log "  Reused:      ${reused[*]}"
+  [ "${#linked[@]}"   -gt 0 ] && log "  Cross-linked (body):    ${linked[*]}"
+  [ "${#commented[@]}" -gt 0 ] && log "  Cross-linked (comment): ${commented[*]}"
+  [ "${#skipped_empty[@]}" -gt 0 ] && log "  Skipped (no commits vs parent): ${skipped_empty[*]}"
+  [ "${#skipped_other[@]}" -gt 0 ] && log "  Skipped (other):        ${skipped_other[*]}"
+  [ "${#failed[@]}"   -gt 0 ] && warn "  Failed:      ${failed[*]}"
+}
+
 # Sync the current global branch by rebasing it onto its parent.
 # Per repo: fetch → stash dirty work (incl. untracked) → rebase onto parent → pop stash.
 # Prefers 'origin/<parent>' as the rebase target (freshest after fetch), falls back
@@ -6625,6 +6906,7 @@ main() {
     list) cmd_list "$@" ;;
     branch) cmd_branch "$@" ;;
     merge) cmd_merge "$@" ;;
+    pr) cmd_pr "$@" ;;
     pull) cmd_pull "$@" ;;
     push) cmd_push "$@" ;;
     commit) cmd_commit "$@" ;;
