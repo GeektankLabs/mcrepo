@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.5.4"
+MCREPO_VERSION="0.5.5"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -73,11 +73,16 @@ Usage:  # Show available mcrepo commands
 ═══════════════════════════════════════════════════════════════════════════════
   REPOSITORY MANAGEMENT
 ═══════════════════════════════════════════════════════════════════════════════
-  ./mcrepo.sh add <git-url> [name]                # Add a repository to mcrepo.yaml (default mode: read) and clone it if needed
+  ./mcrepo.sh add <git-url> [name] [opts]         # Add a repository (interactive when GitHub+gh: offers origin/fork/upstream/read-only)
+                                                  #   opts: --as-origin|--as-upstream --upstream <url> --origin <url> --mode read|write --fork --no-clone --yes
+  ./mcrepo.sh upstream [<repo> <url>|--off|--origin <url>]  # Show or set per-repo upstream (PR target) for the fork workflow
+  ./mcrepo.sh fork <repo-name-or-url> [name]      # Fork a GitHub repo (gh): origin=your fork, upstream=original
+  ./mcrepo.sh fork --all [--yes]                  # Fork+rewire every repo (incl. meta) where you lack push access (plan + confirm)
+  ./mcrepo.sh doctor                              # Report git/gh/auth + per-repo origin/upstream/access; guidance for setup
   ./mcrepo.sh new <name> [-m "description"]       # Create a new LOCAL incubator sub-repo (files live committed in base mcrepo, no external remote yet)
   ./mcrepo.sh publish <name> <git-url> [-m "msg"] [--force] # Graduate a local incubator: untrack from base, init sub-repo .git, push initial commit to empty remote
   ./mcrepo.sh remove <name-or-url> [--keep-files] [--force] # Remove a repository: drops YAML entry and deletes local folder (after confirming uncommitted/unpushed work); --keep-files preserves folder, --force skips prompts
-  ./mcrepo.sh write <repo-name>                   # Switch a repository to write mode and auto-align to global branch (if configured)
+  ./mcrepo.sh write <repo-name>                   # Switch to write mode + align to global branch; checks push access (gh) and offers to fork if missing
   ./mcrepo.sh read <repo-name>                    # Switch a repository to read mode (read-only context)
   ./mcrepo.sh sleep <repo-name> [--force]         # Switch a repository to sleep mode and clear its local folder contents (local incubator repos: signal only, files preserved)
   ./mcrepo.sh sleep --wakeall                     # Wake all sleeping repositories and set them to read mode
@@ -96,7 +101,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh merge [-m "subject"]                   # Squash-merge global branch into each repo's parent (default subject = branch name)
   ./mcrepo.sh merge --no-squash                      # Legacy: --no-ff merge commit instead of squash
   ./mcrepo.sh merge --rebase                         # Sync: rebase current global branch onto parent branch (auto-stashes, prefers origin/<parent>)
-  ./mcrepo.sh pr [-m "title"] [--draft] [--no-push]  # Create coordinated GitHub PRs per write-mode repo with commits vs parent, cross-linked
+  ./mcrepo.sh pr [-m "title"] [--draft] [--no-push] [--target origin|upstream]  # Coordinated GitHub PRs per repo with commits vs base; fork->upstream when upstream set; cross-linked
   ./mcrepo.sh pull                                   # Fetch + ff-pull all active repos; meta-context auto-stashes on dirty, sub-repos skip on dirty
   ./mcrepo.sh pull --rebase                          # Auto-stash, pull, pop stash for ALL repos (handles dirty sub-repos safely)
   ./mcrepo.sh pull --reset                           # Discard local changes and reset to origin state (destructive!)
@@ -507,11 +512,13 @@ parse_repos_tsv() {
         parent = v
       } else if (k == "local") {
         local = v
+      } else if (k == "upstream") {
+        upstream = v
       }
     }
     function emit() {
       if (in_item) {
-        print url SEP name SEP mode SEP description SEP parent SEP local
+        print url SEP name SEP mode SEP description SEP parent SEP local SEP upstream
       }
     }
     BEGIN {
@@ -522,6 +529,7 @@ parse_repos_tsv() {
       description = ""
       parent = ""
       local = ""
+      upstream = ""
     }
     {
       line = $0
@@ -534,6 +542,7 @@ parse_repos_tsv() {
         description = ""
         parent = ""
         local = ""
+        upstream = ""
         sub(/^[ \t]*-[ \t]*/, "", line)
         parse_kv(line)
         next
@@ -627,6 +636,30 @@ parse_meta_parent() {
   ' "$REPOS_FILE"
 }
 
+parse_meta_upstream() {
+  awk '
+    function trim(s) {
+      gsub(/^[ \t]+|[ \t]+$/, "", s)
+      return s
+    }
+    function unquote(s) {
+      s = trim(s)
+      if ((s ~ /^".*"$/) || (s ~ /^\047.*\047$/)) {
+        return substr(s, 2, length(s) - 2)
+      }
+      return s
+    }
+    {
+      line = $0
+      if (line ~ /^[ \t]*meta-upstream:[ \t]*/) {
+        sub(/^[ \t]*meta-upstream:[ \t]*/, "", line)
+        print unquote(line)
+        exit
+      }
+    }
+  ' "$REPOS_FILE"
+}
+
 REPO_URLS=()
 REPO_NAMES=()
 REPO_MODES=()
@@ -638,11 +671,18 @@ REPO_PARENTS=()
 # Incubator flag per repo ("true"/"false"). Local repos live inside base mcrepo's
 # git history with no external remote until promoted via 'mcrepo publish'.
 REPO_LOCALS=()
+# Per-repo upstream repo URL (fork workflow): origin (REPO_URLS) is where you push
+# (your fork/own repo), upstream is the original repo that PRs target. Empty when
+# you work directly in your own repo. Tracked via 'upstream:' in mcrepo.yaml.
+REPO_UPSTREAMS=()
 ORGANIZATION=""
 GLOBAL_BRANCH=""
 # Parent branch stack for the meta-context repo itself (same comma-separated
 # format as REPO_PARENTS). Tracked via 'meta-parent:' in mcrepo.yaml.
 META_PARENT=""
+# Upstream (PR target) URL for the meta-context repo itself, set when the meta-repo
+# is a fork. Its origin lives only in the git remote. Tracked via 'meta-upstream:'.
+META_UPSTREAM=""
 
 is_repo_local() {
   local idx="$1"
@@ -660,16 +700,19 @@ load_repos() {
   REPO_DESCRIPTIONS=()
   REPO_PARENTS=()
   REPO_LOCALS=()
+  REPO_UPSTREAMS=()
   ORGANIZATION=""
   GLOBAL_BRANCH=""
   META_PARENT=""
+  META_UPSTREAM=""
 
   ORGANIZATION="$(parse_organization || true)"
   GLOBAL_BRANCH="$(parse_branch || true)"
   META_PARENT="$(parse_meta_parent || true)"
+  META_UPSTREAM="$(parse_meta_upstream || true)"
 
-  local parsed_url parsed_name parsed_mode parsed_description parsed_parent parsed_local
-  while IFS=$'\x1f' read -r parsed_url parsed_name parsed_mode parsed_description parsed_parent parsed_local; do
+  local parsed_url parsed_name parsed_mode parsed_description parsed_parent parsed_local parsed_upstream
+  while IFS=$'\x1f' read -r parsed_url parsed_name parsed_mode parsed_description parsed_parent parsed_local parsed_upstream; do
     local is_local="false"
     case "${parsed_local:-}" in
       true|1|yes|TRUE|YES) is_local="true" ;;
@@ -694,6 +737,7 @@ load_repos() {
     REPO_DESCRIPTIONS+=("$parsed_description")
     REPO_PARENTS+=("${parsed_parent:-}")
     REPO_LOCALS+=("$is_local")
+    REPO_UPSTREAMS+=("${parsed_upstream:-}")
   done < <(parse_repos_tsv)
 }
 
@@ -707,6 +751,9 @@ save_repos() {
   fi
   if [ -n "$META_PARENT" ]; then
     printf 'meta-parent: %s\n' "$META_PARENT" >>"$REPOS_FILE"
+  fi
+  if [ -n "$META_UPSTREAM" ]; then
+    printf 'meta-upstream: %s\n' "$META_UPSTREAM" >>"$REPOS_FILE"
   fi
 
   if [ "${#REPO_NAMES[@]}" -eq 0 ]; then
@@ -727,6 +774,9 @@ save_repos() {
     printf '    description: "%s"\n' "$(yaml_escape_double_quoted "${REPO_DESCRIPTIONS[$i]}")" >>"$REPOS_FILE"
     if [ -n "${REPO_PARENTS[$i]:-}" ]; then
       printf '    parent: %s\n' "${REPO_PARENTS[$i]}" >>"$REPOS_FILE"
+    fi
+    if [ -n "${REPO_UPSTREAMS[$i]:-}" ]; then
+      printf '    upstream: %s\n' "${REPO_UPSTREAMS[$i]}" >>"$REPOS_FILE"
     fi
     if is_repo_local "$i"; then
       printf '    local: true\n' >>"$REPOS_FILE"
@@ -797,6 +847,7 @@ sync_organization_repos() {
     REPO_DESCRIPTIONS+=("")
     REPO_PARENTS+=("")
     REPO_LOCALS+=("false")
+    REPO_UPSTREAMS+=("")
     ensure_gitignore_repo_entry "$repo_name"
     imported=$((imported + 1))
   done <<<"$repo_rows"
@@ -1950,42 +2001,470 @@ cmd_init() {
   fi
 }
 
+# Create a fork of <owner/repo> via gh (idempotent) and print the fork clone URL.
+# Returns 1 if gh is not ready / login unknown.
+gh_create_fork() {
+  local slug="$1"
+  gh_ready || return 1
+  local login; login="$(gh_login)"
+  [ -n "$login" ] || return 1
+  # gh repo fork is idempotent: it reports "already exists" and exits 0.
+  gh repo fork "$slug" --clone=false >/dev/null 2>&1 || true
+  local repo="${slug#*/}"
+  printf 'https://github.com/%s/%s.git' "$login" "$repo"
+}
+
+# Append a repo entry (origin + optional upstream), clone origin, wire the
+# 'upstream' git remote, persist. Used by cmd_add / cmd_fork.
+# Args: origin_url name mode upstream_url do_clone(0/1)
+register_repo_entry() {
+  local o_url="$1" name="$2" mode="$3" up_url="$4" do_clone="$5"
+  REPO_URLS+=("$o_url")
+  REPO_NAMES+=("$name")
+  REPO_MODES+=("$mode")
+  REPO_DESCRIPTIONS+=("")
+  REPO_PARENTS+=("")
+  REPO_LOCALS+=("false")
+  REPO_UPSTREAMS+=("$up_url")
+  save_repos
+
+  ensure_gitignore_repo_entry "$name"
+  local repo_dir
+  repo_dir="$(ensure_repo_dir_mode "$name" "$mode")"
+  if [ "$do_clone" -eq 1 ] && [ -n "$o_url" ]; then
+    if ! clone_repo_if_needed "$repo_dir" "$o_url" "$mode"; then
+      warn "Repo added, but clone failed for '$name'"
+    fi
+  fi
+  if [ -n "$up_url" ] && [ -d "$repo_dir/.git" ]; then
+    ensure_upstream_remote "$repo_dir" "$up_url"
+    git -C "$repo_dir" fetch upstream --quiet 2>/dev/null || true
+  fi
+  refresh_generated_files
+  sync_vscode_git_ignored_repositories
+}
+
 cmd_add() {
-  [ "$#" -ge 1 ] || die "Usage: ./mcrepo.sh add <git-url> [name]"
-  local url="$1"
-  local name="${2:-}"
-  local mode="read"
+  local url="" name="" mode="read"
+  local role="" flag_upstream="" flag_origin="" do_fork=0 do_clone=1 assume_yes=0 mode_set=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --as-origin)   role="origin" ;;
+      --as-upstream) role="upstream" ;;
+      --upstream)    shift; flag_upstream="${1:-}"; [ -n "$flag_upstream" ] || die "--upstream requires a URL" ;;
+      --origin)      shift; flag_origin="${1:-}"; [ -n "$flag_origin" ] || die "--origin requires a URL" ;;
+      --mode)        shift; mode="${1:-}"; mode_set=1; validate_mode "$mode" || die "--mode must be read|write|sleep" ;;
+      --fork)        do_fork=1 ;;
+      --no-clone)    do_clone=0 ;;
+      --yes|-y)      assume_yes=1 ;;
+      -*)            die "Unknown add option: $1" ;;
+      *)
+        if [ -z "$url" ]; then url="$1"
+        elif [ -z "$name" ]; then name="$1"
+        else die "Usage: ./mcrepo.sh add <git-url> [name] [options]"
+        fi
+        ;;
+    esac
+    shift
+  done
+  [ -n "$url" ] || die "Usage: ./mcrepo.sh add <git-url> [name] [options]"
 
   load_repos
-  [ -n "$name" ] || name="$(derive_name_from_url "$url")"
+
+  # Resolve the final origin/upstream URLs and mode.
+  local final_origin="" final_upstream=""
+
+  if [ -n "$role" ] || [ "$assume_yes" -eq 1 ] || [ ! -t 0 ] || [ ! -t 1 ]; then
+    # --- Non-interactive / flag-driven path ---
+    case "${role:-origin}" in
+      upstream)
+        final_upstream="$url"
+        if [ "$do_fork" -eq 1 ]; then
+          url_is_github "$url" || die "--fork requires a github.com URL"
+          gh_ready || die "--fork needs GitHub CLI. Install gh and run 'gh auth login' (see 'mcrepo doctor')."
+          parse_git_url "$url" >/dev/null
+          final_origin="$(gh_create_fork "$GU_OWNER/$GU_REPO")" || die "Fork via gh failed."
+          [ "$mode_set" -eq 1 ] || mode="write"
+        else
+          final_origin="$flag_origin"
+        fi
+        ;;
+      *) # origin
+        final_origin="$url"
+        final_upstream="$flag_upstream"
+        ;;
+    esac
+  else
+    # --- Interactive analysis + menu ---
+    log "Analyzing $url ..."
+    local is_gh=0 perm="" isfork="" parent="" defbranch="" canpush="unknown"
+    if url_is_github "$url"; then
+      is_gh=1
+      parse_git_url "$url" >/dev/null
+      if gh_ready; then
+        local info; info="$(gh_repo_info "$GU_OWNER/$GU_REPO" || true)"
+        if [ -n "$info" ]; then
+          IFS=$'\t' read -r perm isfork parent defbranch <<<"$info"
+          if gh_perm_can_push "$perm"; then canpush="yes"; else canpush="no"; fi
+        fi
+      fi
+    fi
+
+    if [ "$is_gh" -eq 1 ] && [ -n "$perm" ]; then
+      log "  GitHub repo $GU_OWNER/$GU_REPO — your access: $perm$([ "$isfork" = "true" ] && printf ' (is a fork of %s)' "$parent")"
+    elif [ "$is_gh" -eq 1 ]; then
+      log "  GitHub repo $GU_OWNER/$GU_REPO — access unknown (gh not authenticated; run 'gh auth login' for richer detection)."
+    else
+      log "  Non-GitHub or unparsable URL — GitHub features (fork/PR/access-check) unavailable."
+    fi
+
+    printf 'How do you want to add this repo?\n' >&2
+    printf '  [o] origin       — you push here directly (your own repo / you have write access)\n' >&2
+    if [ "$is_gh" -eq 1 ] && gh_ready; then
+      printf '  [f] upstream+fork — fork it to your account now; PRs go fork -> this repo\n' >&2
+      printf '  [e] upstream+existing fork — you already forked it; provide/auto-detect your fork\n' >&2
+    fi
+    printf '  [u] upstream only — record as PR target; wire your origin/fork later\n' >&2
+    printf '  [r] read-only     — just track it, no push/PR intended\n' >&2
+    local default_choice="o"
+    [ "$canpush" = "no" ] && default_choice="f"
+    printf 'Choice [o/f/e/u/r] (default %s): ' "$default_choice" >&2
+    local choice; IFS= read -r choice
+    [ -n "$choice" ] || choice="$default_choice"
+
+    case "$choice" in
+      o|O)
+        final_origin="$url"; final_upstream="$flag_upstream"
+        ;;
+      f|F)
+        [ "$is_gh" -eq 1 ] && gh_ready || die "Fork needs a github.com URL and an authenticated gh (see 'mcrepo doctor')."
+        final_upstream="$url"
+        final_origin="$(gh_create_fork "$GU_OWNER/$GU_REPO")" || die "Fork via gh failed."
+        log "  Forked -> $final_origin"
+        [ "$mode_set" -eq 1 ] || mode="write"
+        ;;
+      e|E)
+        final_upstream="$url"
+        local login fork_try=""
+        login="$(gh_login)"
+        if [ -n "$login" ] && gh_repo_info "$login/$GU_REPO" >/dev/null 2>&1; then
+          fork_try="https://github.com/$login/$GU_REPO.git"
+          log "  Detected existing fork: $fork_try"
+        fi
+        if [ -n "$flag_origin" ]; then
+          final_origin="$flag_origin"
+        elif [ -n "$fork_try" ]; then
+          final_origin="$fork_try"
+        else
+          printf 'Enter your fork (origin) URL: ' >&2
+          IFS= read -r final_origin
+          [ -n "$final_origin" ] || die "No fork URL provided."
+        fi
+        [ "$mode_set" -eq 1 ] || mode="write"
+        ;;
+      u|U)
+        final_upstream="$url"; final_origin="$flag_origin"
+        [ "$mode_set" -eq 1 ] || mode="write"
+        ;;
+      r|R)
+        final_origin="$url"; final_upstream=""; mode="read"
+        ;;
+      *)
+        die "Unknown choice '$choice'. Aborting."
+        ;;
+    esac
+  fi
+
+  # Derive a name from the most specific URL we have.
+  if [ -z "$name" ]; then
+    name="$(derive_name_from_url "${final_origin:-$final_upstream}")"
+  fi
   [ -n "$name" ] || die "Could not derive repository name"
 
-  if find_repo_index "$url" >/dev/null 2>&1; then
+  # Duplicate checks.
+  if [ -n "$final_origin" ] && find_repo_index "$final_origin" >/dev/null 2>&1; then
     die "Repository URL already exists in $REPOS_FILE"
   fi
   if find_repo_index "$name" >/dev/null 2>&1; then
     die "Repository name already exists in $REPOS_FILE"
   fi
 
-  REPO_URLS+=("$url")
-  REPO_NAMES+=("$name")
-  REPO_MODES+=("$mode")
-  REPO_DESCRIPTIONS+=("")
-  REPO_PARENTS+=("")
-  REPO_LOCALS+=("false")
-  save_repos
+  register_repo_entry "$final_origin" "$name" "$mode" "$final_upstream" "$do_clone"
 
-  ensure_gitignore_repo_entry "$name"
-  local repo_dir
-  repo_dir="$(ensure_repo_dir_mode "$name" "$mode")"
-  if ! clone_repo_if_needed "$repo_dir" "$url" "$mode"; then
-    warn "Repo added, but clone failed for '$name'"
-  fi
-  refresh_generated_files
-  sync_vscode_git_ignored_repositories
-
-  log "Added repo '$name' in mode '$mode'."
+  local summary="origin=${final_origin:-<none>}"
+  [ -n "$final_upstream" ] && summary="$summary upstream=$final_upstream"
+  log "Added repo '$name' in mode '$mode' ($summary)."
   print_description_update_prompt
+}
+
+# Manage the per-repo upstream (PR target) relationship.
+#   mcrepo upstream                       # list origin/upstream per repo
+#   mcrepo upstream <repo> <url>          # set/replace upstream
+#   mcrepo upstream <repo> --off          # remove upstream
+#   mcrepo upstream <repo> --origin <url> # set origin for an upstream-only entry
+cmd_upstream() {
+  load_repos
+
+  if [ "$#" -eq 0 ]; then
+    if [ "${#REPO_NAMES[@]}" -eq 0 ]; then
+      log "No repositories configured."
+      return 0
+    fi
+    log "Repo origin/upstream:"
+    local i
+    for i in "${!REPO_NAMES[@]}"; do
+      printf '  %-20s origin=%-45s upstream=%s\n' \
+        "${REPO_NAMES[$i]}" "${REPO_URLS[$i]:-<none>}" "${REPO_UPSTREAMS[$i]:-<none>}"
+    done
+    return 0
+  fi
+
+  local repo="$1"; shift
+  local idx; idx="$(find_repo_index "$repo")" || die "Repo not found: $repo"
+
+  local new_upstream="" set_off=0 new_origin="" have_upstream=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --off) set_off=1 ;;
+      --origin) shift; new_origin="${1:-}"; [ -n "$new_origin" ] || die "--origin requires a URL" ;;
+      -*) die "Unknown upstream option: $1" ;;
+      *) new_upstream="$1"; have_upstream=1 ;;
+    esac
+    shift
+  done
+
+  local repo_dir; repo_dir="$(get_repo_dir "${REPO_NAMES[$idx]}" "${REPO_MODES[$idx]}")"
+
+  if [ -n "$new_origin" ]; then
+    REPO_URLS[$idx]="$new_origin"
+    log "Set origin for '${REPO_NAMES[$idx]}' -> $new_origin"
+  fi
+
+  if [ "$set_off" -eq 1 ]; then
+    REPO_UPSTREAMS[$idx]=""
+    [ -d "$repo_dir/.git" ] && git -C "$repo_dir" remote remove upstream 2>/dev/null || true
+    log "Removed upstream from '${REPO_NAMES[$idx]}'."
+  elif [ "$have_upstream" -eq 1 ]; then
+    REPO_UPSTREAMS[$idx]="$new_upstream"
+    if [ -d "$repo_dir/.git" ]; then
+      ensure_upstream_remote "$repo_dir" "$new_upstream"
+      git -C "$repo_dir" fetch upstream --quiet 2>/dev/null || true
+    fi
+    log "Set upstream for '${REPO_NAMES[$idx]}' -> $new_upstream"
+  elif [ -z "$new_origin" ]; then
+    die "Usage: mcrepo upstream <repo> <url> | --off | --origin <url>"
+  fi
+
+  save_repos
+}
+
+# Fork the current origin of repo <idx> and rewire: origin=fork, upstream=original
+# (in mcrepo.yaml arrays AND the clone's git remotes). Does NOT call save_repos — the
+# caller persists (so bulk runs save once). Returns 1 if it cannot fork.
+fork_and_rewire_repo() {
+  local idx="$1"
+  local orig_url="${REPO_URLS[$idx]:-}"
+  [ -n "$orig_url" ] || { warn "'${REPO_NAMES[$idx]}': no origin URL to fork."; return 1; }
+  url_is_github "$orig_url" || { warn "'${REPO_NAMES[$idx]}': origin is not a github.com URL."; return 1; }
+  parse_git_url "$orig_url" >/dev/null
+  local fork_url; fork_url="$(gh_create_fork "$GU_OWNER/$GU_REPO")" || { warn "'${REPO_NAMES[$idx]}': fork via gh failed."; return 1; }
+  REPO_UPSTREAMS[$idx]="$orig_url"
+  REPO_URLS[$idx]="$fork_url"
+  local repo_dir; repo_dir="$(get_repo_dir "${REPO_NAMES[$idx]}" "${REPO_MODES[$idx]}")"
+  if [ -d "$repo_dir/.git" ]; then
+    git -C "$repo_dir" remote set-url origin "$fork_url" 2>/dev/null || true
+    ensure_upstream_remote "$repo_dir" "$orig_url"
+    git -C "$repo_dir" fetch --all --prune --quiet 2>/dev/null || true
+  fi
+  log "Rewired '${REPO_NAMES[$idx]}': origin=$fork_url upstream=$orig_url"
+}
+
+# Fork the meta-repo's current origin and rewire: origin=fork (git remote),
+# upstream=original (git remote + META_UPSTREAM). Caller persists via save_repos.
+fork_and_rewire_meta() {
+  local orig_url; orig_url="$(git -C . remote get-url origin 2>/dev/null || true)"
+  [ -n "$orig_url" ] || { warn "(meta-context): no origin remote to fork."; return 1; }
+  url_is_github "$orig_url" || { warn "(meta-context): origin is not a github.com URL."; return 1; }
+  parse_git_url "$orig_url" >/dev/null
+  local fork_url; fork_url="$(gh_create_fork "$GU_OWNER/$GU_REPO")" || { warn "(meta-context): fork via gh failed."; return 1; }
+  git -C . remote set-url origin "$fork_url" 2>/dev/null || true
+  ensure_upstream_remote "." "$orig_url"
+  git -C . fetch --all --prune --quiet 2>/dev/null || true
+  META_UPSTREAM="$orig_url"
+  log "Rewired (meta-context): origin=$fork_url upstream=$orig_url"
+}
+
+# Fork repos and wire origin=fork, upstream=original.
+#   mcrepo fork <repo-name>        # fork an existing entry's origin
+#   mcrepo fork <git-url> [name]   # add a new entry from a fork
+#   mcrepo fork --all [--yes]      # fork every repo (incl. meta) lacking push access
+cmd_fork() {
+  local do_all=0 assume_yes=0
+  local -a pos=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --all) do_all=1 ;;
+      --yes|-y) assume_yes=1 ;;
+      -*) die "Unknown fork option: $1" ;;
+      *) pos+=("$1") ;;
+    esac
+    shift
+  done
+
+  gh_ready || die "fork needs GitHub CLI. Install gh and run 'gh auth login' (see 'mcrepo doctor')."
+  load_repos
+
+  if [ "$do_all" -eq 1 ]; then
+    cmd_fork_all "$assume_yes"
+    return $?
+  fi
+
+  [ "${#pos[@]}" -ge 1 ] || die "Usage: ./mcrepo.sh fork <repo-name-or-url> [name] | --all [--yes]"
+  local target="${pos[0]}" name="${pos[1]:-}"
+  local idx orig_url
+  if idx="$(find_repo_index "$target" 2>/dev/null)"; then
+    orig_url="${REPO_URLS[$idx]}"
+    [ -n "$orig_url" ] || die "Repo '$target' has no origin URL to fork."
+    fork_and_rewire_repo "$idx" || die "Fork failed for '$target'."
+    save_repos
+  else
+    orig_url="$target"
+    url_is_github "$orig_url" || die "fork requires a github.com URL (got: $orig_url)."
+    parse_git_url "$orig_url" >/dev/null
+    local fork_url; fork_url="$(gh_create_fork "$GU_OWNER/$GU_REPO")" || die "Fork via gh failed."
+    log "Forked $GU_OWNER/$GU_REPO -> $fork_url"
+    [ -n "$name" ] || name="$GU_REPO"
+    find_repo_index "$name" >/dev/null 2>&1 && die "Repository name already exists: $name"
+    register_repo_entry "$fork_url" "$name" "write" "$orig_url" 1
+    log "Added forked repo '$name': origin=$fork_url upstream=$orig_url"
+  fi
+}
+
+# Bulk: fork every repo (and the meta-repo) where you lack push access, rewiring
+# origin->upstream and fork->origin. Shows a plan and asks for confirmation (TTY).
+cmd_fork_all() {
+  local assume_yes="${1:-0}"
+  local -a to_fork_idx=() keep=() skip=()
+  local meta_to_fork=0
+
+  local i name o
+  for i in "${!REPO_NAMES[@]}"; do
+    name="${REPO_NAMES[$i]}"; o="${REPO_URLS[$i]:-}"
+    if [ -n "${REPO_UPSTREAMS[$i]:-}" ]; then skip+=("$name (already has upstream)"); continue; fi
+    if [ -z "$o" ] || ! url_is_github "$o"; then skip+=("$name (no github origin)"); continue; fi
+    parse_git_url "$o" >/dev/null
+    local info perm; info="$(gh_repo_info "$GU_OWNER/$GU_REPO" || true)"
+    perm="$(printf '%s' "$info" | cut -f1)"
+    if [ -n "$perm" ] && gh_perm_can_push "$perm"; then
+      keep+=("$name ($perm)")
+    else
+      to_fork_idx+=("$i")
+    fi
+  done
+
+  # Meta-repo
+  local meta_origin meta_label=""
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    meta_origin="$(git -C . remote get-url origin 2>/dev/null || true)"
+    if [ -n "$META_UPSTREAM" ]; then
+      skip+=("(meta-context) (already has upstream)")
+    elif [ -z "$meta_origin" ] || ! url_is_github "$meta_origin"; then
+      [ -n "$meta_origin" ] && skip+=("(meta-context) (no github origin)")
+    else
+      parse_git_url "$meta_origin" >/dev/null
+      local minfo mperm; minfo="$(gh_repo_info "$GU_OWNER/$GU_REPO" || true)"
+      mperm="$(printf '%s' "$minfo" | cut -f1)"
+      if [ -n "$mperm" ] && gh_perm_can_push "$mperm"; then
+        keep+=("(meta-context) ($mperm)")
+      else
+        meta_to_fork=1; meta_label="(meta-context)"
+      fi
+    fi
+  fi
+
+  if [ "${#to_fork_idx[@]}" -eq 0 ] && [ "$meta_to_fork" -eq 0 ]; then
+    log "Nothing to fork — every repo either has push access or already has an upstream."
+    [ "${#keep[@]}" -gt 0 ] && log "  keep: ${keep[*]}"
+    [ "${#skip[@]}" -gt 0 ] && log "  skip: ${skip[*]}"
+    return 0
+  fi
+
+  log "=== fork --all plan ==="
+  local -a fork_labels=()
+  for i in ${to_fork_idx[@]+"${to_fork_idx[@]}"}; do fork_labels+=("${REPO_NAMES[$i]}"); done
+  [ "$meta_to_fork" -eq 1 ] && fork_labels+=("$meta_label")
+  log "  fork: ${fork_labels[*]}"
+  [ "${#keep[@]}" -gt 0 ] && log "  keep: ${keep[*]}"
+  [ "${#skip[@]}" -gt 0 ] && log "  skip: ${skip[*]}"
+  log ""
+
+  if [ "$assume_yes" -ne 1 ] && [ -t 0 ] && [ -t 1 ]; then
+    printf 'Fork and rewire %d repo(s)? [Y/n] ' "${#fork_labels[@]}" >&2
+    local confirm; IFS= read -r confirm
+    case "$confirm" in n|N|no) log "Aborted."; return 0 ;; esac
+  fi
+
+  local rewired=0
+  for i in ${to_fork_idx[@]+"${to_fork_idx[@]}"}; do
+    fork_and_rewire_repo "$i" && rewired=$((rewired+1))
+  done
+  if [ "$meta_to_fork" -eq 1 ]; then
+    fork_and_rewire_meta && rewired=$((rewired+1))
+  fi
+  save_repos
+  log ""
+  log "fork --all complete: rewired $rewired repo(s). Modes unchanged. Run 'mcrepo pr' to open coordinated PRs to upstream."
+}
+
+# Report environment + per-repo origin/upstream/access so the git+gh+platform
+# setup is transparent. Degrades gracefully when gh is missing/unauthenticated.
+cmd_doctor() {
+  load_repos
+  log "=== mcrepo doctor ==="
+
+  if command -v git >/dev/null 2>&1; then
+    log "git:  $(git --version 2>/dev/null)"
+  else
+    warn "git:  NOT FOUND (required)"
+  fi
+
+  if command -v gh >/dev/null 2>&1; then
+    if gh auth status >/dev/null 2>&1; then
+      local login; login="$(gh_login)"
+      log "gh:   installed, authenticated as ${login:-?}"
+    else
+      warn "gh:   installed but NOT authenticated — run 'gh auth login' to enable access checks, fork and PRs"
+    fi
+  else
+    warn "gh:   NOT installed — clone/push/branch/merge still work; fork/PR/access-check need gh"
+  fi
+  log ""
+
+  if [ "${#REPO_NAMES[@]}" -eq 0 ]; then
+    log "No repositories configured."
+    return 0
+  fi
+  log "Repositories:"
+  local i
+  for i in "${!REPO_NAMES[@]}"; do
+    local name="${REPO_NAMES[$i]}" o="${REPO_URLS[$i]:-}" up="${REPO_UPSTREAMS[$i]:-}"
+    local line="  $name\n     origin:   ${o:-<none>}"
+    [ -n "$up" ] && line="$line\n     upstream: $up"
+    if [ -n "$o" ] && url_is_github "$o" && gh_ready; then
+      parse_git_url "$o" >/dev/null
+      local info; info="$(gh_repo_info "$GU_OWNER/$GU_REPO" || true)"
+      if [ -n "$info" ]; then
+        local perm; perm="$(printf '%s' "$info" | cut -f1)"
+        if gh_perm_can_push "$perm"; then
+          line="$line\n     access:   $perm (push OK)"
+        else
+          line="$line\n     access:   $perm (no push — consider 'mcrepo fork $name')"
+        fi
+      fi
+    fi
+    printf '%b\n' "$line"
+  done
 }
 
 cmd_remove() {
@@ -2131,6 +2610,7 @@ cmd_remove() {
   local old_descriptions=("${REPO_DESCRIPTIONS[@]}")
   local old_parents=("${REPO_PARENTS[@]}")
   local old_locals=("${REPO_LOCALS[@]}")
+  local old_upstreams=("${REPO_UPSTREAMS[@]}")
 
   REPO_URLS=()
   REPO_NAMES=()
@@ -2138,6 +2618,7 @@ cmd_remove() {
   REPO_DESCRIPTIONS=()
   REPO_PARENTS=()
   REPO_LOCALS=()
+  REPO_UPSTREAMS=()
 
   local i
   for i in "${!old_names[@]}"; do
@@ -2148,6 +2629,7 @@ cmd_remove() {
       REPO_DESCRIPTIONS+=("${old_descriptions[$i]}")
       REPO_PARENTS+=("${old_parents[$i]}")
       REPO_LOCALS+=("${old_locals[$i]}")
+      REPO_UPSTREAMS+=("${old_upstreams[$i]}")
     fi
   done
   save_repos
@@ -2259,6 +2741,7 @@ cmd_new() {
   REPO_DESCRIPTIONS+=("$description")
   REPO_PARENTS+=("")
   REPO_LOCALS+=("true")
+  REPO_UPSTREAMS+=("")
   save_repos
 
   mkdir -p "./$name"
@@ -2602,6 +3085,32 @@ set_mode_command() {
   fi
   if [ "$target_mode" = "write" ]; then
     apply_global_branch_to_repo_if_configured "${REPO_NAMES[$idx]}" "$repo_dir"
+    # read->write: if you lack push access to origin, offer to fork (non-blocking).
+    if [ "$previous_mode" != "write" ] && [ -z "${REPO_UPSTREAMS[$idx]:-}" ]; then
+      local _w_origin="${REPO_URLS[$idx]:-}"
+      if [ -n "$_w_origin" ] && url_is_github "$_w_origin" && gh_ready; then
+        parse_git_url "$_w_origin" >/dev/null
+        local _w_info _w_perm
+        _w_info="$(gh_repo_info "$GU_OWNER/$GU_REPO" || true)"
+        _w_perm="$(printf '%s' "$_w_info" | cut -f1)"
+        if [ -n "$_w_perm" ] && ! gh_perm_can_push "$_w_perm"; then
+          local _w_do_fork=0
+          if [ -t 0 ] && [ -t 1 ]; then
+            printf "You have no push access to '%s' (%s). Fork it now (origin->your fork, original->upstream)? [Y/n] " "$_w_origin" "$_w_perm" >&2
+            local _w_reply; IFS= read -r _w_reply
+            case "$_w_reply" in n|N|no) _w_do_fork=0 ;; *) _w_do_fork=1 ;; esac
+          fi
+          if [ "$_w_do_fork" -eq 1 ]; then
+            if fork_and_rewire_repo "$idx"; then
+              save_repos
+              log "origin is now your fork; '${REPO_NAMES[$idx]}' is ready for write."
+            fi
+          else
+            warn "No push access to '${REPO_NAMES[$idx]}' origin — run 'mcrepo fork ${REPO_NAMES[$idx]}' when you want to contribute via a fork."
+          fi
+        fi
+      fi
+    fi
   fi
   if [ "$target_mode" = "sleep" ] || [ "$target_mode" = "off" ]; then
     mkdir -p "$repo_dir"
@@ -4802,21 +5311,118 @@ Install it in VS Code:
 # (2) ls-remote query to origin (network, caches result via set-head),
 # (3) heuristic check for common branch names (main/master/develop/trunk).
 # Returns empty string if detection fails.
-detect_default_branch() {
+# ─── Capability / platform layer ────────────────────────────────────────────
+# These helpers underpin the origin/upstream (fork) workflow. All gh-dependent
+# helpers DEGRADE GRACEFULLY: when gh is missing/unauthenticated they return a
+# non-zero status or "unknown" rather than calling die(), so plain-git workflows
+# (clone/push/branch/merge) keep working without GitHub CLI.
+
+# Parse a git URL (https, ssh git@host:owner/repo.git, ssh://) into components.
+# Sets globals GU_HOST, GU_OWNER, GU_REPO. Returns 1 if it cannot be parsed.
+parse_git_url() {
+  local url="$1"
+  GU_HOST=""; GU_OWNER=""; GU_REPO=""
+  [ -n "$url" ] || return 1
+  url="${url%%\#*}"; url="${url%%\?*}"
+  local rest
+  case "$url" in
+    git@*:*)
+      # scp-like: git@host:owner/repo(.git)
+      GU_HOST="${url#git@}"; GU_HOST="${GU_HOST%%:*}"
+      rest="${url#*:}"
+      ;;
+    ssh://*)
+      rest="${url#ssh://}"; rest="${rest#*@}"   # drop optional user@
+      GU_HOST="${rest%%/*}"; GU_HOST="${GU_HOST%%:*}"  # strip optional :port
+      rest="${rest#*/}"
+      ;;
+    http://*|https://*)
+      rest="${url#*://}"; rest="${rest#*@}"
+      GU_HOST="${rest%%/*}"
+      rest="${rest#*/}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  GU_OWNER="${rest%%/*}"
+  local tail="${rest#*/}"
+  GU_REPO="${tail%%/*}"
+  GU_REPO="${GU_REPO%.git}"
+  [ -n "$GU_HOST" ] && [ -n "$GU_OWNER" ] && [ -n "$GU_REPO" ]
+}
+
+# True if the URL points at github.com (door left open for other platforms later).
+url_is_github() {
+  parse_git_url "$1" >/dev/null 2>&1 || return 1
+  [ "$GU_HOST" = "github.com" ]
+}
+
+# Cached gh readiness: gh installed AND authenticated. 0 = ready.
+_GH_READY_CACHE=""
+gh_ready() {
+  if [ -z "$_GH_READY_CACHE" ]; then
+    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+      _GH_READY_CACHE="yes"
+    else
+      _GH_READY_CACHE="no"
+    fi
+  fi
+  [ "$_GH_READY_CACHE" = "yes" ]
+}
+
+# Authenticated GitHub login (fork owner). Empty if gh not ready.
+gh_login() {
+  gh_ready || { printf ''; return 1; }
+  gh api user --jq '.login' 2>/dev/null || printf ''
+}
+
+# Fetch repo info for <owner/repo>. Prints TSV: viewerPermission, isFork,
+# parentNameWithOwner, defaultBranch. Returns 1 if gh not ready or lookup fails.
+gh_repo_info() {
+  local slug="$1"
+  gh_ready || return 1
+  gh repo view "$slug" --json viewerPermission,isFork,parent,defaultBranchRef \
+    --jq '[.viewerPermission, (.isFork|tostring), (.parent.nameWithOwner // ""), (.defaultBranchRef.name // "")] | @tsv' 2>/dev/null
+}
+
+# True if the viewerPermission string grants push access.
+gh_perm_can_push() {
+  case "$1" in ADMIN|MAINTAIN|WRITE) return 0 ;; *) return 1 ;; esac
+}
+
+# Ensure a git remote named 'upstream' exists in repo_dir pointing at url.
+ensure_upstream_remote() {
+  local repo_dir="$1" url="$2"
+  [ -n "$url" ] || return 0
+  [ -d "$repo_dir/.git" ] || return 0
+  local cur
+  cur="$(git -C "$repo_dir" remote get-url upstream 2>/dev/null || true)"
+  if [ -z "$cur" ]; then
+    git -C "$repo_dir" remote add upstream "$url" 2>/dev/null || true
+  elif [ "$cur" != "$url" ]; then
+    git -C "$repo_dir" remote set-url upstream "$url" 2>/dev/null || true
+  fi
+}
+
+# Detect the default branch of a given remote (default: origin). Mirrors the
+# origin-only detection but parameterized so we can ask the 'upstream' remote.
+detect_default_branch_remote() {
   local repo_dir="$1"
+  local remote="${2:-origin}"
   local branch
 
   # Layer 1: Local symbolic ref (fast, no network)
-  branch=$(git -C "$repo_dir" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+  branch=$(git -C "$repo_dir" symbolic-ref "refs/remotes/$remote/HEAD" 2>/dev/null | sed "s|refs/remotes/$remote/||")
   if [ -n "$branch" ]; then
     printf '%s' "$branch"
     return 0
   fi
 
   # Layer 2: Remote query (needs network)
-  branch=$(git -C "$repo_dir" ls-remote --symref origin HEAD 2>/dev/null | head -1 | sed 's|.*refs/heads/||; s|\t.*||')
+  branch=$(git -C "$repo_dir" ls-remote --symref "$remote" HEAD 2>/dev/null | head -1 | sed 's|.*refs/heads/||; s|\t.*||')
   if [ -n "$branch" ]; then
-    git -C "$repo_dir" remote set-head origin "$branch" 2>/dev/null
+    git -C "$repo_dir" remote set-head "$remote" "$branch" 2>/dev/null
     printf '%s' "$branch"
     return 0
   fi
@@ -4824,13 +5430,17 @@ detect_default_branch() {
   # Layer 3: Heuristic fallback
   local candidate
   for candidate in main master develop trunk; do
-    if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$candidate"; then
+    if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/$remote/$candidate"; then
       printf '%s' "$candidate"
       return 0
     fi
   done
 
   printf ''
+}
+
+detect_default_branch() {
+  detect_default_branch_remote "$1" "origin"
 }
 
 switch_repo_branch() {
@@ -6187,6 +6797,7 @@ cmd_pr() {
   local do_draft=0
   local do_push=1
   local include_read=0
+  local opt_target=""   # "", "origin", or "upstream" (global override)
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -6194,6 +6805,7 @@ cmd_pr() {
       --draft) do_draft=1 ;;
       --no-push) do_push=0 ;;
       --include-read) include_read=1 ;;
+      --target) shift; opt_target="${1:-}"; case "$opt_target" in origin|upstream) ;; *) die "--target must be origin|upstream" ;; esac ;;
       *) die "Unknown pr option: $1" ;;
     esac
     shift
@@ -6207,13 +6819,15 @@ cmd_pr() {
   local source_branch="$GLOBAL_BRANCH"
   [ -n "$title" ] || title="$source_branch"
 
-  # --- Phase 0: prerequisites ---
-  command -v gh >/dev/null 2>&1 || die "GitHub CLI 'gh' not found. Install it and run 'gh auth login'."
-  gh auth status >/dev/null 2>&1 || die "GitHub CLI is not authenticated. Run 'gh auth login' first."
+  # --- Phase 0: prerequisites (PRs always need gh) ---
+  gh_ready || die "Pull requests need the GitHub CLI. Install gh and run 'gh auth login' (see 'mcrepo doctor')."
 
-  # --- Phase 1: collect candidates (repos with commits vs their parent) ---
-  local i mode repo_dir repo_name parent actual cmp_target cnt
-  local -a cand_dirs=() cand_names=() cand_parents=() cand_counts=()
+  # --- Phase 1: collect candidates (repos with commits vs their base branch) ---
+  # Per candidate we record the PR TARGET: same-repo (origin) or cross-repo (fork
+  # -> upstream). Parallel arrays carry the gh repo slug (-R) and head ref.
+  local i mode repo_dir repo_name base actual cmp_target cnt
+  local -a cand_dirs=() cand_names=() cand_bases=() cand_counts=()
+  local -a cand_slugs=() cand_heads=() cand_kinds=()
   local -a skipped_empty=() skipped_other=() dirty_repos=()
 
   for i in "${!REPO_NAMES[@]}"; do
@@ -6225,46 +6839,83 @@ cmd_pr() {
     repo_dir="$(get_repo_dir "$repo_name" "$mode")"
     [ -d "$repo_dir/.git" ] || continue
 
-    # origin must be a GitHub remote
-    local origin_url
+    local origin_url upstream_url target
     origin_url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)"
-    if [ -z "$origin_url" ] || ! printf '%s' "$origin_url" | grep -qi 'github'; then
-      warn "Skipping '$repo_name': origin is not a GitHub remote."
+    upstream_url="${REPO_UPSTREAMS[$i]:-}"
+
+    # Decide PR target for this repo.
+    target="origin"
+    if [ -n "$upstream_url" ] && [ "$opt_target" != "origin" ]; then
+      target="upstream"
+    fi
+    if [ "$opt_target" = "upstream" ] && [ -z "$upstream_url" ]; then
+      warn "Skipping '$repo_name': --target upstream but no upstream configured (set with 'mcrepo upstream $repo_name <url>')."
       skipped_other+=("$repo_name")
       continue
     fi
 
-    parent="${REPO_PARENTS[$i]##*,}"
-    [ -n "$parent" ] || parent="$(detect_default_branch "$repo_dir")"
-    if [ -z "$parent" ]; then
-      warn "Skipping '$repo_name': no parent branch recorded and cannot detect default branch."
-      skipped_other+=("$repo_name")
-      continue
-    fi
-
+    # Repo must be on the coordinated branch.
     actual="$(repo_branch "$repo_dir")"
     if [ "$actual" != "$source_branch" ]; then
       warn "Skipping '$repo_name': on '$actual', expected '$source_branch' (realign with 'mcrepo branch $actual')."
       skipped_other+=("$repo_name")
       continue
     fi
-    if [ "$parent" = "$source_branch" ]; then
-      warn "Skipping '$repo_name': parent equals current branch '$source_branch'."
-      skipped_other+=("$repo_name")
-      continue
+
+    local slug="" head="" cmp_remote=""
+    if [ "$target" = "upstream" ]; then
+      # Cross-repo PR: head = <forkOwner>:<branch> on origin; base repo = upstream.
+      if ! url_is_github "$upstream_url"; then
+        warn "Skipping '$repo_name': upstream is not a github.com URL."
+        skipped_other+=("$repo_name"); continue
+      fi
+      parse_git_url "$upstream_url" >/dev/null
+      slug="$GU_OWNER/$GU_REPO"
+      if [ -z "$origin_url" ] || ! url_is_github "$origin_url"; then
+        warn "Skipping '$repo_name': need a GitHub origin (your fork) to open a PR to upstream. Try 'mcrepo fork $repo_name'."
+        skipped_other+=("$repo_name"); continue
+      fi
+      parse_git_url "$origin_url" >/dev/null
+      head="$GU_OWNER:$source_branch"
+      # Make sure the upstream remote + its refs are available for base detection.
+      ensure_upstream_remote "$repo_dir" "$upstream_url"
+      git -C "$repo_dir" fetch upstream --quiet 2>/dev/null || true
+      base="${REPO_PARENTS[$i]##*,}"
+      if [ -z "$base" ] || ! git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/upstream/$base"; then
+        base="$(detect_default_branch_remote "$repo_dir" upstream)"
+      fi
+      cmp_remote="upstream"
+    else
+      # Same-repo PR (your own repo): base = parent / default branch.
+      if [ -z "$origin_url" ] || ! url_is_github "$origin_url"; then
+        warn "Skipping '$repo_name': origin is not a GitHub remote."
+        skipped_other+=("$repo_name"); continue
+      fi
+      base="${REPO_PARENTS[$i]##*,}"
+      [ -n "$base" ] || base="$(detect_default_branch "$repo_dir")"
+      head="$source_branch"
+      cmp_remote="origin"
     fi
 
-    # Has commits vs parent? Prefer origin/<parent>, fall back to local.
+    if [ -z "$base" ]; then
+      warn "Skipping '$repo_name': cannot determine base branch on $cmp_remote."
+      skipped_other+=("$repo_name"); continue
+    fi
+    if [ "$base" = "$source_branch" ]; then
+      warn "Skipping '$repo_name': base equals current branch '$source_branch'."
+      skipped_other+=("$repo_name"); continue
+    fi
+
+    # Has commits vs base? Prefer <cmp_remote>/<base>, fall back to local.
     cmp_target=""
-    if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$parent"; then
-      cmp_target="origin/$parent"
-    elif git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$parent"; then
-      cmp_target="$parent"
+    if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/$cmp_remote/$base"; then
+      cmp_target="$cmp_remote/$base"
+    elif git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$base"; then
+      cmp_target="$base"
     fi
     if [ -z "$cmp_target" ]; then
-      warn "Skipping '$repo_name': parent branch '$parent' not found locally or on origin."
-      skipped_other+=("$repo_name")
-      continue
+      warn "Skipping '$repo_name': base branch '$base' not found on $cmp_remote or locally."
+      skipped_other+=("$repo_name"); continue
     fi
     cnt="$(git -C "$repo_dir" rev-list --count "$cmp_target..HEAD" 2>/dev/null || printf -- '-1')"
     if [ "$cnt" -le 0 ]; then
@@ -6274,42 +6925,61 @@ cmd_pr() {
 
     [ "$(repo_dirty_state "$repo_dir")" = "dirty" ] && dirty_repos+=("$repo_name")
 
-    cand_dirs+=("$repo_dir")
-    cand_names+=("$repo_name")
-    cand_parents+=("$parent")
-    cand_counts+=("$cnt")
+    cand_dirs+=("$repo_dir"); cand_names+=("$repo_name"); cand_bases+=("$base"); cand_counts+=("$cnt")
+    cand_slugs+=("$slug"); cand_heads+=("$head"); cand_kinds+=("$target")
   done
 
-  # Meta-context repo (same handling as cmd_merge)
+  # Meta-context repo: same-repo by default, or fork->upstream when META_UPSTREAM set.
   if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    local meta_parent meta_actual meta_origin meta_cmp meta_cnt
-    meta_parent="${META_PARENT##*,}"
-    [ -n "$meta_parent" ] || meta_parent="$(detect_default_branch ".")"
+    local meta_base meta_actual meta_origin meta_cmp meta_cnt
+    local meta_target="origin" meta_slug="" meta_head="$source_branch" meta_cmp_remote="origin"
     meta_actual="$(repo_branch ".")"
     meta_origin="$(git -C . remote get-url origin 2>/dev/null || true)"
-    if [ -n "$meta_parent" ] && [ "$meta_parent" != "$source_branch" ] && [ "$meta_actual" = "$source_branch" ] \
-       && [ -n "$meta_origin" ] && printf '%s' "$meta_origin" | grep -qi 'github'; then
-      meta_cmp=""
-      if git -C . show-ref --verify --quiet "refs/remotes/origin/$meta_parent"; then
-        meta_cmp="origin/$meta_parent"
-      elif git -C . show-ref --verify --quiet "refs/heads/$meta_parent"; then
-        meta_cmp="$meta_parent"
+
+    if [ -n "$META_UPSTREAM" ] && [ "$opt_target" != "origin" ]; then
+      meta_target="upstream"
+    fi
+
+    if [ "$meta_actual" = "$source_branch" ] && [ -n "$meta_origin" ] && url_is_github "$meta_origin"; then
+      if [ "$meta_target" = "upstream" ] && url_is_github "$META_UPSTREAM"; then
+        parse_git_url "$META_UPSTREAM" >/dev/null; meta_slug="$GU_OWNER/$GU_REPO"
+        parse_git_url "$meta_origin" >/dev/null; meta_head="$GU_OWNER:$source_branch"
+        ensure_upstream_remote "." "$META_UPSTREAM"
+        git -C . fetch upstream --quiet 2>/dev/null || true
+        meta_base="${META_PARENT##*,}"
+        if [ -z "$meta_base" ] || ! git -C . show-ref --verify --quiet "refs/remotes/upstream/$meta_base"; then
+          meta_base="$(detect_default_branch_remote "." upstream)"
+        fi
+        meta_cmp_remote="upstream"
+      else
+        meta_base="${META_PARENT##*,}"
+        [ -n "$meta_base" ] || meta_base="$(detect_default_branch ".")"
       fi
-      if [ -n "$meta_cmp" ]; then
-        meta_cnt="$(git -C . rev-list --count "$meta_cmp..HEAD" 2>/dev/null || printf -- '-1')"
-        if [ "$meta_cnt" -gt 0 ]; then
-          [ "$(repo_dirty_state ".")" = "dirty" ] && dirty_repos+=("(meta-context)")
-          cand_dirs+=("."); cand_names+=("(meta-context)"); cand_parents+=("$meta_parent"); cand_counts+=("$meta_cnt")
-        else
-          skipped_empty+=("(meta-context)")
+
+      if [ -n "$meta_base" ] && [ "$meta_base" != "$source_branch" ]; then
+        meta_cmp=""
+        if git -C . show-ref --verify --quiet "refs/remotes/$meta_cmp_remote/$meta_base"; then
+          meta_cmp="$meta_cmp_remote/$meta_base"
+        elif git -C . show-ref --verify --quiet "refs/heads/$meta_base"; then
+          meta_cmp="$meta_base"
+        fi
+        if [ -n "$meta_cmp" ]; then
+          meta_cnt="$(git -C . rev-list --count "$meta_cmp..HEAD" 2>/dev/null || printf -- '-1')"
+          if [ "$meta_cnt" -gt 0 ]; then
+            [ "$(repo_dirty_state ".")" = "dirty" ] && dirty_repos+=("(meta-context)")
+            cand_dirs+=("."); cand_names+=("(meta-context)"); cand_bases+=("$meta_base"); cand_counts+=("$meta_cnt")
+            cand_slugs+=("$meta_slug"); cand_heads+=("$meta_head"); cand_kinds+=("$meta_target")
+          else
+            skipped_empty+=("(meta-context)")
+          fi
         fi
       fi
     fi
   fi
 
   if [ "${#cand_dirs[@]}" -eq 0 ]; then
-    log "No repos with commits against their parent — nothing to open a PR for."
-    [ "${#skipped_empty[@]}" -gt 0 ] && log "  Skipped (no commits vs parent): ${skipped_empty[*]}"
+    log "No repos with commits against their base — nothing to open a PR for."
+    [ "${#skipped_empty[@]}" -gt 0 ] && log "  Skipped (no commits vs base): ${skipped_empty[*]}"
     return 0
   fi
 
@@ -6317,10 +6987,16 @@ cmd_pr() {
   log "=== PR plan (branch '$source_branch') ==="
   local idx
   for idx in "${!cand_dirs[@]}"; do
-    printf '  %-20s %s -> %s  [%s commit(s)]\n' \
-      "${cand_names[$idx]}" "$source_branch" "${cand_parents[$idx]}" "${cand_counts[$idx]}"
+    local tgt_label
+    if [ "${cand_kinds[$idx]}" = "upstream" ]; then
+      tgt_label="upstream ${cand_slugs[$idx]}"
+    else
+      tgt_label="origin"
+    fi
+    printf '  %-20s %s -> %s (%s)  [%s commit(s)]\n' \
+      "${cand_names[$idx]}" "$source_branch" "${cand_bases[$idx]}" "$tgt_label" "${cand_counts[$idx]}"
   done
-  [ "${#skipped_empty[@]}" -gt 0 ] && log "  Skipped (no commits vs parent): ${skipped_empty[*]}"
+  [ "${#skipped_empty[@]}" -gt 0 ] && log "  Skipped (no commits vs base): ${skipped_empty[*]}"
   if [ "${#dirty_repos[@]}" -gt 0 ]; then
     warn "Uncommitted changes in: ${dirty_repos[*]} — these will NOT be included in the PR(s)."
   fi
@@ -6331,20 +7007,21 @@ cmd_pr() {
     case "$confirm" in n|N|no) log "Aborted."; return 0 ;; esac
   fi
 
-  # --- Phase 3: auto-push feature branch (unless --no-push) ---
-  local -a pr_dirs=() pr_names=() pr_parents=() pr_urls=()
+  # --- Phase 3: auto-push feature branch to origin (your fork), unless --no-push ---
+  local -a pr_dirs=() pr_names=() pr_bases=() pr_slugs=() pr_heads=() pr_urls=()
   local -a failed=()
   for idx in "${!cand_dirs[@]}"; do
     repo_dir="${cand_dirs[$idx]}"; repo_name="${cand_names[$idx]}"
     if [ "$do_push" -eq 1 ]; then
-      log "--- Pushing '$repo_name' ($source_branch) ---"
+      log "--- Pushing '$repo_name' ($source_branch -> origin) ---"
       if ! git -C "$repo_dir" push -u origin "$source_branch"; then
         warn "Push failed for '$repo_name' — skipping PR."
         failed+=("$repo_name")
         continue
       fi
     fi
-    pr_dirs+=("$repo_dir"); pr_names+=("$repo_name"); pr_parents+=("${cand_parents[$idx]}")
+    pr_dirs+=("$repo_dir"); pr_names+=("$repo_name"); pr_bases+=("${cand_bases[$idx]}")
+    pr_slugs+=("${cand_slugs[$idx]}"); pr_heads+=("${cand_heads[$idx]}")
   done
 
   if [ "${#pr_dirs[@]}" -eq 0 ]; then
@@ -6356,9 +7033,14 @@ cmd_pr() {
   # --- Phase 4: create or reuse PRs ---
   local -a created=() reused=()
   for idx in "${!pr_dirs[@]}"; do
-    repo_dir="${pr_dirs[$idx]}"; repo_name="${pr_names[$idx]}"; parent="${pr_parents[$idx]}"
+    repo_dir="${pr_dirs[$idx]}"; repo_name="${pr_names[$idx]}"
+    base="${pr_bases[$idx]}"; local slug="${pr_slugs[$idx]}" head="${pr_heads[$idx]}"
+    # -R <slug> for cross-repo (upstream) PRs; empty for same-repo. ${arr[@]+...}
+    # is the bash 3.2 + `set -u` safe expansion of a possibly-empty array.
+    local rflag=()
+    [ -n "$slug" ] && rflag=(-R "$slug")
     local url=""
-    url="$(cd "$repo_dir" && gh pr list --head "$source_branch" --base "$parent" --state open --json url --jq '.[0].url' 2>/dev/null || true)"
+    url="$(cd "$repo_dir" && gh pr list ${rflag[@]+"${rflag[@]}"} --head "$head" --base "$base" --state open --json url --jq '.[0].url' 2>/dev/null || true)"
     if [ -n "$url" ]; then
       log "Reusing existing PR for '$repo_name': $url"
       reused+=("$repo_name")
@@ -6367,9 +7049,7 @@ cmd_pr() {
       base_body="Coordinated mcrepo change on branch \`$source_branch\` (repo: $repo_name)."
       local draft_flag=()
       [ "$do_draft" -eq 1 ] && draft_flag=(--draft)
-      # NOTE: ${arr[@]+"${arr[@]}"} is the bash 3.2 + `set -u` safe expansion for a
-      # possibly-empty array (plain "${arr[@]}" errors as "unbound variable" there).
-      url="$(cd "$repo_dir" && gh pr create --base "$parent" --head "$source_branch" \
+      url="$(cd "$repo_dir" && gh pr create ${rflag[@]+"${rflag[@]}"} --base "$base" --head "$head" \
               --title "$title" --body "$base_body" ${draft_flag[@]+"${draft_flag[@]}"} 2>/dev/null || true)"
       if [ -z "$url" ]; then
         warn "Failed to create PR for '$repo_name'."
@@ -6383,19 +7063,18 @@ cmd_pr() {
   done
 
   # Rebuild parallel arrays for repos that actually got a URL (filter failures).
-  local -a link_names=() link_dirs=() link_urls=()
+  local -a link_names=() link_urls=()
   local u_i=0
   for idx in "${!pr_dirs[@]}"; do
     repo_name="${pr_names[$idx]}"
     case " ${failed[*]-} " in *" $repo_name "*) continue ;; esac
-    link_names+=("$repo_name"); link_dirs+=("${pr_dirs[$idx]}"); link_urls+=("${pr_urls[$u_i]}")
+    link_names+=("$repo_name"); link_urls+=("${pr_urls[$u_i]}")
     u_i=$((u_i+1))
   done
 
-  # --- Phase 5: cross-link all PRs ---
+  # --- Phase 5: cross-link all PRs (addressed by URL — works across repos) ---
   local -a linked=() commented=()
   if [ "${#link_urls[@]}" -gt 0 ]; then
-    # Build the shared cross-link block.
     local block
     block="$MCREPO_PR_BLOCK_BEGIN
 ### Coordinated PRs (branch \`$source_branch\`)
@@ -6407,14 +7086,14 @@ cmd_pr() {
     done
     block="$block$MCREPO_PR_BLOCK_END"
 
-    for li in "${!link_dirs[@]}"; do
-      repo_dir="${link_dirs[$li]}"; repo_name="${link_names[$li]}"
+    for li in "${!link_urls[@]}"; do
+      local url="${link_urls[$li]}"; repo_name="${link_names[$li]}"
       local cur_body new_body
-      cur_body="$(cd "$repo_dir" && gh pr view "$source_branch" --json body --jq '.body' 2>/dev/null || true)"
+      cur_body="$(gh pr view "$url" --json body --jq '.body' 2>/dev/null || true)"
       new_body="$(pr_body_with_block "$cur_body" "$block")"
-      if (cd "$repo_dir" && gh pr edit "$source_branch" --body "$new_body" >/dev/null 2>&1); then
+      if gh pr edit "$url" --body "$new_body" >/dev/null 2>&1; then
         linked+=("$repo_name")
-      elif (cd "$repo_dir" && gh pr comment "$source_branch" --body "$block" >/dev/null 2>&1); then
+      elif gh pr comment "$url" --body "$block" >/dev/null 2>&1; then
         commented+=("$repo_name")
       else
         warn "Could not add cross-link to '$repo_name' (neither edit nor comment worked)."
@@ -6430,7 +7109,7 @@ cmd_pr() {
   [ "${#reused[@]}"   -gt 0 ] && log "  Reused:      ${reused[*]}"
   [ "${#linked[@]}"   -gt 0 ] && log "  Cross-linked (body):    ${linked[*]}"
   [ "${#commented[@]}" -gt 0 ] && log "  Cross-linked (comment): ${commented[*]}"
-  [ "${#skipped_empty[@]}" -gt 0 ] && log "  Skipped (no commits vs parent): ${skipped_empty[*]}"
+  [ "${#skipped_empty[@]}" -gt 0 ] && log "  Skipped (no commits vs base): ${skipped_empty[*]}"
   [ "${#skipped_other[@]}" -gt 0 ] && log "  Skipped (other):        ${skipped_other[*]}"
   [ "${#failed[@]}"   -gt 0 ] && warn "  Failed:      ${failed[*]}"
 }
@@ -6895,6 +7574,9 @@ main() {
   case "$cmd" in
     init) cmd_init "$@" ;;
     add) cmd_add "$@" ;;
+    upstream) cmd_upstream "$@" ;;
+    fork) cmd_fork "$@" ;;
+    doctor) cmd_doctor "$@" ;;
     new) cmd_new "$@" ;;
     publish) cmd_publish "$@" ;;
     publish-base) cmd_publish_base "$@" ;;
