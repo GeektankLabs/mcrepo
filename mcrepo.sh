@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.5.5"
+MCREPO_VERSION="0.5.6"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -105,7 +105,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh pull                                   # Fetch + ff-pull all active repos; meta-context auto-stashes on dirty, sub-repos skip on dirty
   ./mcrepo.sh pull --rebase                          # Auto-stash, pull, pop stash for ALL repos (handles dirty sub-repos safely)
   ./mcrepo.sh pull --reset                           # Discard local changes and reset to origin state (destructive!)
-  ./mcrepo.sh push [-m "message"] [--no-fetch]       # Fetch + abort if behind, then commit (if -m) and push write-mode repos
+  ./mcrepo.sh push [-m "message"] [--no-fetch] [--no-force] # Fetch + push write-mode repos; auto force-with-lease branches only rebased onto parent; abort if genuinely behind; --no-force disables auto-force
 
 ═══════════════════════════════════════════════════════════════════════════════
   MID-OPERATION RECOVERY
@@ -1081,7 +1081,7 @@ _mcrepo_complete() {
       COMPREPLY=( $(compgen -W "--rebase --reset" -- "$cur") )
       ;;
     push)
-      COMPREPLY=( $(compgen -W "-m" -- "$cur") )
+      COMPREPLY=( $(compgen -W "-m --no-fetch --no-force" -- "$cur") )
       ;;
     commit)
       COMPREPLY=( $(compgen -W "-m --include-read --revert --reset --force" -- "$cur") )
@@ -1192,9 +1192,7 @@ _mcrepo_complete() {
       fi
       ;;
     push)
-      if (( CURRENT == 3 )); then
-        compadd -- -m
-      fi
+      compadd -- -m --no-fetch --no-force
       ;;
     commit)
       compadd -- -m --include-read --revert --reset --force
@@ -1328,8 +1326,8 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 - `mcrepo branch <name>` distinguishes fork (new branch, records parent) from jump (existing branch, no parent change).
 - `mcrepo branch --delete` discards the global branch and reverts repos to their parent branches.
 - `mcrepo branch --off` is a fallback that turns off coordination without switching branches.
-- `mcrepo pull` fetches and pulls from origin for all active repos (ff-only). Meta-context auto-stashes on dirty; dirty sub-repos skip — use `pull --rebase` to auto-stash sub-repos too.
-- `mcrepo push [-m "message"]` pushes write-mode repos. With `-m`, also commits uncommitted changes first (same coordinated-commit format as `mcrepo commit`).
+- `mcrepo pull` fetches and pulls from origin for all active repos (ff-only). Meta-context auto-stashes on dirty; dirty sub-repos skip — use `pull --rebase` to auto-stash sub-repos too. After `mcrepo merge --rebase`, a coordinated branch can't fast-forward because the rebase rewrote its hashes; `mcrepo pull` recognizes this and tells you to run `mcrepo push` instead of failing.
+- `mcrepo push [-m "message"]` pushes write-mode repos. With `-m`, also commits uncommitted changes first (same coordinated-commit format as `mcrepo commit`). Branches that were only rebased onto their parent (diverged from a stale remote, but provably your own rebase) are auto-published with `--force-with-lease` after a fresh fetch; pass `--no-force` to disable. Genuinely diverged branches (remote contains other work) are never force-pushed — mcrepo refuses and prints a paste-ready prompt for a local coding agent to resolve.
 - When `branch:` is empty, branch coordination is off and repos manage branches independently.
 - When running non-interactively (e.g., from scripts or agents), `mcrepo branch` aborts if uncommitted changes exist. Ensure clean working trees before switching branches.
 
@@ -3229,6 +3227,121 @@ repo_upstream_state() {
   fi
 }
 
+# Classify how a branch diverges from its upstream, so callers can tell the
+# "I rebased onto main but haven't pushed yet" case (safe to force-with-lease)
+# apart from "the remote branch has real new work" (must not be clobbered).
+# Usage: classify_divergence <repo_dir> <branch> <parent>  (parent may be empty)
+# Prints exactly one of:
+#   none         - no upstream, in-sync, ahead-only (plain push), or unknown
+#   behind-only  - behind>0 && ahead==0 (plain fast-forward; normal pull handles it)
+#   safe-force   - diverged AND provably our own rebase (auto-force eligible)
+#   remote-work  - diverged but NOT provably our rebase (needs human/agent review)
+classify_divergence() {
+  local repo_dir="$1"
+  local branch="$2"
+  local parent="$3"
+  if ! git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    printf 'none'; return 0
+  fi
+  local ab behind ahead
+  ab="$(git -C "$repo_dir" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null)" || { printf 'none'; return 0; }
+  behind="$(printf '%s' "$ab" | awk '{print $1+0}')"
+  ahead="$(printf '%s' "$ab" | awk '{print $2+0}')"
+  if [ "$behind" -eq 0 ]; then
+    printf 'none'; return 0   # in-sync or ahead-only: nothing diverged
+  fi
+  if [ "$ahead" -eq 0 ]; then
+    printf 'behind-only'; return 0   # plain fast-forward
+  fi
+  # Diverged (ahead>0 && behind>0). Decide whether this is our own rebase.
+  # Resolve the parent ref P: prefer origin/<parent>, else local <parent>.
+  local p_ref=""
+  if [ -n "$parent" ]; then
+    if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$parent"; then
+      p_ref="origin/$parent"
+    elif git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$parent"; then
+      p_ref="$parent"
+    fi
+  fi
+  if [ -z "$p_ref" ]; then
+    printf 'remote-work'; return 0   # can't prove rebase case without a parent ref
+  fi
+  # Safe iff: local HEAD already contains the parent (rebase pulled main in)
+  # AND the remote branch is stale (predates the parent merge).
+  if git -C "$repo_dir" merge-base --is-ancestor "$p_ref" HEAD 2>/dev/null && \
+     ! git -C "$repo_dir" merge-base --is-ancestor "$p_ref" "@{u}" 2>/dev/null; then
+    printf 'safe-force'; return 0
+  fi
+  printf 'remote-work'
+}
+
+# Print a copy-paste prompt the user can hand to a local coding agent to resolve
+# a stuck/conflict state that mcrepo deliberately will not auto-resolve.
+# Usage: print_agent_recovery_prompt <situation> <name|dir> [<name|dir> ...]
+#   situation: rebase-conflict | stash-conflict | ambiguous-divergence
+print_agent_recovery_prompt() {
+  local situation="$1"; shift
+  local headline detail
+  case "$situation" in
+    rebase-conflict)
+      headline="Rebase conflicts during 'mcrepo merge --rebase' (coordinated branches across repos)."
+      detail="A git rebase is paused mid-way. Each conflicted repo has an in-progress rebase you must finish."
+      ;;
+    stash-conflict)
+      headline="Stash-pop conflicts after 'mcrepo merge --rebase'."
+      detail="The rebase succeeded but restoring auto-stashed local changes conflicted. A stash is still saved."
+      ;;
+    ambiguous-divergence)
+      headline="A coordinated branch diverged from its remote and it is NOT just a local rebase."
+      detail="The remote branch already contains work mcrepo cannot prove came from your rebase, so it refuses to force-push."
+      ;;
+    *)
+      headline="mcrepo hit a state it will not auto-resolve."
+      detail=""
+      ;;
+  esac
+  log ""
+  log "Need help resolving this? Paste the prompt between the lines below to your local coding agent:"
+  log "------------------------------------------------------------"
+  printf 'I am using the mcrepo toolset (./mcrepo.sh) which coordinates a feature branch across a\n'
+  printf 'meta-context repo and several sub-repos, then rebases it onto each parent `main`.\n\n'
+  printf 'Situation: %s\n' "$headline"
+  printf '%s\n\n' "$detail"
+  printf 'Affected repos (name and local path):\n'
+  local entry name dir
+  for entry in "$@"; do
+    name="${entry%%|*}"
+    dir="${entry#*|}"
+    printf -- '- %s  (cd %s)\n' "$name" "$dir"
+  done
+  printf '\nPlease help me resolve this cleanly:\n'
+  printf '1. For each affected repo, compare the three sides that produced the divergence/conflict:\n'
+  printf '   the local feature branch, the parent `main` it was rebased onto, and the stale\n'
+  printf '   `origin/<branch>` that still holds pre-rebase history. Use `git -C <dir> log --oneline --graph`\n'
+  printf '   and `git -C <dir> status` to orient.\n'
+  printf '2. Note that the conflicting commits are mcrepo coordination commits (subjects like\n'
+  printf '   "mcrepo commit #N @<batch>") that may exist in BOTH old and rebased form — do not keep both;\n'
+  printf '   resolve toward the intended final state = real feature work on top of the latest `main`.\n'
+  case "$situation" in
+    rebase-conflict)
+      printf '3. Edit conflicted files, `git -C <dir> add` them, then run `./mcrepo.sh continue` to advance\n'
+      printf '   each paused rebase (repeat until all repos finish). Restore any auto-stash with\n'
+      printf '   `git -C <dir> stash pop` if mcrepo notes a stash was kept.\n'
+      ;;
+    stash-conflict)
+      printf '3. Resolve the conflicted files, `git -C <dir> add` them, then `git -C <dir> stash drop`\n'
+      printf '   to discard the now-applied stash entry.\n'
+      ;;
+    ambiguous-divergence)
+      printf '3. Decide whether the remote commits are wanted. If yes, integrate them (merge or rebase onto\n'
+      printf '   `origin/<branch>`); if they are obsolete, only then force-publish. Do NOT blindly force-push.\n'
+      ;;
+  esac
+  printf '4. When every affected repo is clean (`./mcrepo.sh status` shows no inprogress state), run\n'
+  printf '   `./mcrepo.sh push` to publish (it auto force-with-leases branches that were only rebased).\n'
+  log "------------------------------------------------------------"
+}
+
 generate_commit_message() {
   local repo_dir="$1"
   local branch_name="$2"
@@ -3469,6 +3582,7 @@ cmd_pull() {
   local -a pull_branches=()
   local -a pull_dirty=()
   local -a pull_has_upstream=()
+  local -a pull_parents=()
 
   local i repo_dir branch dirty
   for i in "${!REPO_NAMES[@]}"; do
@@ -3481,11 +3595,14 @@ cmd_pull() {
     if git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
       has_up=1
     fi
+    local pparent="${REPO_PARENTS[$i]##*,}"
+    [ -n "$pparent" ] || pparent="$(detect_default_branch "$repo_dir")"
     pull_dirs+=("$repo_dir")
     pull_names+=("${REPO_NAMES[$i]}")
     pull_branches+=("$branch")
     pull_dirty+=("$dirty")
     pull_has_upstream+=("$has_up")
+    pull_parents+=("$pparent")
   done
 
   # Meta-context repo
@@ -3577,6 +3694,8 @@ cmd_pull() {
   local -a fetch_only_repos=()
   local -a stash_conflict_repos=()
   local -a failed_repos=()
+  local -a diverged_rebased=()   # safe-force: rebased locally, just needs publishing
+  local -a diverged_conflict=()  # remote-work: needs human/agent review
   local had_dirty=0
 
   for i in "${!pull_dirs[@]}"; do
@@ -3585,6 +3704,7 @@ cmd_pull() {
     local rb="${pull_branches[$i]}"
     local rdirty="${pull_dirty[$i]}"
     local rup="${pull_has_upstream[$i]}"
+    local rp="${pull_parents[$i]}"
 
     # Always fetch
     if ! git -C "$rd" fetch origin --prune 2>/dev/null; then
@@ -3638,7 +3758,11 @@ cmd_pull() {
       else
         warn "Pull failed for '$rn' (diverged). Restoring stash."
         [ "$stashed" -eq 1 ] && git -C "$rd" stash pop 2>/dev/null || true
-        failed_repos+=("$rn")
+        case "$(classify_divergence "$rd" "$rb" "$rp")" in
+          safe-force) diverged_rebased+=("$rn|$rd") ;;
+          remote-work) diverged_conflict+=("$rn|$rd") ;;
+          *) failed_repos+=("$rn") ;;
+        esac
       fi
       continue
     fi
@@ -3653,13 +3777,18 @@ cmd_pull() {
     if run_with_repo_prefix "$rn" git -C "$rd" pull --ff-only; then
       updated_repos+=("$rn")
     else
-      warn "Pull failed for '$rn' (diverged or conflict)"
-      failed_repos+=("$rn")
+      case "$(classify_divergence "$rd" "$rb" "$rp")" in
+        safe-force) diverged_rebased+=("$rn|$rd") ;;
+        remote-work) diverged_conflict+=("$rn|$rd") ;;
+        *) warn "Pull failed for '$rn' (diverged or conflict)"; failed_repos+=("$rn") ;;
+      esac
     fi
   done
 
   # Meta-context repo
   if [ -n "$meta_dir" ]; then
+    local meta_pull_parent="${META_PARENT##*,}"
+    [ -n "$meta_pull_parent" ] || meta_pull_parent="$(detect_default_branch ".")"
     if ! git -C . fetch origin --prune 2>/dev/null; then
       warn "Fetch failed for (meta-context)"
       failed_repos+=("(meta-context)")
@@ -3694,14 +3823,21 @@ cmd_pull() {
       else
         warn "Pull failed for (meta-context) (diverged). Restoring stash."
         [ "$meta_stashed" -eq 1 ] && git -C . stash pop 2>/dev/null || true
-        failed_repos+=("(meta-context)")
+        case "$(classify_divergence "." "$meta_branch" "$meta_pull_parent")" in
+          safe-force) diverged_rebased+=("(meta-context)|.") ;;
+          remote-work) diverged_conflict+=("(meta-context)|.") ;;
+          *) failed_repos+=("(meta-context)") ;;
+        esac
       fi
     else
       if run_with_repo_prefix "(meta-context)" git -C . pull --ff-only; then
         updated_repos+=("(meta-context)")
       else
-        warn "Pull failed for (meta-context) (diverged or conflict)"
-        failed_repos+=("(meta-context)")
+        case "$(classify_divergence "." "$meta_branch" "$meta_pull_parent")" in
+          safe-force) diverged_rebased+=("(meta-context)|.") ;;
+          remote-work) diverged_conflict+=("(meta-context)|.") ;;
+          *) warn "Pull failed for (meta-context) (diverged or conflict)"; failed_repos+=("(meta-context)") ;;
+        esac
       fi
     fi
   fi
@@ -3717,10 +3853,22 @@ cmd_pull() {
   if [ "${#stash_conflict_repos[@]}" -gt 0 ]; then
     warn "  Stash conflicts:  ${stash_conflict_repos[*]}"
   fi
+  if [ "${#diverged_rebased[@]}" -gt 0 ]; then
+    local dr
+    local -a dr_names=()
+    for dr in "${diverged_rebased[@]}"; do dr_names+=("${dr%%|*}"); done
+    log "  Rebased locally:  ${dr_names[*]}"
+  fi
+  if [ "${#diverged_conflict[@]}" -gt 0 ]; then
+    local dc
+    local -a dc_names=()
+    for dc in "${diverged_conflict[@]}"; do dc_names+=("${dc%%|*}"); done
+    warn "  Diverged:         ${dc_names[*]}"
+  fi
   if [ "${#failed_repos[@]}" -gt 0 ]; then
     warn "  Failed:           ${failed_repos[*]}"
   fi
-  if [ "${#updated_repos[@]}" -eq 0 ] && [ "${#fetch_only_repos[@]}" -eq 0 ] && [ "${#failed_repos[@]}" -eq 0 ] && [ "${#stash_conflict_repos[@]}" -eq 0 ]; then
+  if [ "${#updated_repos[@]}" -eq 0 ] && [ "${#fetch_only_repos[@]}" -eq 0 ] && [ "${#failed_repos[@]}" -eq 0 ] && [ "${#stash_conflict_repos[@]}" -eq 0 ] && [ "${#diverged_rebased[@]}" -eq 0 ] && [ "${#diverged_conflict[@]}" -eq 0 ]; then
     log "  Everything up to date."
   fi
 
@@ -3728,6 +3876,29 @@ cmd_pull() {
     log ""
     log "Some repos skipped (dirty). Use 'mcrepo pull --rebase' to auto-stash and pull,"
     log "or 'mcrepo pull --reset' to discard local changes."
+  fi
+
+  if [ "${#diverged_rebased[@]}" -gt 0 ]; then
+    log ""
+    log "These branches were rebased locally and just need publishing — this is expected after"
+    log "'mcrepo merge --rebase', NOT remote work from another machine. They can't fast-forward because"
+    log "the rebase rewrote their commit hashes. Run 'mcrepo push' to publish them (it will safely"
+    log "force-with-lease the rebased branches):"
+    local dr2
+    for dr2 in "${diverged_rebased[@]}"; do
+      log "  - ${dr2%%|*}"
+    done
+  fi
+
+  if [ "${#diverged_conflict[@]}" -gt 0 ]; then
+    log ""
+    log "These branches diverged AND their remote contains work that does not look like your local"
+    log "rebase — pull can't fast-forward and mcrepo won't auto-resolve it. Review before deciding:"
+    local dc2
+    for dc2 in "${diverged_conflict[@]}"; do
+      log "  - ${dc2%%|*}"
+    done
+    print_agent_recovery_prompt ambiguous-divergence "${diverged_conflict[@]}"
   fi
 }
 
@@ -4045,10 +4216,12 @@ cmd_commit() {
 cmd_push() {
   local commit_message=""
   local do_fetch=1
+  local allow_force=1
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -m) shift; commit_message="${1:-}"; [ -n "$commit_message" ] || die "-m requires a message" ;;
       --no-fetch) do_fetch=0 ;;
+      --no-force) allow_force=0 ;;
       *) die "Unknown push option: $1" ;;
     esac
     shift
@@ -4066,6 +4239,8 @@ cmd_push() {
   local -a push_behind_count=()
   local -a push_parents=()
   local -a push_is_empty=()
+  local -a push_force=()
+  local -a push_divclass=()   # "" | safe-force | remote-work | behind-only
 
   local i repo_dir branch dirty parent
   for i in "${!REPO_NAMES[@]}"; do
@@ -4086,10 +4261,12 @@ cmd_push() {
     push_behind_count+=(0)
     push_parents+=("$parent")
     push_is_empty+=(0)
+    push_force+=(0)
+    push_divclass+=("")
   done
 
   # Meta-context repo
-  local meta_dir="" meta_branch="" meta_dirty="" meta_has_upstream=0 meta_ahead=0 meta_behind=0
+  local meta_dir="" meta_branch="" meta_dirty="" meta_has_upstream=0 meta_ahead=0 meta_behind=0 meta_force=0 meta_divclass=""
   if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     meta_dir="."
     meta_branch="$(repo_branch ".")"
@@ -4110,6 +4287,15 @@ cmd_push() {
       ab="$(git -C "${push_dirs[$i]}" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null || printf '0\t0')"
       push_behind_count[$i]="$(printf '%s' "$ab" | awk '{print $1+0}')"
       push_ahead_count[$i]="$(printf '%s' "$ab" | awk '{print $2+0}')"
+      # Classify any behind branch so we can message it precisely. Auto force-with-lease
+      # only the safe-force case, only after a fresh fetch (current lease ref), and only
+      # when --no-force was not passed.
+      if [ "${push_behind_count[$i]}" -gt 0 ]; then
+        push_divclass[$i]="$(classify_divergence "${push_dirs[$i]}" "${push_branches[$i]}" "${push_parents[$i]}")"
+        if [ "${push_divclass[$i]}" = "safe-force" ] && [ "$allow_force" -eq 1 ] && [ "$do_fetch" -eq 1 ]; then
+          push_force[$i]=1
+        fi
+      fi
     else
       # No upstream yet (branch never pushed): is this branch empty vs its parent?
       # Skip pushing branches that carry no commits beyond their parent so we don't
@@ -4140,6 +4326,14 @@ cmd_push() {
       meta_ab="$(git -C . rev-list --left-right --count '@{u}...HEAD' 2>/dev/null || printf '0\t0')"
       meta_behind="$(printf '%s' "$meta_ab" | awk '{print $1+0}')"
       meta_ahead="$(printf '%s' "$meta_ab" | awk '{print $2+0}')"
+      if [ "$meta_behind" -gt 0 ]; then
+        local meta_parent="${META_PARENT##*,}"
+        [ -n "$meta_parent" ] || meta_parent="$(detect_default_branch ".")"
+        meta_divclass="$(classify_divergence "." "$meta_branch" "$meta_parent")"
+        if [ "$meta_divclass" = "safe-force" ] && [ "$allow_force" -eq 1 ] && [ "$do_fetch" -eq 1 ]; then
+          meta_force=1
+        fi
+      fi
     fi
   fi
 
@@ -4188,6 +4382,8 @@ cmd_push() {
   # --- Phase 3: Plan display ---
   log "=== Push plan ==="
   local -a behind_repos=()
+  local -a remote_work_entries=()
+  local -a force_disabled_entries=()   # rebased branches we won't auto-force (--no-force/--no-fetch)
   for i in "${!push_dirs[@]}"; do
     local action
     if [ "${push_dirty[$i]}" = "dirty" ]; then
@@ -4200,14 +4396,29 @@ cmd_push() {
       action="leer (keine Commits gg. ${push_parents[$i]}) -> skip"
     elif [ "${push_has_upstream[$i]}" -eq 0 ]; then
       action="push (new upstream)"
+    elif [ "${push_force[$i]}" -eq 1 ]; then
+      action="${push_ahead_count[$i]} ahead -> force-push (rebased)"
     elif [ "${push_ahead_count[$i]}" -gt 0 ]; then
       action="${push_ahead_count[$i]} ahead -> push"
     else
       action="up to date -> skip"
     fi
     if [ "${push_behind_count[$i]}" -gt 0 ]; then
-      action="$action  [BEHIND ${push_behind_count[$i]}]"
-      behind_repos+=("${push_names[$i]} (${push_behind_count[$i]} behind)")
+      if [ "${push_force[$i]}" -eq 1 ]; then
+        action="$action  [REBASED -> force-push]"
+      elif [ "${push_divclass[$i]}" = "safe-force" ]; then
+        # Rebased branch, but auto-force was disabled (--no-force / --no-fetch).
+        action="$action  [REBASED -> needs force]"
+        behind_repos+=("${push_names[$i]} (rebased, force disabled)")
+        force_disabled_entries+=("${push_names[$i]}|${push_dirs[$i]}")
+      else
+        action="$action  [BEHIND ${push_behind_count[$i]}]"
+        behind_repos+=("${push_names[$i]} (${push_behind_count[$i]} behind)")
+        # Genuine remote work (remote already contains the parent) — never auto-force.
+        if [ "${push_divclass[$i]}" = "remote-work" ]; then
+          remote_work_entries+=("${push_names[$i]}|${push_dirs[$i]}")
+        fi
+      fi
     fi
     printf '  %-20s branch=%-20s -> %s\n' "${push_names[$i]}" "${push_branches[$i]}" "$action"
   done
@@ -4221,14 +4432,27 @@ cmd_push() {
       fi
     elif [ "$meta_has_upstream" -eq 0 ]; then
       meta_action="push (new upstream)"
+    elif [ "$meta_force" -eq 1 ]; then
+      meta_action="$meta_ahead ahead -> force-push (rebased)"
     elif [ "$meta_class" = "ahead" ]; then
       meta_action="$meta_ahead ahead -> push"
     else
       meta_action="up to date -> skip"
     fi
     if [ "$meta_behind" -gt 0 ]; then
-      meta_action="$meta_action  [BEHIND $meta_behind]"
-      behind_repos+=("(meta-context) ($meta_behind behind)")
+      if [ "$meta_force" -eq 1 ]; then
+        meta_action="$meta_action  [REBASED -> force-push]"
+      elif [ "$meta_divclass" = "safe-force" ]; then
+        meta_action="$meta_action  [REBASED -> needs force]"
+        behind_repos+=("(meta-context) (rebased, force disabled)")
+        force_disabled_entries+=("(meta-context)|.")
+      else
+        meta_action="$meta_action  [BEHIND $meta_behind]"
+        behind_repos+=("(meta-context) ($meta_behind behind)")
+        if [ "$meta_divclass" = "remote-work" ]; then
+          remote_work_entries+=("(meta-context)|.")
+        fi
+      fi
     fi
     printf '  %-20s branch=%-20s -> %s\n' "(meta-context)" "$meta_branch" "$meta_action"
   fi
@@ -4243,10 +4467,34 @@ cmd_push() {
     done
     log ""
     log "Refusing to push to avoid mid-run rejections."
-    log "Sync first with one of:"
-    log "  mcrepo pull           # fast-forward where possible"
-    log "  mcrepo pull --rebase  # rebase local commits on top of upstream"
-    log "Or rerun with --no-fetch to skip this safety check (still rejected by remote on real conflicts)."
+    if [ "${#force_disabled_entries[@]}" -gt 0 ]; then
+      log ""
+      log "The following branches were only rebased onto their parent and just need re-publishing."
+      log "Auto force-with-lease is disabled here (--no-force / --no-fetch). Re-run 'mcrepo push'"
+      log "without those flags to publish them automatically, or force-push manually:"
+      local fd
+      for fd in "${force_disabled_entries[@]}"; do
+        log "  - ${fd%%|*}:  git -C ${fd#*|} push --force-with-lease"
+      done
+    fi
+    local plain_behind=$(( ${#behind_repos[@]} - ${#force_disabled_entries[@]} ))
+    if [ "$plain_behind" -gt 0 ]; then
+      log ""
+      log "Sync first with one of:"
+      log "  mcrepo pull           # fast-forward where possible"
+      log "  mcrepo pull --rebase  # rebase local commits on top of upstream"
+      log "Or rerun with --no-fetch to skip this safety check (still rejected by remote on real conflicts)."
+    fi
+    if [ "${#remote_work_entries[@]}" -gt 0 ]; then
+      log ""
+      log "Note: the following branches have diverged AND their remote already contains work that does"
+      log "not look like your local rebase — so mcrepo will not force-push them. Review before deciding:"
+      local rw
+      for rw in "${remote_work_entries[@]}"; do
+        log "  - ${rw%%|*}"
+      done
+      print_agent_recovery_prompt ambiguous-divergence "${remote_work_entries[@]}"
+    fi
     return 1
   fi
 
@@ -4265,6 +4513,7 @@ cmd_push() {
   # --- Phase 5: Commit dirty repos ---
   local -a committed_pushed=()
   local -a pushed_repos=()
+  local -a force_pushed_repos=()
   local -a skipped_dirty=()
   local -a skipped_uptodate=()
   local -a skipped_empty=()
@@ -4342,6 +4591,13 @@ cmd_push() {
         failed_repos+=("$rn")
         continue
       fi
+    elif [ "${push_force[$i]}" -eq 1 ]; then
+      log "  (rebased branch — publishing with --force-with-lease)"
+      if ! git -C "$rd" push --force-with-lease; then
+        warn "Force-push failed for '$rn' (remote moved since fetch?). See git output above."
+        failed_repos+=("$rn")
+        continue
+      fi
     else
       if ! git -C "$rd" push; then
         warn "Push failed for '$rn' (see git output above)"
@@ -4352,6 +4608,8 @@ cmd_push() {
 
     if [ "$was_dirty" = "committed" ]; then
       committed_pushed+=("$rn")
+    elif [ "${push_force[$i]}" -eq 1 ]; then
+      force_pushed_repos+=("$rn")
     else
       pushed_repos+=("$rn")
     fi
@@ -4370,6 +4628,14 @@ cmd_push() {
         else
           pushed_repos+=("(meta-context)")
         fi
+      fi
+    elif [ "$meta_force" -eq 1 ]; then
+      log "  (rebased branch — publishing with --force-with-lease)"
+      if ! git -C . push --force-with-lease; then
+        warn "Force-push failed for (meta-context) (remote moved since fetch?). See git output above."
+        failed_repos+=("(meta-context)")
+      else
+        force_pushed_repos+=("(meta-context)")
       fi
     else
       if ! git -C . push; then
@@ -4396,6 +4662,9 @@ cmd_push() {
   fi
   if [ "${#pushed_repos[@]}" -gt 0 ]; then
     log "  Pushed:                ${pushed_repos[*]}"
+  fi
+  if [ "${#force_pushed_repos[@]}" -gt 0 ]; then
+    log "  Force-pushed (rebased): ${force_pushed_repos[*]}"
   fi
   if [ "${#skipped_uptodate[@]}" -gt 0 ]; then
     log "  Skipped (up to date):  ${skipped_uptodate[*]}"
@@ -7214,6 +7483,9 @@ cmd_merge_rebase() {
   local -a clean_repos=()
   local -a merge_conflict_repos=()
   local -a stash_conflict_repos=()
+  local -a merge_conflict_entries=()   # name|dir
+  local -a stash_conflict_entries=()   # name|dir
+  local -a clean_entries=()            # name|dir (for post-rebase publish detection)
 
   for idx in "${!rebase_indexes[@]}"; do
     local ri="${rebase_indexes[$idx]}"
@@ -7248,10 +7520,19 @@ cmd_merge_rebase() {
     # Rebase current branch onto target
     if ! git -C "$repo_dir" rebase "$rebase_target"; then
       merge_conflict_repos+=("$repo_name")
+      merge_conflict_entries+=("$repo_name|$repo_dir")
+      # Per-repo conflict context: the three sides that collided.
+      warn "  Rebase conflicts in '$repo_name'. The conflict is between three sides:"
+      warn "    - local feature branch : $source_branch (your work)"
+      warn "    - parent target        : $rebase_target (latest main being rebased onto)"
+      if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$source_branch"; then
+        warn "    - stale remote branch  : origin/$source_branch (pre-rebase history, still on the server)"
+      fi
+      warn "    Conflicts may mix real feature work with mcrepo coordination commits (#N) — keep the intended final state."
       if [ "$did_stash" -eq 1 ]; then
-        warn "  Rebase conflicts. Resolve, run 'mcrepo continue' (or 'git -C $repo_dir rebase --continue'), then 'git -C $repo_dir stash pop' to restore your changes."
+        warn "  Resolve, run 'mcrepo continue' (or 'git -C $repo_dir rebase --continue'), then 'git -C $repo_dir stash pop' to restore your changes."
       else
-        warn "  Rebase conflicts. Resolve, then run 'mcrepo continue' (or 'git -C $repo_dir rebase --continue')."
+        warn "  Resolve, then run 'mcrepo continue' (or 'git -C $repo_dir rebase --continue')."
       fi
       continue
     fi
@@ -7260,12 +7541,14 @@ cmd_merge_rebase() {
     if [ "$did_stash" -eq 1 ]; then
       if ! git -C "$repo_dir" stash pop; then
         stash_conflict_repos+=("$repo_name")
+        stash_conflict_entries+=("$repo_name|$repo_dir")
         warn "  Stash pop conflicts. Resolve, then run 'git -C $repo_dir stash drop'."
         continue
       fi
     fi
 
     clean_repos+=("$repo_name")
+    clean_entries+=("$repo_name|$repo_dir")
     log "  Done."
   done
 
@@ -7295,22 +7578,33 @@ cmd_merge_rebase() {
 
     if ! git -C . rebase "$meta_rebase_target"; then
       merge_conflict_repos+=("(meta-context)")
+      merge_conflict_entries+=("(meta-context)|.")
+      warn "  Rebase conflicts in (meta-context). The conflict is between three sides:"
+      warn "    - local feature branch : $source_branch (your work)"
+      warn "    - parent target        : $meta_rebase_target (latest main being rebased onto)"
+      if git -C . show-ref --verify --quiet "refs/remotes/origin/$source_branch"; then
+        warn "    - stale remote branch  : origin/$source_branch (pre-rebase history, still on the server)"
+      fi
+      warn "    Conflicts may mix real feature work with mcrepo coordination commits (#N) — keep the intended final state."
       if [ "$meta_did_stash" -eq 1 ]; then
-        warn "  Rebase conflicts. Resolve, run 'mcrepo continue' (or 'git rebase --continue'), then 'git stash pop' to restore your changes."
+        warn "  Resolve, run 'mcrepo continue' (or 'git rebase --continue'), then 'git stash pop' to restore your changes."
       else
-        warn "  Rebase conflicts. Resolve, then run 'mcrepo continue' (or 'git rebase --continue')."
+        warn "  Resolve, then run 'mcrepo continue' (or 'git rebase --continue')."
       fi
     else
       if [ "$meta_did_stash" -eq 1 ]; then
         if ! git -C . stash pop; then
           stash_conflict_repos+=("(meta-context)")
+          stash_conflict_entries+=("(meta-context)|.")
           warn "  Stash pop conflicts. Resolve, then run 'git stash drop'."
         else
           clean_repos+=("(meta-context)")
+          clean_entries+=("(meta-context)|.")
           log "  Done."
         fi
       else
         clean_repos+=("(meta-context)")
+        clean_entries+=("(meta-context)|.")
         log "  Done."
       fi
     fi
@@ -7328,10 +7622,39 @@ cmd_merge_rebase() {
   if [ "${#stash_conflict_repos[@]}" -gt 0 ]; then
     log "Stash conflicts (resolve, then 'git stash drop'): ${stash_conflict_repos[*]}"
   fi
+
+  # Conflict recovery: offer a paste-ready prompt for a local coding agent.
+  if [ "${#merge_conflict_entries[@]}" -gt 0 ]; then
+    print_agent_recovery_prompt rebase-conflict "${merge_conflict_entries[@]}"
+  fi
+  if [ "${#stash_conflict_entries[@]}" -gt 0 ]; then
+    print_agent_recovery_prompt stash-conflict "${stash_conflict_entries[@]}"
+  fi
+
   if [ "${#merge_conflict_repos[@]}" -eq 0 ] && [ "${#stash_conflict_repos[@]}" -eq 0 ]; then
     log ""
     log "All repos synced. You can now run 'mcrepo merge' to merge into parent branches."
-    log "Note: this rebase rewrote local history — if you'd pushed this branch, force-push with care."
+    # The rebase rewrote commit hashes. Any cleanly-rebased branch that was already
+    # pushed now diverges from its origin/<branch> and must be re-published.
+    local -a republish_names=()
+    local ce ce_name ce_dir
+    for ce in "${clean_entries[@]}"; do
+      ce_name="${ce%%|*}"
+      ce_dir="${ce#*|}"
+      if git -C "$ce_dir" show-ref --verify --quiet "refs/remotes/origin/$source_branch"; then
+        republish_names+=("$ce_name")
+      fi
+    done
+    if [ "${#republish_names[@]}" -gt 0 ]; then
+      log ""
+      log "Local history was rewritten by the rebase, so these branches now differ from their remote"
+      log "(this is expected — not remote work from another machine). Run 'mcrepo push' to publish them;"
+      log "mcrepo will safely force-with-lease the rebased branches:"
+      local rpn
+      for rpn in "${republish_names[@]}"; do
+        log "  - $rpn"
+      done
+    fi
   fi
 }
 

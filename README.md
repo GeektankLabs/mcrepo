@@ -177,7 +177,8 @@ Behavior details:
 - Parent branches are recorded automatically by `mcrepo branch` — each repo can have a different parent.
 - The meta-context repo (`.`) participates in both branching and merging with its own parent tracking (`meta-parent:` in `mcrepo.yaml`).
 - `merge` performs a dry-run across ALL repos first. If any would conflict, no merges happen.
-- `merge --rebase` rebases the current branch onto its parent (prefers `origin/<parent>` so it picks up newly merged work from other PRs; falls back to local `<parent>` when no origin is configured). Auto-stashes uncommitted work (including untracked files). This rewrites local history — if the branch was already pushed, you'll need to force-push.
+- `merge --rebase` rebases the current branch onto its parent (prefers `origin/<parent>` so it picks up newly merged work from other PRs; falls back to local `<parent>` when no origin is configured). Auto-stashes uncommitted work (including untracked files). This rewrites local history, so a branch that was already pushed will diverge from its remote. mcrepo flags those branches at the end of the rebase and tells you to run `mcrepo push` — which auto force-with-leases them (see [Pushing](#pushing)); you do **not** need to force-push by hand.
+- On a rebase conflict, `merge --rebase` prints per-repo context for the three colliding sides (local feature branch vs parent `main` vs the stale `origin/<branch>`) and a paste-ready prompt you can hand to a local coding agent to resolve the conflict, then finish with `mcrepo continue` and `mcrepo push`.
 - Merges are local only (no push). Review and push per-repo when ready.
 - Nested branches are supported: `main → feature → sub-feature`. Each `merge` pops one level.
 - After a squash merge, the source branch's tip is no longer reachable from the parent, so the post-merge cleanup uses **force-delete** (`git branch -D`) with an explicit confirmation defaulting to **No**. The `--no-squash` path keeps the previous safe-delete (`git branch -d`) prompt.
@@ -205,6 +206,7 @@ mode repos are skipped. The meta-context repo participates as well.
 mcrepo push                # fetch, refuse if behind, then push ahead repos
 mcrepo push -m "message"   # also commit dirty write-mode repos before pushing
 mcrepo push --no-fetch     # skip the safety fetch (faster, less safe)
+mcrepo push --no-force     # disable auto force-with-lease for rebased branches
 ```
 
 Behavior details:
@@ -212,10 +214,21 @@ Behavior details:
 - Before pushing, mcrepo fetches `origin` for every push target (write-mode
   sub-repos plus meta-context). It then computes both **ahead** and **behind**
   per repo.
-- If any target is behind its upstream, `push` aborts before any commit or
-  push happens, and suggests `mcrepo pull` / `mcrepo pull --rebase` to sync
-  first. This avoids partial-success runs where the first repos succeed and
-  the rest get rejected mid-run.
+- **Rebased branches are auto-published.** After `mcrepo merge --rebase`, a
+  coordinated branch diverges from its already-pushed `origin/<branch>` (ahead
+  *and* behind) purely because the rebase rewrote its commit hashes. mcrepo
+  detects this case — local `HEAD` already contains the parent `main` *and* the
+  remote branch is stale (predates that merge) — and publishes it with
+  `git push --force-with-lease` (shown as `[REBASED -> force-push]` in the plan).
+  Because force-with-lease runs only after a fresh fetch, a remote that moved
+  since the fetch aborts the push instead of clobbering another machine's work.
+  Pass `--no-force` (or `--no-fetch`) to opt out.
+- If a target is behind in a way that is **not** a provable rebase (the remote
+  already contains work mcrepo can't attribute to your rebase), `push` aborts
+  before any commit or push happens, suggests `mcrepo pull` / `mcrepo pull
+  --rebase`, and prints a paste-ready prompt you can hand to a local coding
+  agent to resolve the divergence. This avoids partial-success runs where the
+  first repos succeed and the rest get rejected mid-run.
 - Failures from `git push` (auth, branch protection, hooks, non-fast-forward)
   are now printed verbatim above the summary so the cause is visible.
 - Without `-m` and in non-interactive context, dirty repos are skipped (not
