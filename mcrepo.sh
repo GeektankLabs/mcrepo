@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_NAME="mcrepo.sh"
-MCREPO_VERSION="0.5.6"
+MCREPO_VERSION="0.5.7"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -1590,6 +1589,10 @@ _find_code_cli() {
 
 install_vscode_extension() {
   local silent="${1:-0}"  # pass "1" to suppress non-error output during init
+  if is_truthy "${MCREPO_SKIP_VSCODE:-}"; then
+    [ "$silent" -eq 0 ] && log "Skipped VS Code extension install (MCREPO_SKIP_VSCODE=1)."
+    return 0
+  fi
   local code_cmd
   if ! code_cmd="$(_find_code_cli)"; then
     if [ "$silent" -eq 0 ]; then
@@ -1603,7 +1606,8 @@ install_vscode_extension() {
   local tmp_vsix
   tmp_vsix="$(mktemp /tmp/mcrepo-XXXXXX.vsix)"
 
-  local vsix_url="${MCREPO_VSIX_URL}?_=$(date +%s)"
+  local vsix_url
+  vsix_url="${MCREPO_VSIX_URL}?_=$(date +%s)"
   log "Downloading mcrepo VS Code extension..."
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL "$vsix_url" -o "$tmp_vsix" || { warn "Download failed."; rm -f "$tmp_vsix"; return 1; }
@@ -1631,6 +1635,9 @@ cmd_install_extension() {
 }
 
 maybe_reload_vscode_window() {
+  if is_truthy "${MCREPO_SKIP_VSCODE:-}"; then
+    return 0
+  fi
   if command -v code >/dev/null 2>&1; then
     if code --reuse-window --command workbench.action.reloadWindow >/dev/null 2>&1; then
       log "Triggered VS Code window reload via CLI command."
@@ -2103,6 +2110,7 @@ cmd_add() {
       if gh_ready; then
         local info; info="$(gh_repo_info "$GU_OWNER/$GU_REPO" || true)"
         if [ -n "$info" ]; then
+          # shellcheck disable=SC2034  # defbranch is the 4th tab field; not used here
           IFS=$'\t' read -r perm isfork parent defbranch <<<"$info"
           if gh_perm_can_push "$perm"; then canpush="yes"; else canpush="no"; fi
         fi
@@ -3440,7 +3448,7 @@ cmd_status() {
   else
     log "Global branch: (off - per-repo branches)"
   fi
-  local i local_state branch dirty repo_dir parent_info upstream inprogress diverged extras
+  local i local_state branch dirty repo_dir parent_info upstream inprogress extras
   for i in "${!REPO_NAMES[@]}"; do
     repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
     if is_repo_local "$i"; then
@@ -4950,7 +4958,6 @@ resolve_scope_dir() {
   local for_write="$2"
 
   SKILL_SCOPE_KIND="workspace"
-  SKILL_SCOPE_NAME="workspace"
   SKILL_SCOPE_DIR="$SUPPORT_SKILLS_DIR"
 
   if [ -z "$scope_repo" ]; then
@@ -4974,7 +4981,6 @@ resolve_scope_dir() {
   fi
 
   SKILL_SCOPE_KIND="repo"
-  SKILL_SCOPE_NAME="$repo_name"
   SKILL_SCOPE_DIR="$repo_dir/$OPENCODE_PROJECT_SKILLS_DIR"
 }
 
@@ -5222,22 +5228,23 @@ workspace_enable_skill() {
   local skill_id="$1"
   [ -f "$SKILLS_CONFIG_FILE" ] || return 0
 
+  # bash-3.2-safe: filter the needle while reading (no mapfile on macOS stock bash)
   local id
   local -a enabled_ids=()
   local -a disabled_ids=()
   while IFS= read -r id; do
     [ -n "$id" ] || continue
+    [ "$id" != "$skill_id" ] || continue
     enabled_ids+=("$id")
   done < <(parse_skill_config_list "enabled")
   while IFS= read -r id; do
     [ -n "$id" ] || continue
+    [ "$id" != "$skill_id" ] || continue
     disabled_ids+=("$id")
   done < <(parse_skill_config_list "disabled")
 
-  mapfile -t enabled_ids < <(array_remove_item "$skill_id" "${enabled_ids[@]}")
-  mapfile -t disabled_ids < <(array_remove_item "$skill_id" "${disabled_ids[@]}")
   enabled_ids+=("$skill_id")
-  write_skills_config "${enabled_ids[@]}" "__MCREPO_DISABLED_SPLIT__" "${disabled_ids[@]}"
+  write_skills_config "${enabled_ids[@]}" "__MCREPO_DISABLED_SPLIT__" "${disabled_ids[@]+"${disabled_ids[@]}"}"
 }
 
 is_skill_active() {
@@ -5260,7 +5267,7 @@ is_skill_active() {
     disabled_ids+=("$id")
   done < <(parse_skill_config_list "disabled")
 
-  if array_contains "$skill_id" "${disabled_ids[@]}"; then
+  if array_contains "$skill_id" "${disabled_ids[@]+"${disabled_ids[@]}"}"; then
     return 1
   fi
 
@@ -5464,13 +5471,19 @@ Tip: Browse skills at https://clawhub.ai/skills"
       local -a disabled_ids=()
       local explicit_mode=0
 
+      # bash-3.2-safe: filter the target while reading (no mapfile on macOS stock bash)
       while IFS= read -r id; do
         [ -n "$id" ] || continue
+        if [ "$id" = "$target_id" ]; then
+          explicit_mode=1
+          continue
+        fi
         enabled_ids+=("$id")
       done < <(parse_skill_config_list "enabled")
 
       while IFS= read -r id; do
         [ -n "$id" ] || continue
+        [ "$id" != "$target_id" ] || continue
         disabled_ids+=("$id")
       done < <(parse_skill_config_list "disabled")
 
@@ -5481,13 +5494,11 @@ Tip: Browse skills at https://clawhub.ai/skills"
       if [ ! -f "$SKILLS_CONFIG_FILE" ]; then
         while IFS= read -r id; do
           [ -n "$id" ] || continue
+          [ "$id" != "$target_id" ] || continue
           enabled_ids+=("$id")
         done < <(list_skill_ids "$SUPPORT_SKILLS_DIR")
         explicit_mode=1
       fi
-
-      mapfile -t enabled_ids < <(array_remove_item "$target_id" "${enabled_ids[@]}")
-      mapfile -t disabled_ids < <(array_remove_item "$target_id" "${disabled_ids[@]}")
 
       if [ "$subcmd" = "enable" ]; then
         if [ "$explicit_mode" -eq 1 ]; then
@@ -5497,7 +5508,7 @@ Tip: Browse skills at https://clawhub.ai/skills"
         disabled_ids+=("$target_id")
       fi
 
-      write_skills_config "${enabled_ids[@]}" "__MCREPO_DISABLED_SPLIT__" "${disabled_ids[@]}"
+      write_skills_config "${enabled_ids[@]+"${enabled_ids[@]}"}" "__MCREPO_DISABLED_SPLIT__" "${disabled_ids[@]+"${disabled_ids[@]}"}"
       sync_workspace_skills_to_opencode
       log "Skill '$target_id' set to $subcmd"
       ;;

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    name: Lint (bash -n, shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n mcrepo.sh
+      - name: shellcheck mcrepo.sh
+        run: shellcheck --severity=warning mcrepo.sh
+      - name: shellcheck tests
+        run: shellcheck --severity=warning tests/run.sh tests/helpers.bash
+
+  test:
+    name: Test suite (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos runs /usr/bin/env bash = stock bash 3.2 -> catches
+        # mapfile-class and empty-array-under-set-u regressions
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: npm install -g bats@1.11.0
+      - name: Run suite
+        run: tests/run.sh
+
+  plugin:
+    name: VS Code plugin build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vsc-plugin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: vsc-plugin/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit -p .
+      - name: Bundle
+        run: npm run compile
