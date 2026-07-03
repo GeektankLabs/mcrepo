@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.5.9"
+MCREPO_VERSION="0.6.0"
 # Manifest (mcrepo.yaml) format version. Bump when the manifest schema changes
 # incompatibly; cmd_post_update_migrate migrates older manifests forward.
 MCREPO_SCHEMA_VERSION="1"
