@@ -1,11 +1,20 @@
 # mcrepo.sh
 
-An AI-agent-first Meta-Context-Repository approach for MacOS and Linux.
+An AI-agent-first **Multi-Context Repository** (MC-Repo) tool for macOS and Linux.
 It lets you work across many independent Git repositories in one local directory context, without migrating them into a monorepo. All managed by just one shell script: `mcrepo.sh` with practical workspace governance for multi-repo agent workflows.
+
+The workspace root that holds `mcrepo.yaml` and the shared `+-` folders is called the **meta-context repo** throughout this document and in command output (see the [Glossary](#glossary)).
 
 ![mcrepo workspace banner](assets/mcrepo-banner.svg)
 
 ## Install & Setup
+
+### Prerequisites
+
+- bash 3.2+ (macOS stock bash works), git (2.38+ required for `mcrepo merge`'s conflict dry-run)
+- optional: [GitHub CLI `gh`](https://cli.github.com/) for fork/PR/access-check features, `python3` for VS Code settings sync, `jq` for organization sync without `gh`
+
+### Setup
 
 - Create an empty repository
 - Open it in VSCode (optional)
@@ -55,7 +64,7 @@ Before the first commit, `publish-base` reconciles `.gitignore` against `mcrepo.
 
 ## Modes and Visibility
 
-Every added repository starts in `read` mode.
+Repositories added with `mcrepo add <git-url>` start in `read` mode; fork/upstream workflows (`add --fork`, `fork`, interactive upstream choices) default to `write` since their purpose is contributing changes.
 
 - `👀 read`: context available, no edits intended
 - `✏️ write`: active repository where changes should be done
@@ -72,7 +81,9 @@ mcrepo status
 
 Repository folder names are always clean (no mode or emoji prefix in directory names). Mode visibility is tracked in `mcrepo.yaml` and can be decorated in the editor.
 
-When a repo is set to `sleep`, mcrepo clears the local checkout and leaves two placeholders in that folder: `.gitignore` and `.mcrepo-sleep`. Switching back to `read` or `write` checks out the repository again.
+When a repo is set to `sleep`, mcrepo clears the local checkout **including `.git`** and leaves two placeholders in that folder: `.gitignore` and `.mcrepo-sleep`. Switching back to `read` or `write` checks out the repository again.
+
+Because sleeping deletes the clone, mcrepo first scans for local work that would be lost — uncommitted changes, untracked files, unpushed commits on any branch, stashes — and refuses (or prompts) when it finds any. `sleep <repo> --force` discards such work explicitly.
 
 ## Incubator Sub-Repos
 
@@ -126,6 +137,8 @@ Behavior details:
   - **Commit** — auto-commit to current branch before switching
   - **Carry** — carry changes into the target branch (stash + pop, with dry-run safety check)
   - **Discard** — discard all uncommitted changes
+- For scripts and agents, preselect the answer with `--dirty abort|commit|carry|discard` (non-interactive runs abort by default).
+- If a carry run is interrupted (Ctrl-C), re-running `mcrepo branch <name>` finishes the switch and restores the carried stashes automatically; `mcrepo status` shows a `stash=N` indicator for repos with stashes.
 - If `<name>` exists on `origin` but not locally, mcrepo creates a local tracking branch from `origin/<name>`.
 - After updating target repos, mcrepo switches the meta-context repo to the same branch as the final step.
 - Each repo's previous branch is automatically recorded as its parent branch in `mcrepo.yaml`, enabling `mcrepo merge` later (only on fork, not on jump).
@@ -161,8 +174,11 @@ After feature work is complete, squash the coordinated branch back into each rep
 ```bash
 mcrepo merge                  # squash; subject defaults to the source branch name
 mcrepo merge -m "feat: ..."   # squash with explicit subject
+mcrepo merge --include-read   # also merge read-mode repos that joined via 'branch --include-read'
 mcrepo merge --no-squash      # legacy: --no-ff merge commit per repo
 ```
+
+`merge` needs git 2.38+ (it dry-runs conflicts with `git merge-tree --write-tree`; `mcrepo doctor` checks this).
 
 If the dry-run detects conflicts, sync with the parent branch first:
 
@@ -200,13 +216,45 @@ Resolve the conflicts inside each repo first (the per-repo paths are visible
 via `mcrepo status` under `inprogress=…`), then run `mcrepo continue`. Sleep
 mode repos are skipped. The meta-context repo participates as well.
 
+## Coordinated Commits
+
+Commit related changes across all dirty write repos (and the meta-context) as one logical unit:
+
+```bash
+mcrepo commit -m "message"          # coordinated commit across dirty write repos + meta-context
+mcrepo commit --include-read -m ".."# also include read-mode repos
+mcrepo commit --revert              # peel the newest coordinated commit off HEAD (reset --hard HEAD~1)
+mcrepo commit --reset               # discard uncommitted changes across all target repos
+```
+
+Behavior details:
+
+- Each coordinated commit gets a subject `mcrepo commit #N @<batch-id>: <message>` so the group can be recognized later.
+- `--revert` only peels repos whose HEAD carries the same `#N` **on the same branch and with the same batch id** — repos on other branches or with mismatched batch ids are skipped (override with `--force`). It refuses without `--force` when the commit is already pushed.
+- `--revert`/`--reset` are destructive; non-interactive runs require `--force`.
+
+## Pulling
+
+```bash
+mcrepo pull            # fetch + ff-pull all active repos; dirty sub-repos are skipped
+mcrepo pull --rebase   # auto-stash, pull, pop stash for ALL repos (handles dirty repos safely)
+mcrepo pull --reset    # discard local changes and reset to origin state (destructive!)
+```
+
+Behavior details:
+
+- The meta-context auto-stashes on dirty so unrelated edits never block its pull.
+- `--reset` confirms before discarding uncommitted changes, and **separately per repo** before discarding committed-but-unpushed commits (it lists them first). `--yes` skips both confirmations for automation; without it, non-interactive runs keep such repos untouched.
+- Diverged branches that are provably your own local rebase are reported as "rebased locally" — publish them with `mcrepo push`. Genuinely diverged branches print a paste-ready recovery prompt for a coding agent.
+
 ## Pushing
 
 ```bash
-mcrepo push                # fetch, refuse if behind, then push ahead repos
-mcrepo push -m "message"   # also commit dirty write-mode repos before pushing
-mcrepo push --no-fetch     # skip the safety fetch (faster, less safe)
-mcrepo push --no-force     # disable auto force-with-lease for rebased branches
+mcrepo push                 # fetch, refuse if behind, then push ahead repos
+mcrepo push -m "message"    # also commit dirty write-mode repos before pushing
+mcrepo push --include-read  # also push read-mode repos (coordinated --include-read work)
+mcrepo push --no-fetch      # skip the safety fetch (faster, less safe)
+mcrepo push --no-force      # disable auto force-with-lease for rebased branches
 ```
 
 Behavior details:
@@ -236,6 +284,46 @@ Behavior details:
   are auto-committed via `git add -A`.
 - The meta-context repo is pushed last so that sub-repo references in the
   meta-context can capture the freshly pushed sub-repo states.
+
+## Fork & PR Workflow
+
+For repos where you lack push access, mcrepo manages the fork triangle (origin = your fork, upstream = the original repo):
+
+```bash
+mcrepo add <git-url>              # interactive when GitHub + gh: offers origin / fork / upstream / read-only
+mcrepo fork <repo-or-url> [name]  # fork via gh: origin=your fork, upstream=original
+mcrepo fork --all [--yes]         # fork+rewire every repo where you lack push access (plan + confirm)
+mcrepo upstream                   # show origin/upstream per repo
+mcrepo upstream <repo> <url>      # set/replace the PR target for the fork workflow
+mcrepo upstream <repo> --off      # remove the upstream relationship
+mcrepo doctor                     # git/gh/auth status + per-repo origin/upstream/access report
+```
+
+`mcrepo write <repo>` also checks push access (with `gh`) and offers to fork on the spot when you have none.
+
+After coordinated work on a global branch, open pull requests for every repo with commits against its base:
+
+```bash
+mcrepo pr                          # coordinated PRs per repo, cross-linked with each other
+mcrepo pr -m "title" [--draft]     # explicit title / draft PRs
+mcrepo pr --target origin|upstream # choose the PR target; defaults to upstream when set (fork workflow)
+mcrepo pr --no-push                # do not auto-push the branch before opening PRs
+```
+
+Each PR body links the sibling PRs so reviewers see the whole coordinated change set.
+
+## Removing a Repository
+
+```bash
+mcrepo remove <name-or-url>              # drop the manifest entry and delete the local folder
+mcrepo remove <name-or-url> --keep-files # keep the folder, only drop the entry
+```
+
+Before deleting, mcrepo scans for local work (uncommitted/untracked/unpushed on any branch/stashes) and prompts; `--force` skips all prompts.
+
+## Organization Sync
+
+`mcrepo init <organization>` imports all non-archived repos of a GitHub organization into the manifest (via `gh`, falling back to the public API with `curl`+`jq`).
 
 ## Status
 
@@ -393,15 +481,16 @@ You can keep component repositories public/open-source while keeping the `mcrepo
 
 ## Versioning and Self-Update
 
-- `mcrepo.sh` includes a built-in script version and prints it on each run.
-- By default, `mcrepo` checks the canonical upstream script (`GeektankLabs/mcrepo`, `main`, `mcrepo.sh`) and notifies you when a newer version exists.
-- Run `mcrepo update` to self-update the script in place.
-- Override update source URL (for forks/mirrors) with `MCREPO_UPDATE_URL`.
+- `mcrepo version` prints the version; a banner also goes to **stderr** on every run (stdout stays clean for scripting).
+- `mcrepo` checks the canonical upstream script (`GeektankLabs/mcrepo`, `main`, `mcrepo.sh`) at most **once per 24h** (cached in `~/.mcrepo-update-check`) and notifies you when a newer version exists.
+- Run `mcrepo update` to self-update the script in place. The download is syntax-validated (`bash -n`) and staged next to the script before an atomic rename; file permissions and symlinks are preserved.
+- After updating, a migration hook brings `mcrepo.yaml` to the current manifest schema automatically.
+- Override the update source URL (for forks/mirrors) with `MCREPO_UPDATE_URL`.
 - Disable automatic update checks with `MCREPO_DISABLE_UPDATE_CHECK=1`.
 
 ## Patch Submission Without Repository Checkout
 
-- Run `mcrepo export-patch [--strategy intent|legacy] [topic]` (or `mcrepo create-patch ...`).
+- Run `mcrepo create-patch [--strategy intent|legacy] [topic]` (`export-patch` still works as a deprecated alias).
 - Default strategy is `intent`: mcrepo tries to carry only your feature intent onto current upstream and avoid rollback-style hunks.
 - Use `--strategy legacy` to force raw `upstream-main vs local-file` diff behavior.
 - If you omit `[topic]` in an interactive terminal, mcrepo asks for a short 2-5 word title and supports Enter for a default `Feature update <timestamp>` title.
@@ -414,8 +503,71 @@ You can keep component repositories public/open-source while keeping the `mcrepo
 
 ## Platforms
 
-- Current focus: macOS
-- Target support: Linux
+- macOS (stock bash 3.2 supported) and Linux — both run in CI on every change.
+
+## mcrepo.yaml Reference
+
+`mcrepo.yaml` is machine-owned: mcrepo rewrites it on every change (comments are not preserved). Schema:
+
+```yaml
+schema: 1                     # manifest format version (checked on load)
+organization: my-org          # optional: GitHub org for 'init <organization>' sync
+branch: feature-x             # optional: the active global (coordinated) branch
+meta-parent: main             # parent-branch stack of the meta-context (comma-separated, rightmost = immediate parent)
+meta-upstream: <url>          # optional: PR target for the meta-context itself
+repos:
+  - url: https://github.com/acme/service-a.git   # origin (absent for local incubators)
+    name: service-a
+    mode: read                # read | write | sleep
+    description: "..."        # one-line functional description (agent-maintained)
+    parent: main              # parent-branch stack (recorded by 'mcrepo branch')
+    upstream: <url>           # optional: PR target for the fork workflow
+    local: true               # local incubator repo (no external remote yet)
+    localpath: ./service-a
+```
+
+Accepted URL transports: `https`, `ssh`, `git`, `file`, absolute/relative local paths, and scp-style `user@host:path`. Anything else (e.g. `ext::`) is rejected — the manifest is a shared file and must not be able to run commands on clone.
+
+## Environment Variables
+
+- `MCREPO_UPDATE_URL` — override the self-update source (forks/mirrors)
+- `MCREPO_DISABLE_UPDATE_CHECK=1` — disable the (24h-cached) update check
+- `MCREPO_SUPPRESS_VERSION_BANNER=1` — suppress the stderr version banner
+- `MCREPO_NO_SHELL_INSTALL=1` — behave like `init --no-shell-install`
+- `MCREPO_SKIP_VSCODE=1` — skip VS Code extension install and window reloads (CI/tests)
+- `MCREPO_ASSUME_YES=1` — answer every confirmation prompt with yes (CI escape hatch)
+
+## Exit Codes
+
+- `0` — success, including a user-declined confirmation
+- `1` — fatal or usage error
+- `2` — partial failure (some repos succeeded, some failed) — returned by `pull`, `push`, `pr`
+
+## Glossary
+
+- **meta-context repo** — the workspace root holding `mcrepo.yaml` and the `+-` support folders; participates in coordinated commands as `(meta-context)` when git-managed
+- **sub-repo** — an independent git repository managed inside the workspace
+- **mode** — per-repo intent signal: `read` (context only), `write` (active changes), `sleep` (clone removed, entry kept)
+- **global branch** — one coordinated branch name across target repos, set by `mcrepo branch <name>`
+- **parent (stack)** — the branch a feature branch forked from; stacked (comma-separated) so nested branches merge back level by level
+- **local incubator** — a repo created by `mcrepo new` that lives committed inside the meta-context until `mcrepo publish` graduates it to its own remote
+- **upstream** — the PR target in the fork workflow (origin = your fork, upstream = the original repo)
+- **coordinated commit `#N @batch`** — one logical change committed across several repos with a shared sequence number and batch id
+
+## Upgrading from 0.5.x
+
+0.6.0 is a harmonization release with deliberate breaking changes:
+
+- **Removed**: the undocumented `off` command alias (use `sleep`) and `branch off` (use `branch --off`). `mode: off` in old manifests still migrates to `sleep` automatically.
+- **Renamed**: `export-patch` → `create-patch` (the old name still works but warns).
+- **Output contract**: the version banner and update notices moved to **stderr**; parse stdout freely. Partial per-repo failures now exit `2` (previously often `0`).
+- **Prompts**: one contract everywhere — only `y`/`yes` confirms, Enter takes the shown default, anything else declines. Non-interactive runs take the default; destructive actions then need `--yes`/`--force`.
+- **sleep** now refuses to delete clones containing *any* local work (unpushed commits on any branch, stashes, read-mode edits) — previously only dirty write-mode repos were guarded. Use `--force` to discard.
+- **pull --reset** now asks per repo before discarding committed-but-unpushed commits (previously silent for clean-but-diverged repos). Use `--yes` in automation.
+- **commit --revert** now requires branch alignment and matching batch ids across the peel group (override with `--force`).
+- **Manifest**: `mcrepo.yaml` gains a `schema: 1` line; repo/upstream URLs are validated against a transport allowlist.
+- **Pre-0.5 migrations removed**: emoji-prefixed folder renames (`🧪 tests` → `+-tests` etc.), separator-dir cleanup, and legacy `.gitignore` scrubbing are gone. Coming from a pre-0.5 layout? Run any 0.5.x `mcrepo init` once before updating.
+- **New**: `merge --include-read` and `push --include-read` complete the include-read workflow; `branch --dirty abort|commit|carry|discard` makes dirty handling scriptable; `pull --yes`; `mcrepo version`; update checks are cached for 24h.
 
 ## Origins
 

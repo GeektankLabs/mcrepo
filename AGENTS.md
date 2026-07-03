@@ -23,9 +23,10 @@ This file defines how AI agents should work in this repository, which develops `
 
 ## Documentation Rules
 
-- If CLI behavior changes, update `README.md` in the same change.
+- If CLI behavior changes, update `README.md`, `usage()` in `mcrepo.sh`, and the completion generators in the same change. When adding/removing/renaming a command, also update `MCREPO_COMMANDS` — `tests/30-inventory.bats` enforces that inventory, usage, dispatch, and completions agree.
+- Breaking changes must be added to the "Upgrading from 0.5.x" section of `README.md`.
 - Keep install and quickstart examples runnable.
-- Keep platform notes accurate (macOS-first, Linux target).
+- Keep platform notes accurate (macOS + Linux, stock bash 3.2 supported).
 
 ## Testing Rules
 
@@ -47,3 +48,4 @@ This file defines how AI agents should work in this repository, which develops `
 - When an AI agent edits any file under `vsc-plugin/src/` or `vsc-plugin/package.json`, it must also bump the `version` field in `vsc-plugin/package.json` in the same change.
 - Use a patch-only bump: increment only the right-most version segment (`x.y.z` -> `x.y.(z+1)`).
 - The patch segment is unbounded (`...9` can become `...10`, `...11`, etc.).
+- Minor/major bumps are deliberate release decisions made by the maintainer (release milestones), not automatic agent behavior. A minor/major release must document its breaking changes in the README upgrade section.

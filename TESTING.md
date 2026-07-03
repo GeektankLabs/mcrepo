@@ -1,74 +1,64 @@
 # TESTING
 
 This repository develops `mcrepo.sh` itself.
-Do not run tests that mutate files in the development repo root.
+Never run tests that mutate files in the development repo root — the automated
+suite runs every test in a disposable sandbox with an isolated `HOME`.
 
-## Principles
+## Automated Test Suite
 
-- Always test in a disposable sandbox directory.
-- Always use an isolated `HOME` to avoid touching your real shell rc files.
-- Prefer `./mcrepo.sh init --no-shell-install` for automated checks.
-- `./mcrepo.sh init` should produce clean repo folder names.
-
-## Quick Sandbox Smoke Test
-
-Run from the development repo root:
+The suite lives in `tests/` and uses [bats-core](https://github.com/bats-core/bats-core).
+It needs no network and no GitHub account: sub-repos are local `file://` bare
+remotes, and VS Code side effects are disabled via `MCREPO_SKIP_VSCODE=1`.
 
 ```bash
-tmp="$(mktemp -d)"
-cp "./mcrepo.sh" "$tmp/mcrepo.sh"
-chmod +x "$tmp/mcrepo.sh"
-mkdir -p "$tmp/home"
-
-HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh init --no-shell-install'
-HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh add https://github.com/octocat/Hello-World.git hello-world'
-HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh list'
-HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh status'
-HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh write hello-world'
-HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh read hello-world'
-HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh sleep hello-world --force'
-HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh sleep --wakeall'
-HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh skill list'
-HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh skill validate'
+tests/run.sh              # run everything
+tests/run.sh 00-smoke     # run one suite
 ```
 
-Optional cleanup:
+`tests/run.sh` uses `bats` from PATH, falling back to `npx bats@1.11.0`.
 
-```bash
-rm -rf "$tmp"
-```
+Suites:
 
-## What to Verify
+- `00-smoke.bats` — init, add, list, status, mode switches, remove, skills
+- `10-coordinated.bats` — branch → commit → merge → push flows across multiple
+  repos including the meta-context, `--include-read` end to end
+- `20-guards.bats` — destructive-path regression tests: sleep refuses unpushed
+  work, `pull --reset` protects committed commits, carry crash, YAML
+  round-trip, JSONC settings preservation, URL/branch-name validation,
+  stdout/stderr contract, exit codes
+- `30-inventory.bats` — command surface consistency: `MCREPO_COMMANDS`
+  inventory == `usage()` == `main()` dispatch == generated completions;
+  manifest schema stamping and migration
 
-- `mcrepo.yaml` is created and updated correctly.
-- Support directories are generated.
-- Separator directory is not created.
-- Mode switches keep clean repo folder names (no mode-prefix renames).
-- `sleep --force` clears local repo contents and leaves `.gitignore` plus `.mcrepo-sleep` placeholder files.
-- `sleep --wakeall` restores sleeping repos to `read` mode.
-- Sleep/wake mode changes update `.vscode/settings.json` -> `git.ignoredRepositories` for current sleeping repos.
-- `+-skills/` is generated with a default skill pack and template.
-- `.opencode/skills/` is generated as mirror for OpenCode discovery.
-- `mcrepo skill list` shows skill states.
-- `mcrepo skill validate` passes on a fresh workspace.
-- `mcrepo skill install <github-url>` installs a skill into workspace scope.
-- `mcrepo skill <repo-name> install <github-url|clawhub-url>` installs into sub-repo `.opencode/skills/` when repo is in write mode.
-- `init --no-shell-install` does not write shell integration blocks.
-- `init` keeps plain repo folder names without mode prefixes.
-- Re-running `init` removes legacy separator directories when they are empty.
+CI (`.github/workflows/ci.yml`) runs `bash -n`, shellcheck, the full suite on
+ubuntu **and** macOS (stock bash 3.2 — catches `mapfile`-class and
+empty-array-under-`set -u` regressions), and typechecks/bundles the VS Code
+plugin.
 
-## Manual Check for Shell Integration Idempotency
+## Writing Tests
 
-In a sandbox with isolated `HOME`:
+Use the helpers from `tests/helpers.bash`:
 
-```bash
-tmp="$(mktemp -d)"
-cp "./mcrepo.sh" "$tmp/mcrepo.sh"
-chmod +x "$tmp/mcrepo.sh"
-mkdir -p "$tmp/home"
+- `setup_workspace` — disposable sandbox + isolated HOME/git config
+- `make_remote <name>` — seeded local bare remote, prints its `file://` URL
+- `init_workspace_with_repos <names...>` — init + add each repo
+- `git_manage_workspace` — make the sandbox workspace itself git-managed so
+  the meta-context participates in coordinated commands
+- `mcrepo <args>` — run the sandboxed copy of the script
 
-HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh init'
-HOME="$tmp/home" bash -lc 'cd "'"$tmp"'" && ./mcrepo.sh init'
-```
+Every bug fix gets a regression test in `20-guards.bats`. Every new command or
+flag must keep `30-inventory.bats` green (update `MCREPO_COMMANDS`, `usage()`,
+and the completion generators together).
 
-Then inspect the sandbox rc file (`$tmp/home/.bashrc` or `$tmp/home/.zshrc`) and confirm each mcrepo block appears once.
+## Manual Checks (not yet automated)
+
+- Interactive prompts: answers other than `y/yes` decline; `Enter` takes the
+  shown default (see the CONVENTIONS section of `mcrepo help`).
+- Shell integration idempotency: in a sandbox with isolated `HOME`, run
+  `./mcrepo.sh init` twice and confirm each mcrepo block appears once in the
+  rc file.
+- `mcrepo update` self-update flow against a fork via `MCREPO_UPDATE_URL`.
+- VS Code extension: mode badges, context menus only in mcrepo workspaces,
+  reload prompt on topology changes.
+- GitHub-dependent flows (`fork`, `pr`, `doctor`, org sync) with an
+  authenticated `gh` — use throwaway repos, never `--force` against real work.

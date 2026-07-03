@@ -1,0 +1,7 @@
+# local editor/agent state
+.claude/settings.local.json
+.DS_Store
+
+# generated completions (created inside user workspaces, not this dev repo)
+.mcrepo-completion.bash
+.mcrepo-completion.zsh
