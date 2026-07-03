@@ -522,7 +522,23 @@ async function ensureWorkspaceSettings(): Promise<void> {
   }
 }
 
+function isMcrepoWorkspace(): boolean {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  return folders.some((folder) =>
+    existsSync(path.join(folder.uri.fsPath, REPOS_FILE))
+  );
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  // Only act inside mcrepo workspaces: writing SCM/git settings and showing
+  // mode context-menus in arbitrary projects is unwanted. (activationEvents
+  // uses workspaceContains, but activation can also happen via the command
+  // palette — guard here as well.)
+  const active = isMcrepoWorkspace();
+  await vscode.commands.executeCommand("setContext", "mcrepo.isWorkspace", active);
+  if (!active) {
+    return;
+  }
   await ensureWorkspaceSettings();
   const provider = new McrepoDecorationProvider(context);
   context.subscriptions.push(provider);

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.5.7"
+MCREPO_VERSION="0.5.8"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -94,7 +94,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh commit --revert [--include-read] [--force]  # Peel the highest-#N coordinated commit off HEAD (reset --hard HEAD~1)
   ./mcrepo.sh commit --reset  [--include-read] [--force]  # Discard uncommitted changes across all target repos
   ./mcrepo.sh branch                                 # List coordinated branches across write repos (alias: 'branch list')
-  ./mcrepo.sh branch <branch-name> [--include-read]  # Switch/create global branch (interactive dirty-change handling)
+  ./mcrepo.sh branch <branch-name> [--include-read] [--dirty abort|commit|carry|discard]  # Switch/create global branch (interactive dirty-change handling; --dirty preselects for non-interactive use)
   ./mcrepo.sh branch --off                           # Turn off branch coordination (fallback — see merge/--delete)
   ./mcrepo.sh branch --delete                        # Delete global branch, switch repos back to parent branches
   ./mcrepo.sh merge [-m "subject"]                   # Squash-merge global branch into each repo's parent (default subject = branch name)
@@ -103,7 +103,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh pr [-m "title"] [--draft] [--no-push] [--target origin|upstream]  # Coordinated GitHub PRs per repo with commits vs base; fork->upstream when upstream set; cross-linked
   ./mcrepo.sh pull                                   # Fetch + ff-pull all active repos; meta-context auto-stashes on dirty, sub-repos skip on dirty
   ./mcrepo.sh pull --rebase                          # Auto-stash, pull, pop stash for ALL repos (handles dirty sub-repos safely)
-  ./mcrepo.sh pull --reset                           # Discard local changes and reset to origin state (destructive!)
+  ./mcrepo.sh pull --reset [--yes]                   # Discard local changes and reset to origin state (destructive!); prompts per repo before discarding committed work, --yes skips
   ./mcrepo.sh push [-m "message"] [--no-fetch] [--no-force] # Fetch + push write-mode repos; auto force-with-lease branches only rebased onto parent; abort if genuinely behind; --no-force disables auto-force
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -188,6 +188,23 @@ version_greater_than() {
       exit 1
     }
   '
+}
+
+# 'mcrepo merge' relies on 'git merge-tree --write-tree' (git 2.38+) for its
+# conflict dry-run. Returns 1 when the installed git is provably older.
+# Unparsable version strings pass (git itself will error out later).
+git_supports_merge_tree_write_tree() {
+  local v
+  v="$(git version 2>/dev/null | awk '{print $3}')"
+  [ -n "$v" ] || return 0
+  case "$v" in
+    [0-9]*.[0-9]*) ;;
+    *) return 0 ;;
+  esac
+  if version_greater_than "2.38" "$v"; then
+    return 1
+  fi
+  return 0
 }
 
 extract_version_from_file() {
@@ -325,6 +342,18 @@ notify_if_new_version_available() {
 resolve_script_path() {
   local source_path script_dir
   source_path="${BASH_SOURCE[0]}"
+  # Follow symlinks so self-update replaces the real file, not the link.
+  # (readlink -f is not portable to macOS; walk links manually.)
+  local guard=0
+  while [ -L "$source_path" ] && [ "$guard" -lt 10 ]; do
+    local link_target
+    link_target="$(readlink "$source_path")" || break
+    case "$link_target" in
+      /*) source_path="$link_target" ;;
+      *) source_path="$(dirname "$source_path")/$link_target" ;;
+    esac
+    guard=$((guard + 1))
+  done
   script_dir="$(cd "$(dirname "$source_path")" && pwd -P)"
   printf '%s/%s' "$script_dir" "$(basename "$source_path")"
 }
@@ -484,9 +513,32 @@ parse_repos_tsv() {
       gsub(/^[ \t]+|[ \t]+$/, "", s)
       return s
     }
+    # Reverse of yaml_escape_double_quoted: unescape \\ and \" left-to-right.
+    # Without this, every load/save cycle adds another backslash layer to
+    # descriptions containing quotes or backslashes.
+    function unescape_dq(s,   out, i, n, c, nc) {
+      out = ""; n = length(s); i = 1
+      while (i <= n) {
+        c = substr(s, i, 1)
+        if (c == "\\" && i < n) {
+          nc = substr(s, i + 1, 1)
+          if (nc == "\\" || nc == "\"") {
+            out = out nc
+            i += 2
+            continue
+          }
+        }
+        out = out c
+        i++
+      }
+      return out
+    }
     function unquote(s) {
       s = trim(s)
-      if ((s ~ /^".*"$/) || (s ~ /^\047.*\047$/)) {
+      if (s ~ /^".*"$/) {
+        return unescape_dq(substr(s, 2, length(s) - 2))
+      }
+      if (s ~ /^\047.*\047$/) {
         return substr(s, 2, length(s) - 2)
       }
       return s
@@ -741,52 +793,63 @@ load_repos() {
 }
 
 save_repos() {
-  : >"$REPOS_FILE"
-  if [ -n "$ORGANIZATION" ]; then
-    printf 'organization: %s\n' "$ORGANIZATION" >"$REPOS_FILE"
-  fi
-  if [ -n "$GLOBAL_BRANCH" ]; then
-    printf 'branch: %s\n' "$GLOBAL_BRANCH" >>"$REPOS_FILE"
-  fi
-  if [ -n "$META_PARENT" ]; then
-    printf 'meta-parent: %s\n' "$META_PARENT" >>"$REPOS_FILE"
-  fi
-  if [ -n "$META_UPSTREAM" ]; then
-    printf 'meta-upstream: %s\n' "$META_UPSTREAM" >>"$REPOS_FILE"
-  fi
+  # Write to a same-directory temp file and rename into place: save_repos also
+  # runs from EXIT traps during aborted coordinated operations, and a torn
+  # write here would corrupt the workspace's single source of truth.
+  local tmp_file="$REPOS_FILE.tmp.$$"
+  {
+    if [ -n "$ORGANIZATION" ]; then
+      printf 'organization: %s\n' "$ORGANIZATION"
+    fi
+    if [ -n "$GLOBAL_BRANCH" ]; then
+      printf 'branch: %s\n' "$GLOBAL_BRANCH"
+    fi
+    if [ -n "$META_PARENT" ]; then
+      printf 'meta-parent: %s\n' "$META_PARENT"
+    fi
+    if [ -n "$META_UPSTREAM" ]; then
+      printf 'meta-upstream: %s\n' "$META_UPSTREAM"
+    fi
 
-  if [ "${#REPO_NAMES[@]}" -eq 0 ]; then
-    printf 'repos: []\n' >>"$REPOS_FILE"
-    return
-  fi
-
-  printf 'repos:\n' >>"$REPOS_FILE"
-  local i
-  for i in "${!REPO_NAMES[@]}"; do
-    if [ -n "${REPO_URLS[$i]:-}" ]; then
-      printf '  - url: %s\n' "${REPO_URLS[$i]}" >>"$REPOS_FILE"
-      printf '    name: %s\n' "${REPO_NAMES[$i]}" >>"$REPOS_FILE"
+    if [ "${#REPO_NAMES[@]}" -eq 0 ]; then
+      printf 'repos: []\n'
     else
-      printf '  - name: %s\n' "${REPO_NAMES[$i]}" >>"$REPOS_FILE"
+      printf 'repos:\n'
+      local i
+      for i in "${!REPO_NAMES[@]}"; do
+        if [ -n "${REPO_URLS[$i]:-}" ]; then
+          printf '  - url: %s\n' "${REPO_URLS[$i]}"
+          printf '    name: %s\n' "${REPO_NAMES[$i]}"
+        else
+          printf '  - name: %s\n' "${REPO_NAMES[$i]}"
+        fi
+        printf '    mode: %s\n' "${REPO_MODES[$i]}"
+        printf '    description: "%s"\n' "$(yaml_escape_double_quoted "${REPO_DESCRIPTIONS[$i]}")"
+        if [ -n "${REPO_PARENTS[$i]:-}" ]; then
+          printf '    parent: %s\n' "${REPO_PARENTS[$i]}"
+        fi
+        if [ -n "${REPO_UPSTREAMS[$i]:-}" ]; then
+          printf '    upstream: %s\n' "${REPO_UPSTREAMS[$i]}"
+        fi
+        if is_repo_local "$i"; then
+          printf '    local: true\n'
+        fi
+        printf '    localpath: %s\n' "$(repo_local_path_for_mode "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
+      done
     fi
-    printf '    mode: %s\n' "${REPO_MODES[$i]}" >>"$REPOS_FILE"
-    printf '    description: "%s"\n' "$(yaml_escape_double_quoted "${REPO_DESCRIPTIONS[$i]}")" >>"$REPOS_FILE"
-    if [ -n "${REPO_PARENTS[$i]:-}" ]; then
-      printf '    parent: %s\n' "${REPO_PARENTS[$i]}" >>"$REPOS_FILE"
-    fi
-    if [ -n "${REPO_UPSTREAMS[$i]:-}" ]; then
-      printf '    upstream: %s\n' "${REPO_UPSTREAMS[$i]}" >>"$REPOS_FILE"
-    fi
-    if is_repo_local "$i"; then
-      printf '    local: true\n' >>"$REPOS_FILE"
-    fi
-    printf '    localpath: %s\n' "$(repo_local_path_for_mode "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")" >>"$REPOS_FILE"
-  done
+  } >"$tmp_file"
+  mv -f "$tmp_file" "$REPOS_FILE"
 }
 
 sync_organization_repos() {
   local org_name="$1"
   local imported=0 skipped=0
+
+  # The org name is interpolated into gh/curl GitHub API paths — restrict it
+  # to the GitHub org charset before it can reshape a request.
+  case "$org_name" in
+    ''|*[!A-Za-z0-9-]*) die "Invalid organization name: '$org_name' (letters, digits and dashes only)." ;;
+  esac
 
   fetch_org_repos_tsv() {
     local org="$1"
@@ -962,6 +1025,31 @@ reconcile_gitignore_with_repos() {
   done
 }
 
+# Allow only well-known git transports. mcrepo.yaml is a committed, shareable
+# manifest — cloning a hostile workspace must not hand git an ext::/fd::
+# remote-helper transport or an option-injection value (leading dash).
+validate_repo_url() {
+  local url="$1"
+  case "$url" in
+    ''|-*) return 1 ;;
+    https://*|http://*|ssh://*|git://*|file://*) return 0 ;;
+    /*|./*|../*) return 0 ;;
+    *::*) return 1 ;;
+    [A-Za-z0-9_.-]*@*:*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Reject branch names git itself would refuse, plus leading-dash values that
+# could be parsed as options by downstream git calls.
+validate_branch_name() {
+  local name="$1"
+  case "$name" in
+    ''|-*) return 1 ;;
+  esac
+  git check-ref-format "refs/heads/$name" >/dev/null 2>&1
+}
+
 clone_repo_if_needed() {
   local repo_dir="$1"
   local repo_url="$2"
@@ -969,6 +1057,10 @@ clone_repo_if_needed() {
 
   if [ "$mode" = "sleep" ] || [ "$mode" = "off" ]; then
     return 0
+  fi
+  if ! validate_repo_url "$repo_url"; then
+    warn "Refusing to clone '$repo_dir': unsupported or unsafe repo URL '$repo_url' (allowed: https, ssh, git, file, local path, scp-style)."
+    return 1
   fi
   if [ -d "$repo_dir/.git" ]; then
     return 0
@@ -1668,7 +1760,8 @@ sync_vscode_git_ignored_repositories() {
     return 0
   fi
 
-  if ! python3 - "$vscode_settings_file" "${sleep_repos[@]-}" <<'PY'
+  local py_rc=0
+  python3 - "$vscode_settings_file" "${sleep_repos[@]-}" <<'PY' || py_rc=$?
 import json
 import sys
 from pathlib import Path
@@ -1685,10 +1778,13 @@ except FileNotFoundError:
 try:
     data = json.loads(raw) if raw.strip() else {}
 except json.JSONDecodeError:
-    data = {}
+    # VS Code settings.json is JSONC — comments/trailing commas are valid for
+    # VS Code but not for json.loads. NEVER fall back to {} and rewrite: that
+    # silently wipes every user setting. Leave the file untouched instead.
+    sys.exit(3)
 
 if not isinstance(data, dict):
-    data = {}
+    sys.exit(3)
 
 previous_managed = data.get(managed_key)
 if not isinstance(previous_managed, list):
@@ -1712,7 +1808,10 @@ data[managed_key] = current_sleep
 
 settings_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 PY
-  then
+  if [ "$py_rc" -eq 3 ]; then
+    warn "$vscode_settings_file is not plain JSON (JSONC comments/trailing commas?) — left untouched; git.ignoredRepositories not synced."
+    return 0
+  elif [ "$py_rc" -ne 0 ]; then
     warn "Could not sync VS Code git.ignoredRepositories for sleeping repos."
     return 0
   fi
@@ -1727,6 +1826,39 @@ directory_is_empty() {
   entries=("$dir"/*)
   shopt -u nullglob dotglob
   [ "${#entries[@]}" -eq 0 ]
+}
+
+# Scan a git working copy for local work that would be lost if the folder
+# were deleted (used by 'remove' and 'sleep' before destroying contents).
+# Fills the global LOCAL_WORK_CONCERNS array with one line per concern.
+LOCAL_WORK_CONCERNS=()
+scan_local_work_concerns() {
+  local repo_dir="$1"
+  LOCAL_WORK_CONCERNS=()
+  [ -n "$repo_dir" ] && [ -d "$repo_dir/.git" ] || return 0
+
+  if [ -n "$(git -C "$repo_dir" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    LOCAL_WORK_CONCERNS+=("uncommitted changes")
+  fi
+  if [ -n "$(git -C "$repo_dir" ls-files --others --exclude-standard 2>/dev/null)" ]; then
+    LOCAL_WORK_CONCERNS+=("untracked files")
+  fi
+  # Commits on ANY local branch that no remote ref contains — not just the
+  # current branch's @{u}..HEAD, which misses other local branches entirely.
+  if [ -n "$(git -C "$repo_dir" log --branches --not --remotes --oneline -1 2>/dev/null)" ]; then
+    LOCAL_WORK_CONCERNS+=("unpushed commits (local branch work not on any remote)")
+  fi
+  if ! git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    local head_branch
+    head_branch="$(git -C "$repo_dir" symbolic-ref --quiet --short HEAD 2>/dev/null || printf '')"
+    if [ -n "$head_branch" ]; then
+      LOCAL_WORK_CONCERNS+=("no upstream configured for '$head_branch'")
+    fi
+  fi
+  if [ -n "$(git -C "$repo_dir" stash list 2>/dev/null)" ]; then
+    LOCAL_WORK_CONCERNS+=("stashed changes")
+  fi
+  return 0
 }
 
 remove_legacy_separator_dirs() {
@@ -1995,7 +2127,8 @@ cmd_init() {
     install_shell_command
   fi
 
-  install_vscode_extension 1
+  # optional nicety: never let a failed download abort init under set -e
+  install_vscode_extension 1 || warn "VS Code extension install skipped (download failed). Retry later with: mcrepo install-extension"
   maybe_reload_vscode_window
 
   log "Multi-Context repo initialized."
@@ -2187,6 +2320,13 @@ cmd_add() {
     name="$(derive_name_from_url "${final_origin:-$final_upstream}")"
   fi
   [ -n "$name" ] || die "Could not derive repository name"
+
+  if [ -n "$final_origin" ] && ! validate_repo_url "$final_origin"; then
+    die "Unsupported or unsafe origin URL: '$final_origin' (allowed: https, ssh, git, file, local path, scp-style)."
+  fi
+  if [ -n "$final_upstream" ] && ! validate_repo_url "$final_upstream"; then
+    die "Unsupported or unsafe upstream URL: '$final_upstream' (allowed: https, ssh, git, file, local path, scp-style)."
+  fi
 
   # Duplicate checks.
   if [ -n "$final_origin" ] && find_repo_index "$final_origin" >/dev/null 2>&1; then
@@ -2430,7 +2570,11 @@ cmd_doctor() {
   log "=== mcrepo doctor ==="
 
   if command -v git >/dev/null 2>&1; then
-    log "git:  $(git --version 2>/dev/null)"
+    if git_supports_merge_tree_write_tree; then
+      log "git:  $(git --version 2>/dev/null)"
+    else
+      warn "git:  $(git --version 2>/dev/null) — 'mcrepo merge' needs git >= 2.38 (merge-tree --write-tree)"
+    fi
   else
     warn "git:  NOT FOUND (required)"
   fi
@@ -2527,11 +2671,6 @@ cmd_remove() {
   if [ "$keep_files" -eq 0 ] && [ -n "$repo_dir" ] && [ -e "$repo_dir" ]; then
     local -a concerns=()
     local is_git_repo=0
-    local dirty=0
-    local untracked=0
-    local unpushed=0
-    local no_upstream=0
-    local has_stash=0
     local is_sleep_placeholder=0
 
     if [ "$removed_is_local" = "true" ]; then
@@ -2540,37 +2679,12 @@ cmd_remove() {
 
     if [ -d "$repo_dir/.git" ]; then
       is_git_repo=1
-      if [ -n "$(git -C "$repo_dir" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
-        dirty=1
-      fi
-      if [ -n "$(git -C "$repo_dir" ls-files --others --exclude-standard 2>/dev/null)" ]; then
-        untracked=1
-      fi
-      if git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
-        local ahead
-        ahead="$(git -C "$repo_dir" rev-list --count '@{u}..HEAD' 2>/dev/null || printf '0')"
-        if [ "${ahead:-0}" -gt 0 ]; then
-          unpushed=1
-        fi
-      else
-        local head_branch
-        head_branch="$(git -C "$repo_dir" symbolic-ref --quiet --short HEAD 2>/dev/null || printf '')"
-        if [ -n "$head_branch" ]; then
-          no_upstream=1
-        fi
-      fi
-      if [ -n "$(git -C "$repo_dir" stash list 2>/dev/null)" ]; then
-        has_stash=1
-      fi
+      scan_local_work_concerns "$repo_dir"
+      concerns+=("${LOCAL_WORK_CONCERNS[@]+"${LOCAL_WORK_CONCERNS[@]}"}")
     elif [ -f "$repo_dir/.mcrepo-sleep" ]; then
       is_sleep_placeholder=1
     fi
 
-    [ "$dirty" -eq 1 ] && concerns+=("uncommitted changes")
-    [ "$untracked" -eq 1 ] && concerns+=("untracked files")
-    [ "$unpushed" -eq 1 ] && concerns+=("unpushed commits")
-    [ "$no_upstream" -eq 1 ] && concerns+=("no upstream configured (local commits would be lost)")
-    [ "$has_stash" -eq 1 ] && concerns+=("stashed changes")
     if [ "$is_git_repo" -eq 0 ] && [ "$is_sleep_placeholder" -eq 0 ] && [ "$removed_is_local" != "true" ] && ! directory_is_empty "$repo_dir"; then
       concerns+=("directory is not a git repo")
     fi
@@ -3053,17 +3167,42 @@ set_mode_command() {
   local previous_mode
   previous_mode="${REPO_MODES[$idx]}"
 
-  if [ "$previous_mode" = "write" ] && [ "$target_mode" != "write" ]; then
+  if { [ "$target_mode" = "sleep" ] || [ "$target_mode" = "off" ]; } && ! is_repo_local "$idx"; then
+    # Sleep deletes the working copy INCLUDING .git. Scan for ANY local work
+    # (uncommitted, untracked, unpushed on any branch, stashes) regardless of
+    # the previous mode — read-mode edits are just as lost as write-mode ones.
+    local sleep_dir=""
+    if sleep_dir="$(find_existing_repo_dir "${REPO_NAMES[$idx]}")" && [ -d "$sleep_dir/.git" ]; then
+      scan_local_work_concerns "$sleep_dir"
+      if [ "${#LOCAL_WORK_CONCERNS[@]}" -gt 0 ]; then
+        warn "Sleeping '${REPO_NAMES[$idx]}' deletes its local clone (including .git). Detected local work in '$sleep_dir':"
+        local _slc
+        for _slc in "${LOCAL_WORK_CONCERNS[@]}"; do
+          warn "  - $_slc"
+        done
+        if [ "$force_sleep" -eq 1 ]; then
+          warn "Proceeding due to --force."
+        elif [ -t 0 ] && [ -t 1 ]; then
+          printf "Delete this work and sleep '%s' anyway? This cannot be undone. [y/N] " "${REPO_NAMES[$idx]}" >&2
+          local _slc_confirm
+          IFS= read -r _slc_confirm
+          case "$_slc_confirm" in
+            y|Y|yes|YES) ;;
+            *)
+              log "Aborted. Push or commit the work first, or re-run with --force to discard it."
+              return 0
+              ;;
+          esac
+        else
+          die "Repository '${REPO_NAMES[$idx]}' has local work that sleeping would destroy (see above). Push it first, or re-run './mcrepo.sh sleep ${REPO_NAMES[$idx]} --force' to discard it."
+        fi
+      fi
+    fi
+  elif [ "$previous_mode" = "write" ] && [ "$target_mode" != "write" ]; then
     local previous_repo_dir
     previous_repo_dir="$(get_repo_dir "${REPO_NAMES[$idx]}" "$previous_mode")"
     if [ -d "$previous_repo_dir/.git" ] && [ -n "$(git -C "$previous_repo_dir" status --porcelain 2>/dev/null)" ]; then
-      if [ "$target_mode" = "sleep" ] && [ "$force_sleep" -eq 1 ]; then
-        :
-      elif [ "$target_mode" = "sleep" ] || [ "$target_mode" = "off" ]; then
-        die "Repository '${REPO_NAMES[$idx]}' has uncommitted changes in '$previous_repo_dir'. Commit/stash them first, or run './mcrepo.sh sleep ${REPO_NAMES[$idx]} --force' to discard local changes and clear contents."
-      else
-        die "Repository '${REPO_NAMES[$idx]}' has uncommitted changes in '$previous_repo_dir'. Commit/stash them first before changing mode to '$target_mode'."
-      fi
+      die "Repository '${REPO_NAMES[$idx]}' has uncommitted changes in '$previous_repo_dir'. Commit/stash them first before changing mode to '$target_mode'."
     fi
   fi
 
@@ -3470,6 +3609,9 @@ cmd_status() {
       [ -n "$upstream" ] && extras="$extras upstream=$upstream"
       inprogress="$(repo_inprogress_state "$repo_dir")"
       [ -n "$inprogress" ] && extras="$extras inprogress=$inprogress"
+      local stash_count
+      stash_count="$(git -C "$repo_dir" stash list 2>/dev/null | grep -c . || true)"
+      [ "${stash_count:-0}" -gt 0 ] && extras="$extras stash=$stash_count"
       if [ -n "$GLOBAL_BRANCH" ] && [ "${REPO_MODES[$i]}" != "sleep" ] && [ -n "$branch" ] && [ "$branch" != "$GLOBAL_BRANCH" ]; then
         extras="$extras OFF-GLOBAL"
       fi
@@ -3491,6 +3633,9 @@ cmd_status() {
     [ -n "$meta_upstream" ] && meta_extras="$meta_extras upstream=$meta_upstream"
     meta_inprogress="$(repo_inprogress_state ".")"
     [ -n "$meta_inprogress" ] && meta_extras="$meta_extras inprogress=$meta_inprogress"
+    local meta_stash_count
+    meta_stash_count="$(git -C . stash list 2>/dev/null | grep -c . || true)"
+    [ "${meta_stash_count:-0}" -gt 0 ] && meta_extras="$meta_extras stash=$meta_stash_count"
     if [ -n "$GLOBAL_BRANCH" ] && [ -n "$meta_branch" ] && [ "$meta_branch" != "$GLOBAL_BRANCH" ]; then
       meta_extras="$meta_extras OFF-GLOBAL"
     fi
@@ -3571,12 +3716,44 @@ cmd_abort() {
   _iterate_inprogress abort
 }
 
+# Guard for 'pull --reset': a hard reset that would discard COMMITTED work
+# needs its own approval — the Phase-2 prompt only covers uncommitted changes.
+# Returns 0 when resetting is approved, 1 when the repo must be skipped.
+confirm_reset_discard_commits() {
+  local rd="$1" rn="$2" rb="$3" assume_yes="$4"
+  local ahead
+  ahead="$(git -C "$rd" rev-list --count "origin/$rb..HEAD" 2>/dev/null || printf '0')"
+  [ "${ahead:-0}" -gt 0 ] || return 0
+
+  warn "'$rn': reset to origin/$rb would DISCARD $ahead local commit(s):"
+  git -C "$rd" log --oneline "origin/$rb..HEAD" 2>/dev/null | head -10 | while IFS= read -r _lost; do
+    warn "    $_lost"
+  done
+  if [ "$assume_yes" -eq 1 ]; then
+    warn "  Discarding due to --yes."
+    return 0
+  fi
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf "Discard these commits in '%s'? This cannot be undone. [y/N] " "$rn" >&2
+    local _confirm
+    IFS= read -r _confirm
+    case "$_confirm" in
+      y|Y|yes|YES) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  warn "  Non-interactive: keeping '$rn' untouched. Re-run with 'mcrepo pull --reset --yes' to discard."
+  return 1
+}
+
 cmd_pull() {
   local pull_mode="default"
+  local assume_yes=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --rebase) pull_mode="rebase" ;;
       --reset) pull_mode="reset" ;;
+      --yes|-y) assume_yes=1 ;;
       *) die "Unknown pull option: $1" ;;
     esac
     shift
@@ -3732,7 +3909,11 @@ cmd_pull() {
       if run_with_repo_prefix "$rn" git -C "$rd" pull --ff-only; then
         updated_repos+=("$rn")
       else
-        # Diverged: hard reset to origin
+        # Diverged: hard reset to origin — but committed work needs its own approval
+        if ! confirm_reset_discard_commits "$rd" "$rn" "$rb" "$assume_yes"; then
+          failed_repos+=("$rn (reset declined - local commits preserved)")
+          continue
+        fi
         git -C "$rd" reset --hard "origin/$rb" 2>/dev/null || { warn "Reset failed for '$rn'"; failed_repos+=("$rn"); continue; }
         updated_repos+=("$rn")
       fi
@@ -3743,6 +3924,11 @@ cmd_pull() {
       if run_with_repo_prefix "$rn" git -C "$rd" pull --ff-only; then
         updated_repos+=("$rn")
       else
+        # Clean but diverged: the reset would silently drop committed work
+        if ! confirm_reset_discard_commits "$rd" "$rn" "$rb" "$assume_yes"; then
+          failed_repos+=("$rn (reset declined - local commits preserved)")
+          continue
+        fi
         git -C "$rd" reset --hard "origin/$rb" 2>/dev/null || { warn "Reset failed for '$rn'"; failed_repos+=("$rn"); continue; }
         updated_repos+=("$rn")
       fi
@@ -3807,6 +3993,8 @@ cmd_pull() {
       git -C . clean -fd 2>/dev/null || true
       if run_with_repo_prefix "(meta-context)" git -C . pull --ff-only; then
         updated_repos+=("(meta-context)")
+      elif ! confirm_reset_discard_commits "." "(meta-context)" "$meta_branch" "$assume_yes"; then
+        failed_repos+=("(meta-context) (reset declined - local commits preserved)")
       else
         git -C . reset --hard "origin/$meta_branch" 2>/dev/null || { warn "Reset failed for (meta-context)"; failed_repos+=("(meta-context)"); }
         updated_repos+=("(meta-context)")
@@ -4023,8 +4211,8 @@ _commit_revert() {
     die "No target repos to inspect."
   fi
 
-  # Collect (N, batch_id) per repo. Empty N means not coordinated.
-  local -a head_n=() head_batch=()
+  # Collect (N, batch_id, branch) per repo. Empty N means not coordinated.
+  local -a head_n=() head_batch=() head_branches=()
   local max_n=0
   for i in "${!all_dirs[@]}"; do
     local subj n batch
@@ -4033,6 +4221,7 @@ _commit_revert() {
     batch="$(mcrepo_parse_batch_id "$subj")"
     head_n+=("$n")
     head_batch+=("$batch")
+    head_branches+=("$(repo_branch "${all_dirs[$i]}" 2>/dev/null || printf '')")
     if [ -n "$n" ] && [ "$n" -gt "$max_n" ]; then
       max_n="$n"
     fi
@@ -4042,10 +4231,30 @@ _commit_revert() {
     die "No coordinated commit at HEAD in any target repo; nothing to revert."
   fi
 
+  # Branch-alignment preflight (like merge/pr): #N sequence numbers are
+  # per-branch counts and routinely repeat across branches, so a repo sitting
+  # on a different branch than the rest must never be grouped into the peel.
+  local revert_ref_branch=""
+  if [ -n "$GLOBAL_BRANCH" ]; then
+    revert_ref_branch="$GLOBAL_BRANCH"
+  else
+    for i in "${!all_dirs[@]}"; do
+      if [ -n "${head_n[$i]}" ] && [ "${head_n[$i]}" -eq "$max_n" ]; then
+        revert_ref_branch="${head_branches[$i]}"
+        break
+      fi
+    done
+  fi
+
   local -a peel_dirs=() peel_names=() peel_batches=()
   local -a skip_names=() skip_reasons=()
   for i in "${!all_dirs[@]}"; do
     if [ -n "${head_n[$i]}" ] && [ "${head_n[$i]}" -eq "$max_n" ]; then
+      if [ -n "$revert_ref_branch" ] && [ "${head_branches[$i]}" != "$revert_ref_branch" ]; then
+        skip_names+=("${all_names[$i]}")
+        skip_reasons+=("on branch '${head_branches[$i]}' (expected '$revert_ref_branch') — not part of this batch")
+        continue
+      fi
       peel_dirs+=("${all_dirs[$i]}")
       peel_names+=("${all_names[$i]}")
       peel_batches+=("${head_batch[$i]}")
@@ -4058,7 +4267,9 @@ _commit_revert() {
     fi
   done
 
-  # Sanity: all peel repos should share the same batch id.
+  # Sanity: all peel repos must share the same batch id. A mismatch means the
+  # #N grouping is provably wrong — hard-resetting across unrelated batches is
+  # exactly the data loss this check exists to prevent.
   local ref_batch=""
   if [ "${#peel_batches[@]}" -gt 0 ]; then
     ref_batch="${peel_batches[0]}"
@@ -4067,7 +4278,13 @@ _commit_revert() {
     for b in "${peel_batches[@]}"; do
       [ "$b" != "$ref_batch" ] && batch_mismatch=1
     done
-    [ "$batch_mismatch" -eq 1 ] && warn "Peel repos at #$max_n do not share a single batch id — proceeding anyway on #N match."
+    if [ "$batch_mismatch" -eq 1 ]; then
+      if [ "$force" -eq 1 ]; then
+        warn "Peel repos at #$max_n do not share a single batch id — proceeding due to --force."
+      else
+        die "Peel repos at #$max_n carry DIFFERENT batch ids — they are not one coordinated commit. Revert them per-repo manually, or re-run with --force to override."
+      fi
+    fi
   fi
 
   # Pushed-check: refuse without --force if HEAD == upstream anywhere in peel.
@@ -5676,6 +5893,10 @@ ensure_upstream_remote() {
   local repo_dir="$1" url="$2"
   [ -n "$url" ] || return 0
   [ -d "$repo_dir/.git" ] || return 0
+  if ! validate_repo_url "$url"; then
+    warn "Refusing to wire upstream for '$repo_dir': unsupported or unsafe URL '$url'."
+    return 1
+  fi
   local cur
   cur="$(git -C "$repo_dir" remote get-url upstream 2>/dev/null || true)"
   if [ -z "$cur" ]; then
@@ -5726,6 +5947,12 @@ detect_default_branch() {
 switch_repo_branch() {
   local repo_dir="$1"
   local target_branch="$2"
+  # Chokepoint validation: the branch may come straight from mcrepo.yaml
+  # (branch:/parent: of a shared workspace), not only from CLI args.
+  if ! validate_branch_name "$target_branch"; then
+    warn "Skipping '$repo_dir': invalid branch name '$target_branch'"
+    return 1
+  fi
   if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     warn "Skipping '$repo_dir' (not a local git repo)"
     return 0
@@ -5885,14 +6112,13 @@ cmd_branch() {
     cmd_branch_list
     return 0
   fi
-  local branch_name="$1"
-  shift
 
   # Handle "branch --off" (and deprecated "branch off") — turn off global branch coordination
-  if [ "$branch_name" = "--off" ] || [ "$branch_name" = "off" ]; then
-    if [ "$branch_name" = "off" ]; then
+  if [ "${1:-}" = "--off" ] || [ "${1:-}" = "off" ]; then
+    if [ "${1:-}" = "off" ]; then
       warn "Deprecation: 'mcrepo branch off' is deprecated. Use 'mcrepo branch --off' instead."
     fi
+    shift
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --include-read) die "'--include-read' is not supported with 'branch --off'." ;;
@@ -5921,26 +6147,45 @@ cmd_branch() {
   fi
 
   # Handle "branch --delete" — delete global branch, revert to parent branches
-  if [ "$branch_name" = "--delete" ]; then
+  if [ "${1:-}" = "--delete" ]; then
+    shift
     while [ "$#" -gt 0 ]; do
       case "$1" in
         *) die "Unknown option for branch --delete: $1" ;;
       esac
-      shift
     done
     cmd_branch_delete
     return 0
   fi
 
-  local include_read=0
-
+  # Flags may appear before or after the branch name. A leading-dash value is
+  # never accepted as a branch name (git forbids them anyway) — this catches
+  # typos like '--delte' before they trigger a slow fetch across all repos.
+  local branch_name="" include_read=0 dirty_action_flag=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --include-read) include_read=1 ;;
-      *) die "Unknown branch option: $1" ;;
+      --dirty)
+        shift
+        dirty_action_flag="${1:-}"
+        case "$dirty_action_flag" in
+          abort|commit|carry|discard) ;;
+          *) die "--dirty must be one of: abort|commit|carry|discard" ;;
+        esac
+        ;;
+      -*) die "Unknown branch option: $1" ;;
+      *)
+        if [ -z "$branch_name" ]; then
+          branch_name="$1"
+        else
+          die "Unexpected argument: $1 (branch name already given: '$branch_name')"
+        fi
+        ;;
     esac
     shift
   done
+  [ -n "$branch_name" ] || die "Usage: ./mcrepo.sh branch <branch-name> [--include-read] [--dirty abort|commit|carry|discard]"
+  validate_branch_name "$branch_name" || die "Invalid branch name: '$branch_name'"
 
   load_repos
 
@@ -6074,7 +6319,10 @@ cmd_branch() {
     log "Uncommitted changes in: ${dirty_repos[*]}"
     log ""
 
-    if [ -t 0 ] && [ -t 1 ]; then
+    if [ -n "$dirty_action_flag" ]; then
+      dirty_action="$dirty_action_flag"
+      log "Handling uncommitted changes with --dirty $dirty_action."
+    elif [ -t 0 ] && [ -t 1 ]; then
       printf 'How would you like to handle uncommitted changes?\n' >&2
       printf '  [a] Abort  — stop and handle manually\n' >&2
       printf '  [c] Commit — auto-commit to current branch before switching\n' >&2
@@ -6136,13 +6384,17 @@ cmd_branch() {
           ddir_name="(meta-context)"
         fi
 
+        # Reset per repo: 'git stash create' returns nothing for untracked-only
+        # changes, and a stale value from the previous iteration must not leak
+        # into this repo's untracked-collision check below.
+        local target_ref=""
+
         # Create stash commit without modifying working tree (returns SHA)
         local stash_sha
         stash_sha="$(git -C "$ddir" stash create 2>/dev/null || true)"
 
         if [ -n "$stash_sha" ]; then
           # Determine effective target tree (the branch we're switching to)
-          local target_ref=""
           if git -C "$ddir" show-ref --verify --quiet "refs/heads/$branch_name"; then
             target_ref="$branch_name"
           elif git -C "$ddir" show-ref --verify --quiet "refs/remotes/origin/$branch_name"; then
@@ -6212,8 +6464,20 @@ cmd_branch() {
   fi
 
   # --- Phase 5: Switch branches (with fork-vs-jump parent tracking) ---
-  # Safety trap: save partial progress if the script aborts mid-loop (set -e).
-  trap 'GLOBAL_BRANCH="$branch_name"; save_repos' EXIT
+  # Safety trap: save partial progress if the script aborts mid-loop (set -e,
+  # Ctrl-C). Parent stacks are pushed only AFTER each repo's switch succeeds,
+  # so this persists exactly the repos that actually moved — and it records the
+  # new global branch only when at least one repo is on it (a first-repo abort
+  # must not flag the whole workspace OFF-GLOBAL).
+  _BRANCH_SWITCHED_COUNT=0
+  _branch_switch_exit_trap() {
+    if [ "${_BRANCH_SWITCHED_COUNT:-0}" -gt 0 ]; then
+      GLOBAL_BRANCH="$branch_name"
+      save_repos
+      warn "Branch switch interrupted after $_BRANCH_SWITCHED_COUNT repo(s). Unswitched repos show as OFF-GLOBAL in 'mcrepo status'. Re-run 'mcrepo branch $branch_name' to finish (carried stashes are restored automatically)."
+    fi
+  }
+  trap '_branch_switch_exit_trap' EXIT
 
   for idx in "${!target_indexes[@]}"; do
     local ti="${target_indexes[$idx]}"
@@ -6221,23 +6485,22 @@ cmd_branch() {
     local rname="${REPO_NAMES[$ti]}"
     local parent_for_log=""
 
-    # Only record parent when actually forking a new branch (not jumping)
+    # Capture the pre-switch branch; the parent stack is pushed after the
+    # switch succeeds (see trap note above).
     if [ "${target_is_fork[$idx]}" -eq 1 ]; then
-      local current_branch
-      current_branch="$(repo_branch "$repo_dir")"
-      parent_for_log="$current_branch"
-      # Push current branch onto this repo's parent stack before switching.
-      # Stack format: "grandparent,parent" — rightmost is immediate parent.
-      if [ -n "${REPO_PARENTS[$ti]:-}" ]; then
-        REPO_PARENTS[$ti]="${REPO_PARENTS[$ti]},$current_branch"
-      else
-        REPO_PARENTS[$ti]="$current_branch"
-      fi
+      parent_for_log="$(repo_branch "$repo_dir")"
     fi
 
     switch_repo_branch "$repo_dir" "$branch_name"
+    _BRANCH_SWITCHED_COUNT=$((_BRANCH_SWITCHED_COUNT + 1))
 
     if [ "${target_is_fork[$idx]}" -eq 1 ]; then
+      # Stack format: "grandparent,parent" — rightmost is immediate parent.
+      if [ -n "${REPO_PARENTS[$ti]:-}" ]; then
+        REPO_PARENTS[$ti]="${REPO_PARENTS[$ti]},$parent_for_log"
+      else
+        REPO_PARENTS[$ti]="$parent_for_log"
+      fi
       log "  '$rname': created NEW branch '$branch_name' off parent '$parent_for_log'."
     else
       log "  '$rname': switched to EXISTING branch '$branch_name' (no parent recorded)."
@@ -6248,41 +6511,47 @@ cmd_branch() {
   if [ "$meta_is_target" -eq 1 ]; then
     local meta_parent_for_log=""
     if [ "$meta_is_fork" -eq 1 ]; then
-      local meta_current
-      meta_current="$(repo_branch ".")"
-      meta_parent_for_log="$meta_current"
-      # Push meta-context repo's current branch onto its parent stack
-      if [ -n "$META_PARENT" ]; then
-        META_PARENT="${META_PARENT},$meta_current"
-      else
-        META_PARENT="$meta_current"
-      fi
+      meta_parent_for_log="$(repo_branch ".")"
     fi
     switch_repo_branch "." "$branch_name"
+    _BRANCH_SWITCHED_COUNT=$((_BRANCH_SWITCHED_COUNT + 1))
 
     if [ "$meta_is_fork" -eq 1 ]; then
+      if [ -n "$META_PARENT" ]; then
+        META_PARENT="${META_PARENT},$meta_parent_for_log"
+      else
+        META_PARENT="$meta_parent_for_log"
+      fi
       log "  '(meta-context)': created NEW branch '$branch_name' off parent '$meta_parent_for_log'."
     else
       log "  '(meta-context)': switched to EXISTING branch '$branch_name' (no parent recorded)."
     fi
   fi
 
-  # --- Phase 6: Pop stash if carry was chosen ---
-  if [ "$dirty_action" = "carry" ]; then
-    log "Restoring carried changes ..."
-    for ddir in "${dirty_repo_dirs[@]}"; do
-      # Check if we actually stashed something (stash list might be empty)
-      local stash_msg
-      stash_msg="$(git -C "$ddir" stash list -1 2>/dev/null | head -1)"
-      if echo "$stash_msg" | grep -q "mcrepo: carry to $branch_name"; then
-        if ! git -C "$ddir" stash pop 2>/dev/null; then
-          warn "Stash pop had issues in '$ddir'. Run 'git -C $ddir stash pop' manually or 'git -C $ddir stash drop' to discard."
-        else
-          log "  Restored in $ddir"
-        fi
+  # --- Phase 6: Restore carried stashes ---
+  # Scan ALL target repos, not just the ones stashed in THIS run: if a previous
+  # 'branch <name>' was interrupted between stash and pop (Ctrl-C during the
+  # network-bound switch loop), the carried work sits in per-repo stashes while
+  # every tree looks clean — restore it now instead of losing it silently.
+  local -a carry_scan_dirs=()
+  for idx in "${!target_indexes[@]}"; do
+    carry_scan_dirs+=("${target_dirs[$idx]}")
+  done
+  [ "$meta_is_target" -eq 1 ] && carry_scan_dirs+=(".")
+  local restored_any=0
+  for ddir in "${carry_scan_dirs[@]}"; do
+    local stash_msg
+    stash_msg="$(git -C "$ddir" stash list -1 2>/dev/null | head -1)"
+    if echo "$stash_msg" | grep -q "mcrepo: carry to $branch_name"; then
+      [ "$restored_any" -eq 1 ] || log "Restoring carried changes ..."
+      restored_any=1
+      if ! git -C "$ddir" stash pop 2>/dev/null; then
+        warn "Stash pop had issues in '$ddir'. Run 'git -C $ddir stash pop' manually or 'git -C $ddir stash drop' to discard."
+      else
+        log "  Restored in $ddir"
       fi
-    done
-  fi
+    fi
+  done
 
   GLOBAL_BRANCH="$branch_name"
   trap - EXIT
@@ -6739,6 +7008,10 @@ cmd_merge() {
     die "No repos found to merge."
   fi
 
+  if ! git_supports_merge_tree_write_tree; then
+    die "mcrepo merge needs git >= 2.38 for its conflict dry-run ('git merge-tree --write-tree'). Installed: $(git --version 2>/dev/null). Please upgrade git."
+  fi
+
   # Phase 2: Dry-run merge verification
   log ""
   log "=== Dry-run merge verification ==="
@@ -6776,22 +7049,12 @@ cmd_merge() {
       fi
     fi
 
-    # Dry-run using git merge-tree (Git 2.38+)
-    if git merge-tree --write-tree 2>&1 | grep -q "unknown option" 2>/dev/null; then
-      # Fallback for older git
-      if ! git -C "$repo_dir" merge-tree "$(git -C "$repo_dir" merge-base "$target" "$source_branch")" "$target" "$source_branch" >/dev/null 2>&1; then
-        merge_ok=0
-        conflict_repos+=("$repo_name")
-      else
-        log "  OK"
-      fi
+    # Dry-run using git merge-tree --write-tree (git 2.38+, checked above)
+    if git -C "$repo_dir" merge-tree --write-tree "$target" "$source_branch" >/dev/null 2>&1; then
+      log "  OK"
     else
-      if git -C "$repo_dir" merge-tree --write-tree "$target" "$source_branch" >/dev/null 2>&1; then
-        log "  OK"
-      else
-        merge_ok=0
-        conflict_repos+=("$repo_name")
-      fi
+      merge_ok=0
+      conflict_repos+=("$repo_name")
     fi
   done
 
@@ -7702,9 +7965,29 @@ cmd_update() {
     die "Cannot update '$script_path' (no write permission)."
   fi
 
-  chmod +x "$remote_tmp_file"
+  # Validate the download parses before installing it — a truncated or
+  # corrupted file that still carries a version line must never be installed.
+  if ! bash -n "$remote_tmp_file" 2>/dev/null; then
+    rm -f "$remote_tmp_file"
+    die "Downloaded update failed syntax validation (bash -n) — not installing. Try 'mcrepo update' again."
+  fi
 
-  mv "$remote_tmp_file" "$script_path"
+  # Stage next to the target and rename: mktemp lives in TMPDIR, and a
+  # cross-filesystem 'mv' degrades to copy+truncate, rewriting the RUNNING
+  # script's inode in place. Same-directory rename is atomic.
+  local staged_file
+  staged_file="$(mktemp "$script_path.update.XXXXXX")" || { rm -f "$remote_tmp_file"; die "Could not create staging file next to '$script_path'."; }
+  cp "$remote_tmp_file" "$staged_file" || { rm -f "$remote_tmp_file" "$staged_file"; die "Could not stage update next to '$script_path'."; }
+  rm -f "$remote_tmp_file"
+
+  # Preserve the installed script's permissions (mktemp creates 0600).
+  # stat -f is BSD/macOS, stat -c is GNU.
+  local orig_mode
+  orig_mode="$(stat -f '%Lp' "$script_path" 2>/dev/null || stat -c '%a' "$script_path" 2>/dev/null || printf '755')"
+  chmod "$orig_mode" "$staged_file" 2>/dev/null || chmod 755 "$staged_file"
+  chmod +x "$staged_file"
+
+  mv -f "$staged_file" "$script_path"
   log "Updated mcrepo from version $current_version to $remote_version."
 
   if MCREPO_SUPPRESS_VERSION_BANNER=1 MCREPO_DISABLE_UPDATE_CHECK=1 "$script_path" --post-update-migrate "$current_version" "$remote_version"; then
@@ -7714,8 +7997,10 @@ cmd_update() {
     warn "Run mcrepo again and inspect your workspace state before continuing."
   fi
 
-  # Also update the VS Code extension if the code CLI is available
-  install_vscode_extension 0
+  # Also update the VS Code extension if the code CLI is available.
+  # The script itself is already updated at this point — a failed extension
+  # download must not make the whole update exit non-zero under set -e.
+  install_vscode_extension 0 || warn "VS Code extension update skipped (download failed). Retry later with: mcrepo install-extension"
 }
 
 cmd_export_patch() {
@@ -7944,3 +8229,9 @@ main() {
 }
 
 main "$@"
+
+# Explicit exit so bash never reads past this point. If the file on disk was
+# replaced/extended while this process was running (self-update, editor save),
+# bash could otherwise resume parsing at the old EOF offset and execute a
+# garbage tail fragment of the new content.
+exit $?
