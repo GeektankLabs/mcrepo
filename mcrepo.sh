@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.5.8"
+MCREPO_VERSION="0.5.9"
+# Manifest (mcrepo.yaml) format version. Bump when the manifest schema changes
+# incompatibly; cmd_post_update_migrate migrates older manifests forward.
+MCREPO_SCHEMA_VERSION="1"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
 REPOS_FILE="mcrepo.yaml"
-LEGACY_SUPPORT_SCRIPTS_DIR="🛠 scripts"
 SUPPORT_CONTRACTS_DIR="+-contracts"
 SUPPORT_DOCS_DIR="+-docs"
 SUPPORT_TESTS_DIR="+-tests"
 SUPPORT_SKILLS_DIR="+-skills"
 SKILLS_CONFIG_FILE="$SUPPORT_SKILLS_DIR/skills.yaml"
 OPENCODE_PROJECT_SKILLS_DIR=".opencode/skills"
+# Single source of truth for the user-facing command surface. usage(), the
+# dispatch in main(), and the generated completions must stay in sync with
+# this list (checked by tests/30-inventory.bats).
+MCREPO_COMMANDS="init publish-base add upstream fork doctor new publish remove write read sleep list branch merge pr pull push commit continue abort open status skill version update install-extension create-patch help"
+
 COMPLETION_BASH_FILE=".mcrepo-completion.bash"
 COMPLETION_ZSH_FILE=".mcrepo-completion.zsh"
 
@@ -97,14 +104,14 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh branch <branch-name> [--include-read] [--dirty abort|commit|carry|discard]  # Switch/create global branch (interactive dirty-change handling; --dirty preselects for non-interactive use)
   ./mcrepo.sh branch --off                           # Turn off branch coordination (fallback — see merge/--delete)
   ./mcrepo.sh branch --delete                        # Delete global branch, switch repos back to parent branches
-  ./mcrepo.sh merge [-m "subject"]                   # Squash-merge global branch into each repo's parent (default subject = branch name)
+  ./mcrepo.sh merge [-m "subject"] [--include-read]  # Squash-merge global branch into each repo's parent (default subject = branch name)
   ./mcrepo.sh merge --no-squash                      # Legacy: --no-ff merge commit instead of squash
   ./mcrepo.sh merge --rebase                         # Sync: rebase current global branch onto parent branch (auto-stashes, prefers origin/<parent>)
   ./mcrepo.sh pr [-m "title"] [--draft] [--no-push] [--target origin|upstream]  # Coordinated GitHub PRs per repo with commits vs base; fork->upstream when upstream set; cross-linked
   ./mcrepo.sh pull                                   # Fetch + ff-pull all active repos; meta-context auto-stashes on dirty, sub-repos skip on dirty
   ./mcrepo.sh pull --rebase                          # Auto-stash, pull, pop stash for ALL repos (handles dirty sub-repos safely)
   ./mcrepo.sh pull --reset [--yes]                   # Discard local changes and reset to origin state (destructive!); prompts per repo before discarding committed work, --yes skips
-  ./mcrepo.sh push [-m "message"] [--no-fetch] [--no-force] # Fetch + push write-mode repos; auto force-with-lease branches only rebased onto parent; abort if genuinely behind; --no-force disables auto-force
+  ./mcrepo.sh push [-m "message"] [--no-fetch] [--no-force] [--include-read] # Fetch + push write-mode repos; auto force-with-lease branches only rebased onto parent; abort if genuinely behind; --no-force disables auto-force
 
 ═══════════════════════════════════════════════════════════════════════════════
   MID-OPERATION RECOVERY
@@ -453,7 +460,7 @@ yaml_escape_double_quoted() {
 
 validate_mode() {
   case "$1" in
-    write|read|sleep|off) return 0 ;;
+    write|read|sleep) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -469,7 +476,7 @@ mode_icon() {
   case "$1" in
     write) printf '✏️' ;;
     read) printf '👀' ;;
-    sleep|off) printf '💤' ;;
+    sleep) printf '💤' ;;
     *) printf '•' ;;
   esac
 }
@@ -729,6 +736,21 @@ parse_branch() {
   ' "$REPOS_FILE"
 }
 
+# Parse the top-level 'schema:' field from mcrepo.yaml (manifest format version).
+parse_schema_version() {
+  awk '
+    {
+      line = $0
+      if (line ~ /^[ \t]*schema:[ \t]*/) {
+        sub(/^[ \t]*schema:[ \t]*/, "", line)
+        gsub(/[ \t]+/, "", line)
+        print line
+        exit
+      }
+    }
+  ' "$REPOS_FILE"
+}
+
 # Parse the top-level 'meta-parent:' field from mcrepo.yaml.
 # Returns the comma-separated parent branch stack for the meta-context repo.
 parse_meta_parent() {
@@ -825,6 +847,19 @@ load_repos() {
   META_PARENT=""
   META_UPSTREAM=""
 
+  local manifest_schema
+  manifest_schema="$(parse_schema_version || true)"
+  if [ -n "$manifest_schema" ] && [ "$manifest_schema" != "$MCREPO_SCHEMA_VERSION" ]; then
+    case "$manifest_schema" in
+      *[!0-9]*) warn "Ignoring unparsable schema value in $REPOS_FILE: '$manifest_schema'" ;;
+      *)
+        if [ "$manifest_schema" -gt "$MCREPO_SCHEMA_VERSION" ]; then
+          die "$REPOS_FILE uses manifest schema $manifest_schema, but this mcrepo only understands schema $MCREPO_SCHEMA_VERSION. Run 'mcrepo update' first."
+        fi
+        ;;
+    esac
+  fi
+
   ORGANIZATION="$(parse_organization || true)"
   GLOBAL_BRANCH="$(parse_branch || true)"
   META_PARENT="$(parse_meta_parent || true)"
@@ -866,6 +901,7 @@ save_repos() {
   # write here would corrupt the workspace's single source of truth.
   local tmp_file="$REPOS_FILE.tmp.$$"
   {
+    printf 'schema: %s\n' "$MCREPO_SCHEMA_VERSION"
     if [ -n "$ORGANIZATION" ]; then
       printf 'organization: %s\n' "$ORGANIZATION"
     fi
@@ -1034,46 +1070,15 @@ ensure_gitignore_repo_entry() {
   if ! grep -Fqx "$line" .gitignore; then
     printf '%s\n' "$line" >>.gitignore
   fi
-
-  tmp="$(mktemp)"
-  grep -Fvx "/✏️ $repo_name/" .gitignore >"$tmp" || true
-  mv "$tmp" .gitignore
-  tmp="$(mktemp)"
-  grep -Fvx "/👀 $repo_name/" .gitignore >"$tmp" || true
-  mv "$tmp" .gitignore
-  tmp="$(mktemp)"
-  grep -Fvx "/💤 $repo_name/" .gitignore >"$tmp" || true
-  mv "$tmp" .gitignore
-  tmp="$(mktemp)"
-  grep -Fvx "/write $repo_name/" .gitignore >"$tmp" || true
-  mv "$tmp" .gitignore
-  tmp="$(mktemp)"
-  grep -Fvx "/read $repo_name/" .gitignore >"$tmp" || true
-  mv "$tmp" .gitignore
-  tmp="$(mktemp)"
-  grep -Fvx "/sleep $repo_name/" .gitignore >"$tmp" || true
-  mv "$tmp" .gitignore
 }
 
 remove_gitignore_repo_entry() {
   local repo_name="$1"
   [ -f .gitignore ] || return 0
-  local variant tmp
-  local -a variants=(
-    "/$repo_name/"
-    "/✏️ $repo_name/"
-    "/👀 $repo_name/"
-    "/💤 $repo_name/"
-    "/write $repo_name/"
-    "/read $repo_name/"
-    "/sleep $repo_name/"
-  )
-
-  for variant in "${variants[@]}"; do
-    tmp="$(mktemp)"
-    grep -Fvx "$variant" .gitignore >"$tmp" || true
-    mv "$tmp" .gitignore
-  done
+  local tmp
+  tmp="$(mktemp)"
+  grep -Fvx "/$repo_name/" .gitignore >"$tmp" || true
+  mv "$tmp" .gitignore
 }
 
 # Walks every loaded repo and reconciles base .gitignore against its kind:
@@ -1123,7 +1128,7 @@ clone_repo_if_needed() {
   local repo_url="$2"
   local mode="$3"
 
-  if [ "$mode" = "sleep" ] || [ "$mode" = "off" ]; then
+  if [ "$mode" = "sleep" ]; then
     return 0
   fi
   if ! validate_repo_url "$repo_url"; then
@@ -1169,11 +1174,18 @@ clone_repo_if_needed() {
 }
 
 refresh_generated_files() {
-  rm -f "$LEGACY_SUPPORT_SCRIPTS_DIR/mcrepo-completion.bash" "$LEGACY_SUPPORT_SCRIPTS_DIR/mcrepo-completion.zsh"
   rm -f .mcrepo-completion.csh
 
   generate_bash_completion
   generate_zsh_completion
+}
+
+# Replace the __MCREPO_COMMANDS__ placeholder in a generated completion file
+# with the single command inventory defined at the top of this script.
+_substitute_command_inventory() {
+  local file="$1" tmp
+  tmp="$(mktemp)"
+  sed "s/__MCREPO_COMMANDS__/$MCREPO_COMMANDS/" "$file" >"$tmp" && mv "$tmp" "$file"
 }
 
 generate_bash_completion() {
@@ -1208,9 +1220,8 @@ _mcrepo_repo_names() {
 
 _mcrepo_complete() {
   local cur prev
-  local commands="init add remove write read sleep off list branch merge pull push commit open status skill update install-extension export-patch create-patch help"
+  local commands="__MCREPO_COMMANDS__"
   local skill_commands="list new install enable disable validate"
-  local repo_commands="remove write read sleep off open"
 
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
@@ -1228,19 +1239,22 @@ _mcrepo_complete() {
       ;;
     branch)
       if [ "$COMP_CWORD" -eq 2 ]; then
-        COMPREPLY=( $(compgen -W "list --off --delete --include-read" -- "$cur") )
+        COMPREPLY=( $(compgen -W "list --off --delete --include-read --dirty" -- "$cur") )
       else
-        COMPREPLY=( $(compgen -W "--include-read" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--include-read --dirty" -- "$cur") )
       fi
       ;;
     merge)
-      COMPREPLY=( $(compgen -W "--rebase" -- "$cur") )
+      COMPREPLY=( $(compgen -W "--rebase --no-squash --include-read -m" -- "$cur") )
+      ;;
+    pr)
+      COMPREPLY=( $(compgen -W "-m --draft --no-push --target" -- "$cur") )
       ;;
     pull)
-      COMPREPLY=( $(compgen -W "--rebase --reset" -- "$cur") )
+      COMPREPLY=( $(compgen -W "--rebase --reset --yes" -- "$cur") )
       ;;
     push)
-      COMPREPLY=( $(compgen -W "-m --no-fetch --no-force" -- "$cur") )
+      COMPREPLY=( $(compgen -W "-m --no-fetch --no-force --include-read" -- "$cur") )
       ;;
     commit)
       COMPREPLY=( $(compgen -W "-m --include-read --revert --reset --force" -- "$cur") )
@@ -1256,17 +1270,17 @@ _mcrepo_complete() {
         fi
       fi
       ;;
-    remove|write|read|sleep|off|open)
+    remove|write|read|sleep|open)
       if [ "$COMP_CWORD" -eq 2 ]; then
-        if [ "${COMP_WORDS[1]}" = "sleep" -o "${COMP_WORDS[1]}" = "off" ]; then
+        if [ "${COMP_WORDS[1]}" = "sleep" ]; then
           COMPREPLY=( $(compgen -W "$(_mcrepo_repo_names) --wakeall" -- "$cur") )
         else
           COMPREPLY=( $(compgen -W "$(_mcrepo_repo_names)" -- "$cur") )
         fi
       elif [ "$COMP_CWORD" -ge 3 ] && [ "${COMP_WORDS[1]}" = "remove" ]; then
-        COMPREPLY=( $(compgen -W "--keep-files --force -force" -- "$cur") )
-      elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "sleep" -o "${COMP_WORDS[1]}" = "off" ]; then
-        COMPREPLY=( $(compgen -W "--force -force" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--keep-files --force" -- "$cur") )
+      elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "sleep" ]; then
+        COMPREPLY=( $(compgen -W "--force" -- "$cur") )
       fi
       ;;
     *)
@@ -1277,6 +1291,7 @@ _mcrepo_complete() {
 complete -F _mcrepo_complete mcrepo
 complete -F _mcrepo_complete ./mcrepo.sh
 EOF
+  _substitute_command_inventory "$COMPLETION_BASH_FILE"
 }
 
 generate_zsh_completion() {
@@ -1320,7 +1335,7 @@ _mcrepo_complete() {
   local subcmd
   local -a commands repos skill_commands
 
-  commands=(init add remove write read sleep off list branch merge pull push commit open status skill update install-extension export-patch create-patch help)
+  commands=(__MCREPO_COMMANDS__)
   skill_commands=(list new install enable disable validate)
   repos=("${(@f)$(_mcrepo_repo_names)}")
 
@@ -1335,23 +1350,22 @@ _mcrepo_complete() {
       ;;
     branch)
       if (( CURRENT == 3 )); then
-        compadd -- list --off --delete --include-read
-      elif (( CURRENT == 4 )); then
-        compadd -- --include-read
+        compadd -- list --off --delete --include-read --dirty
+      else
+        compadd -- --include-read --dirty
       fi
       ;;
     merge)
-      if (( CURRENT == 3 )); then
-        compadd -- --rebase
-      fi
+      compadd -- --rebase --no-squash --include-read -m
+      ;;
+    pr)
+      compadd -- -m --draft --no-push --target
       ;;
     pull)
-      if (( CURRENT == 3 )); then
-        compadd -- --rebase --reset
-      fi
+      compadd -- --rebase --reset --yes
       ;;
     push)
-      compadd -- -m --no-fetch --no-force
+      compadd -- -m --no-fetch --no-force --include-read
       ;;
     commit)
       compadd -- -m --include-read --revert --reset --force
@@ -1368,17 +1382,17 @@ _mcrepo_complete() {
         fi
       fi
       ;;
-    remove|write|read|sleep|off|open)
+    remove|write|read|sleep|open)
       if (( CURRENT == 3 )); then
-        if [[ "$cmd" == "sleep" || "$cmd" == "off" ]]; then
+        if [[ "$cmd" == "sleep" ]]; then
           compadd -- "${repos[@]}" --wakeall
         else
           compadd -- "${repos[@]}"
         fi
       elif (( CURRENT >= 4 )) && [[ "$cmd" == "remove" ]]; then
-        compadd -- --keep-files --force -force
-      elif (( CURRENT == 4 )) && [[ "$cmd" == "sleep" || "$cmd" == "off" ]]; then
-        compadd -- --force -force
+        compadd -- --keep-files --force
+      elif (( CURRENT == 4 )) && [[ "$cmd" == "sleep" ]]; then
+        compadd -- --force
       fi
       ;;
     *) ;;
@@ -1388,6 +1402,7 @@ _mcrepo_complete() {
 compdef _mcrepo_complete mcrepo
 compdef _mcrepo_complete ./mcrepo.sh
 EOF
+  _substitute_command_inventory "$COMPLETION_ZSH_FILE"
 }
 
 create_readme_template() {
@@ -1815,7 +1830,7 @@ sync_vscode_git_ignored_repositories() {
   local i
 
   for i in "${!REPO_NAMES[@]}"; do
-    if [ "${REPO_MODES[$i]}" = "sleep" ] || [ "${REPO_MODES[$i]}" = "off" ]; then
+    if [ "${REPO_MODES[$i]}" = "sleep" ]; then
       sleep_repos+=("${REPO_NAMES[$i]}")
     fi
   done
@@ -1929,67 +1944,7 @@ scan_local_work_concerns() {
   return 0
 }
 
-remove_legacy_separator_dirs() {
-  local separator_dir
-  local separator_dirs=(
-    "🔹🔹🔹"
-    "🔹 separator"
-    "▪️ separator"
-    "〰️ separator"
-    "– separator"
-    "separator"
-  )
-
-  for separator_dir in "${separator_dirs[@]}"; do
-    [ -d "$separator_dir" ] || continue
-    if directory_is_empty "$separator_dir"; then
-      rmdir "$separator_dir"
-      log "Removed legacy separator directory: $separator_dir"
-    else
-      warn "Keeping non-empty legacy separator directory: $separator_dir"
-    fi
-  done
-}
-
 ensure_base_structure() {
-  remove_legacy_separator_dirs
-
-  if [ -d "🧠 skills" ] && [ ! -e "$SUPPORT_SKILLS_DIR" ]; then
-    mv "🧠 skills" "$SUPPORT_SKILLS_DIR"
-  fi
-  if [ -d "🧩 contracts" ] && [ ! -e "$SUPPORT_CONTRACTS_DIR" ]; then
-    mv "🧩 contracts" "$SUPPORT_CONTRACTS_DIR"
-  fi
-  if [ -d "🧾 docs" ] && [ ! -e "$SUPPORT_DOCS_DIR" ]; then
-    mv "🧾 docs" "$SUPPORT_DOCS_DIR"
-  fi
-  if [ -d "🧪 tests" ] && [ ! -e "$SUPPORT_TESTS_DIR" ]; then
-    mv "🧪 tests" "$SUPPORT_TESTS_DIR"
-  fi
-
-  if [ -d "🧠skills" ] && [ ! -e "$SUPPORT_SKILLS_DIR" ]; then
-    mv "🧠skills" "$SUPPORT_SKILLS_DIR"
-  fi
-  if [ -d "🧩contracts" ] && [ ! -e "$SUPPORT_CONTRACTS_DIR" ]; then
-    mv "🧩contracts" "$SUPPORT_CONTRACTS_DIR"
-  fi
-  if [ -d "🧾docs" ] && [ ! -e "$SUPPORT_DOCS_DIR" ]; then
-    mv "🧾docs" "$SUPPORT_DOCS_DIR"
-  fi
-
-  if [ -d "skills" ] && [ ! -e "$SUPPORT_SKILLS_DIR" ]; then
-    mv "skills" "$SUPPORT_SKILLS_DIR"
-  fi
-  if [ -d "contracts" ] && [ ! -e "$SUPPORT_CONTRACTS_DIR" ]; then
-    mv "contracts" "$SUPPORT_CONTRACTS_DIR"
-  fi
-  if [ -d "docs" ] && [ ! -e "$SUPPORT_DOCS_DIR" ]; then
-    mv "docs" "$SUPPORT_DOCS_DIR"
-  fi
-  if [ -d "tests" ] && [ ! -e "$SUPPORT_TESTS_DIR" ]; then
-    mv "tests" "$SUPPORT_TESTS_DIR"
-  fi
-
   mkdir -p "$SUPPORT_CONTRACTS_DIR" "$SUPPORT_DOCS_DIR" "$SUPPORT_TESTS_DIR" "$SUPPORT_SKILLS_DIR"
 }
 
@@ -2131,7 +2086,7 @@ materialize_from_repos_file() {
       if [ "${REPO_MODES[$i]}" = "write" ]; then
         apply_global_branch_to_repo_if_configured "${REPO_NAMES[$i]}" "$repo_dir"
       fi
-    elif [ "${REPO_MODES[$i]}" = "sleep" ] || [ "${REPO_MODES[$i]}" = "off" ]; then
+    elif [ "${REPO_MODES[$i]}" = "sleep" ]; then
       mkdir -p "$repo_dir"
     fi
   done
@@ -3200,7 +3155,7 @@ set_mode_command() {
   local target_mode="$1"
   shift
 
-  if [ "$target_mode" = "sleep" ] || [ "$target_mode" = "off" ]; then
+  if [ "$target_mode" = "sleep" ]; then
     if [ "$#" -eq 1 ] && [ "$1" = "--wakeall" ]; then
       wake_all_sleeping_repos_to_read
       return 0
@@ -3215,7 +3170,7 @@ set_mode_command() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --force|-force)
-        if [ "$target_mode" != "sleep" ] && [ "$target_mode" != "off" ]; then
+        if [ "$target_mode" != "sleep" ]; then
           die "--force is only supported with 'sleep'"
         fi
         force_sleep=1
@@ -3234,7 +3189,7 @@ set_mode_command() {
   local previous_mode
   previous_mode="${REPO_MODES[$idx]}"
 
-  if { [ "$target_mode" = "sleep" ] || [ "$target_mode" = "off" ]; } && ! is_repo_local "$idx"; then
+  if [ "$target_mode" = "sleep" ] && ! is_repo_local "$idx"; then
     # Sleep deletes the working copy INCLUDING .git. Scan for ANY local work
     # (uncommitted, untracked, unpushed on any branch, stashes) regardless of
     # the previous mode — read-mode edits are just as lost as write-mode ones.
@@ -3318,7 +3273,7 @@ set_mode_command() {
       fi
     fi
   fi
-  if [ "$target_mode" = "sleep" ] || [ "$target_mode" = "off" ]; then
+  if [ "$target_mode" = "sleep" ]; then
     mkdir -p "$repo_dir"
     clear_directory_contents "$repo_dir"
     write_sleep_placeholder_files "$repo_dir"
@@ -3340,7 +3295,7 @@ wake_all_sleeping_repos_to_read() {
   local i woke_count=0
   local -a woke_indexes=()
   for i in "${!REPO_NAMES[@]}"; do
-    if [ "${REPO_MODES[$i]}" = "sleep" ] || [ "${REPO_MODES[$i]}" = "off" ]; then
+    if [ "${REPO_MODES[$i]}" = "sleep" ]; then
       REPO_MODES[$i]="read"
       woke_indexes+=("$i")
       woke_count=$((woke_count + 1))
@@ -4499,11 +4454,13 @@ cmd_push() {
   local commit_message=""
   local do_fetch=1
   local allow_force=1
+  local include_read=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -m) shift; commit_message="${1:-}"; [ -n "$commit_message" ] || die "-m requires a message" ;;
       --no-fetch) do_fetch=0 ;;
       --no-force) allow_force=0 ;;
+      --include-read) include_read=1 ;;
       *) die "Unknown push option: $1" ;;
     esac
     shift
@@ -4526,7 +4483,11 @@ cmd_push() {
 
   local i repo_dir branch dirty parent
   for i in "${!REPO_NAMES[@]}"; do
-    [ "${REPO_MODES[$i]}" = "write" ] || continue
+    if [ "${REPO_MODES[$i]}" != "write" ]; then
+      # --include-read completes the branch/commit --include-read workflow:
+      # coordinated commits in read repos must be publishable too.
+      { [ "$include_read" -eq 1 ] && [ "${REPO_MODES[$i]}" = "read" ]; } || continue
+    fi
     repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
     [ -d "$repo_dir/.git" ] || continue
     branch="$(repo_branch "$repo_dir")"
@@ -6177,10 +6138,7 @@ cmd_branch() {
   fi
 
   # Handle "branch --off" (and deprecated "branch off") — turn off global branch coordination
-  if [ "${1:-}" = "--off" ] || [ "${1:-}" = "off" ]; then
-    if [ "${1:-}" = "off" ]; then
-      warn "Deprecation: 'mcrepo branch off' is deprecated. Use 'mcrepo branch --off' instead."
-    fi
+  if [ "${1:-}" = "--off" ]; then
     shift
     while [ "$#" -gt 0 ]; do
       case "$1" in
@@ -6248,6 +6206,7 @@ cmd_branch() {
     shift
   done
   [ -n "$branch_name" ] || die "Usage: ./mcrepo.sh branch <branch-name> [--include-read] [--dirty abort|commit|carry|discard]"
+  [ "$branch_name" != "off" ] || die "'mcrepo branch off' was removed. Use 'mcrepo branch --off' to turn off coordination."
   validate_branch_name "$branch_name" || die "Invalid branch name: '$branch_name'"
 
   load_repos
@@ -6872,12 +6831,14 @@ cmd_merge() {
   local do_rebase=0
   local do_squash=1
   local commit_message=""
+  local include_read=0
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --rebase) do_rebase=1 ;;
       --no-squash) do_squash=0 ;;
       --squash) do_squash=1 ;;
+      --include-read) include_read=1 ;;
       -m) shift; commit_message="${1:-}"; [ -n "$commit_message" ] || die "-m requires a message" ;;
       *) die "Unknown merge option: $1" ;;
     esac
@@ -6915,7 +6876,12 @@ cmd_merge() {
 
   for i in "${!REPO_NAMES[@]}"; do
     mode="${REPO_MODES[$i]}"
-    [ "$mode" = "write" ] || continue
+    if [ "$mode" != "write" ]; then
+      # --include-read completes the branch/commit --include-read workflow:
+      # read repos switched onto the global branch must be mergeable too, or
+      # their coordinated commits strand on the feature branch.
+      { [ "$include_read" -eq 1 ] && [ "$mode" = "read" ]; } || continue
+    fi
     repo_name="${REPO_NAMES[$i]}"
     repo_dir="$(get_repo_dir "$repo_name" "$mode")"
     [ -d "$repo_dir/.git" ] || continue
@@ -7979,8 +7945,20 @@ cmd_merge_rebase() {
   fi
 }
 
+# Runs once after 'mcrepo update' replaced the script ($1 = old version,
+# $2 = new version). Migrates the manifest to the current schema by doing a
+# load/save round-trip: normalize_mode and save_repos bring legacy fields and
+# the schema stamp up to date. Safe to run in a non-workspace directory.
 cmd_post_update_migrate() {
   [ "$#" -eq 2 ] || return 0
+  [ -f "$REPOS_FILE" ] || return 0
+  local schema_before
+  schema_before="$(parse_schema_version || true)"
+  load_repos
+  save_repos
+  if [ "${schema_before:-0}" != "$MCREPO_SCHEMA_VERSION" ]; then
+    log "Migrated $REPOS_FILE to manifest schema $MCREPO_SCHEMA_VERSION."
+  fi
   return 0
 }
 
@@ -8252,7 +8230,6 @@ main() {
     write) set_mode_command write "$@" ;;
     read) set_mode_command read "$@" ;;
     sleep) set_mode_command sleep "$@" ;;
-    off) set_mode_command sleep "$@" ;;
     list) cmd_list "$@" ;;
     branch) cmd_branch "$@" ;;
     merge) cmd_merge "$@" ;;
@@ -8268,7 +8245,11 @@ main() {
     version|--version|-V) log "mcrepo version $MCREPO_VERSION" ;;
     update) cmd_update "$@" ;;
     install-extension) cmd_install_extension "$@" ;;
-    export-patch|create-patch) cmd_export_patch "$@" ;;
+    create-patch) cmd_export_patch "$@" ;;
+    export-patch)
+      warn "Deprecation: 'mcrepo export-patch' is now 'mcrepo create-patch' (same behavior)."
+      cmd_export_patch "$@"
+      ;;
     --post-update-migrate) cmd_post_update_migrate "$@" ;;
     help|-h|--help) usage ;;
     *)

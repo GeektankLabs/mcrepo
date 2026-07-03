@@ -100,3 +100,24 @@ coordinated_workspace() {
   ! git -C "$SANDBOX/alpha" show-ref --verify --quiet refs/heads/feature-x
   ! grep -q 'branch: feature-x' mcrepo.yaml
 }
+
+@test "--include-read workflow: branch, commit, merge, push a read-mode repo" {
+  init_workspace_with_repos alpha beta
+  mcrepo write alpha >/dev/null
+  # beta stays in read mode
+  git_manage_workspace
+  bash -c 'printf "y\n" | "$0" branch feature-r --include-read' "$SANDBOX/mcrepo.sh" >/dev/null
+  [ "$(repo_branch beta)" = "feature-r" ]
+  dirty_repo alpha
+  dirty_repo beta
+  mcrepo commit -m "read-inclusive change" --include-read >/dev/null
+  [[ "$(repo_subject beta)" == "mcrepo commit #"* ]]
+  run bash -c 'printf "n\n" | "$0" merge -m "feat: read-inclusive" --include-read' "$SANDBOX/mcrepo.sh"
+  [ "$status" -eq 0 ]
+  [ "$(repo_branch beta)" = "main" ]
+  [ "$(repo_subject beta)" = "feat: read-inclusive" ]
+  run mcrepo push --include-read
+  [ "$status" -eq 0 ]
+  remote_subject="$(git --git-dir="$REMOTES_DIR/beta.git" log -1 --format=%s main)"
+  [ "$remote_subject" = "feat: read-inclusive" ]
+}
