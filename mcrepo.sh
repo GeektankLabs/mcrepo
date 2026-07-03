@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.6.0"
+MCREPO_VERSION="0.7.0"
 # Manifest (mcrepo.yaml) format version. Bump when the manifest schema changes
 # incompatibly; cmd_post_update_migrate migrates older manifests forward.
 MCREPO_SCHEMA_VERSION="1"
@@ -18,7 +18,7 @@ OPENCODE_PROJECT_SKILLS_DIR=".opencode/skills"
 # Single source of truth for the user-facing command surface. usage(), the
 # dispatch in main(), and the generated completions must stay in sync with
 # this list (checked by tests/30-inventory.bats).
-MCREPO_COMMANDS="init publish-base add upstream fork doctor new publish remove write read sleep list branch merge pr pull push commit continue abort open status skill version update install-extension create-patch help"
+MCREPO_COMMANDS="init publish-base add upstream fork doctor new publish remove write read sleep list branch sync merge pr pull push commit continue abort resolve open status skill version update install-extension create-patch help"
 
 COMPLETION_BASH_FILE=".mcrepo-completion.bash"
 COMPLETION_ZSH_FILE=".mcrepo-completion.zsh"
@@ -104,9 +104,9 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh branch <branch-name> [--include-read] [--dirty abort|commit|carry|discard]  # Switch/create global branch (interactive dirty-change handling; --dirty preselects for non-interactive use)
   ./mcrepo.sh branch --off                           # Turn off branch coordination (fallback — see merge/--delete)
   ./mcrepo.sh branch --delete                        # Delete global branch, switch repos back to parent branches
-  ./mcrepo.sh merge [-m "subject"] [--include-read]  # Squash-merge global branch into each repo's parent (default subject = branch name)
+  ./mcrepo.sh sync [--include-read]                  # Rebase the global branch onto each parent (auto-stash); resolve conflicts HERE, before merging
+  ./mcrepo.sh merge [-m "subject"] [--include-read]  # Squash-merge global branch into each repo's parent; requires a synced branch (run 'sync' first)
   ./mcrepo.sh merge --no-squash                      # Legacy: --no-ff merge commit instead of squash
-  ./mcrepo.sh merge --rebase                         # Sync: rebase current global branch onto parent branch (auto-stashes, prefers origin/<parent>)
   ./mcrepo.sh pr [-m "title"] [--draft] [--no-push] [--target origin|upstream]  # Coordinated GitHub PRs per repo with commits vs base; fork->upstream when upstream set; cross-linked
   ./mcrepo.sh pull                                   # Fetch + ff-pull all active repos; meta-context auto-stashes on dirty, sub-repos skip on dirty
   ./mcrepo.sh pull --rebase                          # Auto-stash, pull, pop stash for ALL repos (handles dirty sub-repos safely)
@@ -116,8 +116,9 @@ Usage:  # Show available mcrepo commands
 ═══════════════════════════════════════════════════════════════════════════════
   MID-OPERATION RECOVERY
 ═══════════════════════════════════════════════════════════════════════════════
-  ./mcrepo.sh continue                            # Resume any mid-merge/rebase/cherry-pick/revert across repos (--continue)
-  ./mcrepo.sh abort                               # Abort any mid-merge/rebase/cherry-pick/revert across repos (--abort)
+  ./mcrepo.sh continue                            # Resume any mid-merge/rebase/cherry-pick/revert across repos (--continue); exits 2 while conflicts remain
+  ./mcrepo.sh abort                               # Abort any mid-merge/rebase/cherry-pick/revert across repos (--abort); clears marker-less conflicts too
+  ./mcrepo.sh resolve                             # Read-only diagnosis of stuck repos; prints a paste-ready coding-agent prompt on stdout
 
 ═══════════════════════════════════════════════════════════════════════════════
   INSPECTION & NAVIGATION
@@ -1244,8 +1245,11 @@ _mcrepo_complete() {
         COMPREPLY=( $(compgen -W "--include-read --dirty" -- "$cur") )
       fi
       ;;
+    sync)
+      COMPREPLY=( $(compgen -W "--include-read" -- "$cur") )
+      ;;
     merge)
-      COMPREPLY=( $(compgen -W "--rebase --no-squash --include-read -m" -- "$cur") )
+      COMPREPLY=( $(compgen -W "--no-squash --include-read -m" -- "$cur") )
       ;;
     pr)
       COMPREPLY=( $(compgen -W "-m --draft --no-push --target" -- "$cur") )
@@ -1355,8 +1359,11 @@ _mcrepo_complete() {
         compadd -- --include-read --dirty
       fi
       ;;
+    sync)
+      compadd -- --include-read
+      ;;
     merge)
-      compadd -- --rebase --no-squash --include-read -m
+      compadd -- --no-squash --include-read -m
       ;;
     pr)
       compadd -- -m --draft --no-push --target
@@ -1421,7 +1428,7 @@ It provides workspace governance across repos, shared documentation, tests, and 
 5. Add a repository: `mcrepo add <git-url>`
 6. Set repo mode: `mcrepo write <repo>` or `mcrepo read <repo>` or `mcrepo sleep <repo>`
 7. Coordinate branch across target repos and meta-context repo: `mcrepo branch <branch-name>` (turn off with `mcrepo branch --off`)
-8. After feature work, merge back: `mcrepo merge` (sync with parent first: `mcrepo merge --rebase`)
+8. After feature work: `mcrepo sync` (rebase onto parent, resolve conflicts here), then `mcrepo merge`
 9. To discard a branch instead: `mcrepo branch --delete`
 10. Check state: `mcrepo status`
 11. Manage workspace skills: `mcrepo skill list`
@@ -1445,8 +1452,9 @@ It provides workspace governance across repos, shared documentation, tests, and 
 - `mcrepo branch --off` disables global branch coordination (fallback — prefer `merge` or `--delete`).
 - `mcrepo branch --delete` discards the global branch, switches repos back to parent branches, and deletes the branch locally.
 - Parent branches are recorded automatically when `mcrepo branch` forks a new branch. Each repo can have a different parent.
-- `mcrepo merge` merges the global branch into each write repo's parent branch (local only, no push). Performs a dry-run first.
-- `mcrepo merge --rebase` syncs the current branch by rebasing it onto its parent (prefers `origin/<parent>`, falls back to local `<parent>`). Auto-stashes uncommitted work. Rewrites local history — force-push if the branch was already pushed.
+- `mcrepo sync` rebases the current branch onto its parent (prefers `origin/<parent>`, falls back to local `<parent>`). Auto-stashes uncommitted work. Conflicts are resolved HERE, on the feature branch — never during the merge. Rewrites local history; `mcrepo push` re-publishes safely.
+- `mcrepo merge` merges the global branch into each write repo's parent branch (local only, no push). It requires a synced branch (run `mcrepo sync` first) and performs a conflict dry-run, so the merge itself never conflicts.
+- `mcrepo resolve` diagnoses stuck repos (mid-rebase, conflicts, leftover stashes) and prints a paste-ready prompt for a coding agent.
 - `mcrepo pull` fetches and fast-forward pulls from origin for all non-sleep repos. Meta-context is auto-stashed when dirty (so it always tracks upstream); dirty sub-repos are skipped (fetch only).
 - `mcrepo pull --rebase` auto-stashes uncommitted changes, pulls, then pops stash for ALL repos (including sub-repos). Safe for dirty repos.
 - `mcrepo pull --reset` discards all local changes and resets to origin state. Destructive — requires interactive confirmation.
@@ -1496,14 +1504,36 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 - `mcrepo.yaml` tracks the active global `branch:` and per-repo `parent:` stacks.
 - `parent:` is a comma-separated stack (rightmost = immediate parent, e.g. `main,feature`).
 - `meta-parent:` tracks the meta-context repo's own parent branch stack.
-- Never modify `branch:`, `parent:`, or `meta-parent:` fields directly — use `mcrepo branch`, `mcrepo merge`, `mcrepo merge --rebase`, and `mcrepo branch --delete` commands.
+- Never modify `branch:`, `parent:`, or `meta-parent:` fields directly — use `mcrepo branch`, `mcrepo sync`, `mcrepo merge`, and `mcrepo branch --delete` commands.
+- The merge-back flow is strictly two-step: `mcrepo sync` first (rebases the branch onto its parent; conflicts are resolved here), then `mcrepo merge` (always conflict-free after a clean sync).
 - `mcrepo branch <name>` distinguishes fork (new branch, records parent) from jump (existing branch, no parent change).
 - `mcrepo branch --delete` discards the global branch and reverts repos to their parent branches.
 - `mcrepo branch --off` is a fallback that turns off coordination without switching branches.
-- `mcrepo pull` fetches and pulls from origin for all active repos (ff-only). Meta-context auto-stashes on dirty; dirty sub-repos skip — use `pull --rebase` to auto-stash sub-repos too. After `mcrepo merge --rebase`, a coordinated branch can't fast-forward because the rebase rewrote its hashes; `mcrepo pull` recognizes this and tells you to run `mcrepo push` instead of failing.
+- `mcrepo pull` fetches and pulls from origin for all active repos (ff-only). Meta-context auto-stashes on dirty; dirty sub-repos skip — use `pull --rebase` to auto-stash sub-repos too. After `mcrepo sync`, a coordinated branch can't fast-forward because the rebase rewrote its hashes; `mcrepo pull` recognizes this and tells you to run `mcrepo push` instead of failing.
 - `mcrepo push [-m "message"]` pushes write-mode repos. With `-m`, also commits uncommitted changes first (same coordinated-commit format as `mcrepo commit`). Branches that were only rebased onto their parent (diverged from a stale remote, but provably your own rebase) are auto-published with `--force-with-lease` after a fresh fetch; pass `--no-force` to disable. Genuinely diverged branches (remote contains other work) are never force-pushed — mcrepo refuses and prints a paste-ready prompt for a local coding agent to resolve.
 - When `branch:` is empty, branch coordination is off and repos manage branches independently.
 - When running non-interactively (e.g., from scripts or agents), `mcrepo branch` aborts if uncommitted changes exist. Ensure clean working trees before switching branches.
+
+## Conflict Recovery
+
+When a coordinated operation (`mcrepo sync`, `merge`, `pull`, `push`, `branch`) stops on
+conflicts, follow this procedure instead of improvising:
+
+1. Diagnose with `./mcrepo.sh status`: look for `inprogress=REBASING/MERGING/CONFLICTED`
+   and unexpected `mcrepo-stash=N`. Then run `./mcrepo.sh resolve` — it prints the
+   situation-specific recovery procedure; treat that output as the authoritative instructions.
+2. Resolve ONLY real semantic conflicts inside the conflict markers. Where both sides differ
+   purely in formatting/whitespace, keep the parent branch's formatting and preserve both
+   sides' substantive changes. Never reformat or "clean up" code outside conflict markers.
+3. Conflicting commits are often mcrepo coordination commits (`mcrepo commit #N @<batch>`)
+   present in both old and rebased form — never keep both; the target is the real feature
+   work on top of the latest parent branch.
+4. Finish with `git add` on resolved files, then `./mcrepo.sh continue`, repeating until
+   `./mcrepo.sh status` is clean. Stash-pop conflicts have nothing to continue: resolve,
+   `git add`, then `git stash drop`.
+5. Never run `git push --force`, `git reset --hard`, `git rebase --skip`, or delete branches
+   or stashes without the user's explicit approval. Publishing stays user-driven via
+   `mcrepo push`.
 
 ## Coordinated Commits (User-Driven)
 
@@ -1548,6 +1578,7 @@ enabled:
   - test-gate
   - release-prep
   - no-secrets
+  - conflict-resolution
   - subproject-skill-loader
 disabled: []
 EOF
@@ -1656,6 +1687,8 @@ Prevent accidental exposure of credentials and private tokens.
 4. Flag potential leaks immediately.
 EOF
 
+  create_conflict_resolution_skill
+
   mkdir -p "$SUPPORT_SKILLS_DIR/subproject-skill-loader"
   cat >"$SUPPORT_SKILLS_DIR/subproject-skill-loader/skill.md" <<'EOF'
 # subproject-skill-loader
@@ -1682,6 +1715,40 @@ Load sub-repo local skills only when that sub-repo is in write/change scope.
 - Never bypass `mcrepo.yaml` mode restrictions.
 - Workspace governance and safety skills always win in conflicts.
 - Repo-local skills can refine workflow details only inside their own repo scope.
+EOF
+}
+
+# Kept as its own function so cmd_post_update_migrate can backfill just this
+# skill into workspaces created before it existed.
+create_conflict_resolution_skill() {
+  mkdir -p "$SUPPORT_SKILLS_DIR/conflict-resolution"
+  cat >"$SUPPORT_SKILLS_DIR/conflict-resolution/skill.md" <<'EOF'
+# conflict-resolution
+
+## Purpose
+Recover coordinated multi-repo git operations from conflicts without losing work.
+
+## When to Apply
+- `mcrepo status` shows `inprogress=REBASING/MERGING/CONFLICTED` or an unexpected `mcrepo-stash=N`.
+- An mcrepo command printed a paste-ready recovery prompt, or the user pastes one.
+- A coordinated `sync`, `merge`, `pull`, `push`, or `branch` stopped on conflicts.
+
+## Procedure
+1. Run `./mcrepo.sh resolve` and treat its output as the authoritative, situation-specific
+   instructions. Orient with `./mcrepo.sh status` and per-repo `git status` before changing anything.
+2. Resolve ONLY real semantic conflicts. On formatting-only collisions, keep the parent side's
+   formatting and preserve both sides' substantive changes. Never reformat outside conflict markers.
+3. Watch for duplicated `mcrepo commit #N @<batch>` coordination commits (old + rebased form) —
+   never keep both; the target state is the real feature work on top of the latest parent.
+4. Finish per situation: `git add` resolved files, then `./mcrepo.sh continue` (paused rebase/merge)
+   or `git stash drop` (stash-pop conflict), until `./mcrepo.sh status` is clean.
+
+## Guardrails
+- Never `git push --force`, `git reset --hard`, `git rebase --skip`, or delete branches/stashes
+  without explicit user approval; publishing stays user-driven via `mcrepo push`.
+- Commit only to complete a paused operation or a repair commit the recovery instructions name
+  verbatim; new feature commits stay user-driven.
+- Respect `mcrepo.yaml` mode gates at all times.
 EOF
 }
 
@@ -3368,7 +3435,19 @@ repo_inprogress_state() {
     printf 'REVERTING'
   elif [ -f "$git_dir/BISECT_LOG" ]; then
     printf 'BISECTING'
+  elif [ -n "$(git -C "$repo_dir" ls-files -u 2>/dev/null)" ]; then
+    # Unmerged index entries without any op marker: a squash-merge conflict
+    # (squash sets no MERGE_HEAD) or a stash-pop conflict. Without this
+    # fallback such repos look idle to status/continue/abort.
+    printf 'CONFLICTED'
   fi
+}
+
+# Count stash entries created by mcrepo itself ("mcrepo: carry to <branch>",
+# "mcrepo: auto-stash before rebase"). They need explicit pop/drop finalization.
+repo_mcrepo_stash_count() {
+  local repo_dir="$1"
+  git -C "$repo_dir" stash list 2>/dev/null | grep -c 'mcrepo:' || true
 }
 
 # Reports "in-sync", "ahead=N behind=M", or "no-upstream" without fetching.
@@ -3438,71 +3517,155 @@ classify_divergence() {
   printf 'remote-work'
 }
 
-# Print a copy-paste prompt the user can hand to a local coding agent to resolve
-# a stuck/conflict state that mcrepo deliberately will not auto-resolve.
-# Usage: print_agent_recovery_prompt <situation> <name|dir> [<name|dir> ...]
-#   situation: rebase-conflict | stash-conflict | ambiguous-divergence
-print_agent_recovery_prompt() {
+# --- Agent recovery prompts -------------------------------------------------
+# When mcrepo hits a state it deliberately will not auto-resolve, it prints a
+# paste-ready prompt for a local coding agent. _emit_agent_prompt_body writes
+# the raw prompt to stdout (used by 'mcrepo resolve');
+# print_agent_recovery_prompt wraps it in framing and sends everything to
+# stderr (used in failure paths - stdout stays reserved for command results).
+# Usage: _emit_agent_prompt_body <situation> <name|dir> [<name|dir> ...]
+#   situation: rebase-conflict | merge-conflict | stash-conflict |
+#              carry-conflict | ambiguous-divergence | partial-commit
+# Callers may set MCREPO_RECOVERY_CONTEXT (multi-line) with situation details
+# (exact commit subject, stash name, ...); it is printed and cleared here.
+MCREPO_RECOVERY_CONTEXT=""
+_emit_agent_prompt_body() {
   local situation="$1"; shift
-  local headline detail
+  local headline detail three_sides=0
   case "$situation" in
     rebase-conflict)
-      headline="Rebase conflicts during 'mcrepo merge --rebase' (coordinated branches across repos)."
-      detail="A git rebase is paused mid-way. Each conflicted repo has an in-progress rebase you must finish."
+      headline="Rebase conflicts during 'mcrepo sync' (coordinated branches across repos)."
+      detail="A git rebase is paused mid-way. Each affected repo has an in-progress rebase to finish."
+      three_sides=1
+      ;;
+    merge-conflict)
+      headline="A coordinated 'mcrepo merge' into the parent branch failed, or a merge left unmerged files."
+      detail="Some repos may already be merged; the affected ones need repair before re-running 'mcrepo merge'."
       ;;
     stash-conflict)
-      headline="Stash-pop conflicts after 'mcrepo merge --rebase'."
-      detail="The rebase succeeded but restoring auto-stashed local changes conflicted. A stash is still saved."
+      headline="Stash-pop conflicts after a coordinated rebase/pull."
+      detail="The git operation succeeded, but re-applying auto-stashed local changes conflicted. The stash entry is still saved."
+      ;;
+    carry-conflict)
+      headline="Carrying uncommitted changes to another branch conflicted ('mcrepo branch')."
+      detail="mcrepo stashed local changes before switching branches and could not re-apply them cleanly."
       ;;
     ambiguous-divergence)
       headline="A coordinated branch diverged from its remote and it is NOT just a local rebase."
-      detail="The remote branch already contains work mcrepo cannot prove came from your rebase, so it refuses to force-push."
+      detail="The remote branch contains work mcrepo cannot prove came from a local rebase, so it refuses to force-push."
+      three_sides=1
+      ;;
+    partial-commit)
+      headline="A coordinated commit succeeded in some repos but failed in others."
+      detail="The batch must stay one revertable unit; the failed repos need a commit with the SAME subject."
       ;;
     *)
       headline="mcrepo hit a state it will not auto-resolve."
       detail=""
       ;;
   esac
-  log ""
-  log "Need help resolving this? Paste the prompt between the lines below to your local coding agent:"
-  log "------------------------------------------------------------"
-  printf 'I am using the mcrepo toolset (./mcrepo.sh) which coordinates a feature branch across a\n'
-  printf 'meta-context repo and several sub-repos, then rebases it onto each parent `main`.\n\n'
+  printf 'I am working in an mcrepo workspace (./mcrepo.sh): a meta-context repo plus managed\n'
+  printf 'sub-repos share one coordinated feature branch. mcrepo records the parent branch of each\n'
+  printf 'repo in mcrepo.yaml and rebases/merges all repos together. Coordinated commits share\n'
+  printf 'subjects like "mcrepo commit #N @<batch>: ...".\n\n'
   printf 'Situation: %s\n' "$headline"
-  printf '%s\n\n' "$detail"
-  printf 'Affected repos (name and local path):\n'
+  [ -n "$detail" ] && printf '%s\n' "$detail"
+  printf '\nAffected repos (name and local path):\n'
   local entry name dir
   for entry in "$@"; do
     name="${entry%%|*}"
     dir="${entry#*|}"
     printf -- '- %s  (cd %s)\n' "$name" "$dir"
   done
-  printf '\nPlease help me resolve this cleanly:\n'
-  printf '1. For each affected repo, compare the three sides that produced the divergence/conflict:\n'
-  printf '   the local feature branch, the parent `main` it was rebased onto, and the stale\n'
-  printf '   `origin/<branch>` that still holds pre-rebase history. Use `git -C <dir> log --oneline --graph`\n'
-  printf '   and `git -C <dir> status` to orient.\n'
-  printf '2. Note that the conflicting commits are mcrepo coordination commits (subjects like\n'
-  printf '   "mcrepo commit #N @<batch>") that may exist in BOTH old and rebased form — do not keep both;\n'
-  printf '   resolve toward the intended final state = real feature work on top of the latest `main`.\n'
+  if [ -n "${MCREPO_RECOVERY_CONTEXT:-}" ]; then
+    printf '\nAdditional context:\n%s\n' "$MCREPO_RECOVERY_CONTEXT"
+  fi
+  MCREPO_RECOVERY_CONTEXT=""
+  local step=1
+  printf '\nPlease resolve this carefully:\n'
+  printf '%d. Orient first, change nothing yet: run ./mcrepo.sh status, then in each affected repo\n' "$step"
+  printf '   `git -C <dir> status` and `git -C <dir> log --oneline --graph --all -20`.\n'
+  step=$((step + 1))
+  if [ "$three_sides" -eq 1 ]; then
+    printf '%d. Three sides can collide here: the local feature branch (my work), the parent branch it\n' "$step"
+    printf '   is rebased onto (the latest main), and a possibly stale origin/<branch> that still\n'
+    printf '   holds pre-rebase history. The same "mcrepo commit #N @<batch>" coordination commits may\n'
+    printf '   exist in BOTH old and rebased form - never keep both. The target state is: my real\n'
+    printf '   feature work sitting on top of the latest parent.\n'
+    step=$((step + 1))
+  fi
+  printf '%d. Resolve ONLY real semantic conflicts. Where the two sides differ purely in formatting or\n' "$step"
+  printf '   whitespace, keep the formatting of the parent/upstream side and preserve the substantive\n'
+  printf '   changes of both sides. Never reformat, reorder, or "clean up" code outside the conflict\n'
+  printf '   markers.\n'
+  step=$((step + 1))
   case "$situation" in
     rebase-conflict)
-      printf '3. Edit conflicted files, `git -C <dir> add` them, then run `./mcrepo.sh continue` to advance\n'
-      printf '   each paused rebase (repeat until all repos finish). Restore any auto-stash with\n'
-      printf '   `git -C <dir> stash pop` if mcrepo notes a stash was kept.\n'
+      printf '%d. For each paused repo: edit the conflicted files, `git -C <dir> add` them, then run\n' "$step"
+      printf '   ./mcrepo.sh continue to advance every paused rebase (repeat until none remain). If\n'
+      printf '   mcrepo reported an auto-stash, run `git -C <dir> stash pop` afterwards; if the pop\n'
+      printf '   itself conflicts, resolve the same way, `git add`, then `git -C <dir> stash drop`.\n'
+      ;;
+    merge-conflict)
+      printf '%d. A paused merge (inprogress=MERGING) is finished with: resolve, `git -C <dir> add`,\n' "$step"
+      printf '   then ./mcrepo.sh continue. A SQUASH-merge conflict leaves NO in-progress marker - the\n'
+      printf '   repo sits on its PARENT branch with unmerged files (inprogress=CONFLICTED): resolve,\n'
+      printf '   `git -C <dir> add` the files, then `git -C <dir> commit`. If mcrepo already rolled a\n'
+      printf '   failed repo back to the feature branch, find out why the merge failed (git output,\n'
+      printf '   hooks), fix that, then re-run ./mcrepo.sh merge - already-merged repos are skipped.\n'
       ;;
     stash-conflict)
-      printf '3. Resolve the conflicted files, `git -C <dir> add` them, then `git -C <dir> stash drop`\n'
-      printf '   to discard the now-applied stash entry.\n'
+      printf '%d. The rebase/pull itself succeeded; only re-applying auto-stashed local changes\n' "$step"
+      printf '   conflicted, and the stash entry is still saved. Resolve the conflicted files,\n'
+      printf '   `git -C <dir> add` them, then `git -C <dir> stash drop` to discard the now-applied\n'
+      printf '   entry. There is nothing to "continue" - this conflict lives only in the working tree.\n'
+      ;;
+    carry-conflict)
+      printf '%d. mcrepo branch stashed my uncommitted changes before switching and could not re-apply\n' "$step"
+      printf '   them. If `git -C <dir> stash list` still shows the mcrepo entry and the working tree\n'
+      printf '   has no conflict markers, `git -C <dir> stash pop` first. Resolve the conflicted files,\n'
+      printf '   `git -C <dir> add` them, then `git -C <dir> stash drop` if the entry is still listed.\n'
       ;;
     ambiguous-divergence)
-      printf '3. Decide whether the remote commits are wanted. If yes, integrate them (merge or rebase onto\n'
-      printf '   `origin/<branch>`); if they are obsolete, only then force-publish. Do NOT blindly force-push.\n'
+      printf '%d. Report before acting: show me what the remote has that I lack\n' "$step"
+      printf '   (`git -C <dir> log --oneline HEAD..@{u}`) and what I have locally\n'
+      printf '   (`git -C <dir> log --oneline @{u}..HEAD`). If the remote commits are wanted,\n'
+      printf '   integrate them (rebase my branch onto origin/<branch>, or merge). Only if I\n'
+      printf '   explicitly confirm they are obsolete pre-rebase leftovers may you publish with\n'
+      printf '   `git -C <dir> push --force-with-lease` - never a plain --force, never without asking.\n'
+      ;;
+    partial-commit)
+      printf '%d. The coordinated commit was recorded in some repos but failed in the ones listed\n' "$step"
+      printf '   above. In each failed repo find out why the commit failed (hooks, unmerged files,\n'
+      printf '   permissions), fix that, then complete the batch with the EXACT subject given in the\n'
+      printf '   additional context: `git -C <dir> add -A && git -C <dir> commit -m "<subject>"`.\n'
+      printf '   Do not invent a new message and do not run mcrepo commit again - that would start a\n'
+      printf '   new batch number.\n'
+      ;;
+    *)
+      printf '%d. Inspect each affected repo and bring it back to a clean state without losing work.\n' "$step"
       ;;
   esac
-  printf '4. When every affected repo is clean (`./mcrepo.sh status` shows no inprogress state), run\n'
-  printf '   `./mcrepo.sh push` to publish (it auto force-with-leases branches that were only rebased).\n'
-  log "------------------------------------------------------------"
+  step=$((step + 1))
+  printf '%d. Finish sequence: repeat resolve -> `git add` -> ./mcrepo.sh continue until ./mcrepo.sh\n' "$step"
+  printf '   status shows no inprogress= entries, confirm with ./mcrepo.sh resolve that nothing is\n'
+  printf '   left, then run ./mcrepo.sh push to publish (it only force-with-leases branches that are\n'
+  printf '   provably my own rebase and refuses genuinely diverged remotes).\n'
+  printf '\nHard rules: never run `git push --force`, `git reset --hard`, `git rebase --skip`, or\n'
+  printf 'wholesale `git checkout --ours/--theirs`, and never delete branches or stashes on your\n'
+  printf 'own. If one of those seems necessary, stop and ask me first. Commits are allowed ONLY to\n'
+  printf 'finish a paused merge/rebase or a repair commit these instructions name; new feature work\n'
+  printf 'stays user-driven.\n'
+}
+
+print_agent_recovery_prompt() {
+  {
+    printf '\n'
+    printf 'Need help resolving this? Paste the prompt between the lines below to your local coding agent:\n'
+    printf -- '------------------------------------------------------------\n'
+    _emit_agent_prompt_body "$@"
+    printf -- '------------------------------------------------------------\n'
+  } >&2
 }
 
 generate_commit_message() {
@@ -3521,13 +3684,24 @@ generate_commit_message() {
 
 # --- Coordinated-commit helpers (shared by cmd_commit, cmd_merge, cmd_branch) ---
 
-mcrepo_new_batch_id() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+# Batch id: UTC timestamp + short random suffix. The suffix keeps two batches
+# created in the same second (or by parallel invocations) distinguishable —
+# the batch id is the identity that groups a coordinated commit for revert.
+mcrepo_new_batch_id() { printf '%s-%04x' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$((RANDOM ^ $$))"; }
 
+# Next coordinated-commit number: max #N reachable from HEAD across ALL given
+# repo dirs, + 1. Counting only the meta-context (the old behavior) reused N
+# whenever a batch touched no meta files. Defaults to "." when no dirs given.
 mcrepo_next_seq() {
-  local count
-  count="$(git -C . log --format='%s' 2>/dev/null | grep -c '^mcrepo commit #' || true)"
-  [ -z "$count" ] && count=0
-  printf '%d' "$((count + 1))"
+  local max=0 dir n
+  [ "$#" -gt 0 ] || set -- .
+  for dir in "$@"; do
+    n="$(git -C "$dir" log --format='%s' 2>/dev/null \
+      | sed -n 's/^mcrepo commit #\([0-9][0-9]*\) @.*/\1/p' \
+      | sort -rn | head -1)"
+    [ -n "$n" ] && [ "$n" -gt "$max" ] && max="$n"
+  done
+  printf '%d' "$((max + 1))"
 }
 
 mcrepo_commit_subject() {
@@ -3625,9 +3799,11 @@ cmd_status() {
       [ -n "$upstream" ] && extras="$extras upstream=$upstream"
       inprogress="$(repo_inprogress_state "$repo_dir")"
       [ -n "$inprogress" ] && extras="$extras inprogress=$inprogress"
-      local stash_count
+      local stash_count mstash_count
       stash_count="$(git -C "$repo_dir" stash list 2>/dev/null | grep -c . || true)"
       [ "${stash_count:-0}" -gt 0 ] && extras="$extras stash=$stash_count"
+      mstash_count="$(repo_mcrepo_stash_count "$repo_dir")"
+      [ "${mstash_count:-0}" -gt 0 ] && extras="$extras mcrepo-stash=$mstash_count"
       if [ -n "$GLOBAL_BRANCH" ] && [ "${REPO_MODES[$i]}" != "sleep" ] && [ -n "$branch" ] && [ "$branch" != "$GLOBAL_BRANCH" ]; then
         extras="$extras OFF-GLOBAL"
       fi
@@ -3649,9 +3825,11 @@ cmd_status() {
     [ -n "$meta_upstream" ] && meta_extras="$meta_extras upstream=$meta_upstream"
     meta_inprogress="$(repo_inprogress_state ".")"
     [ -n "$meta_inprogress" ] && meta_extras="$meta_extras inprogress=$meta_inprogress"
-    local meta_stash_count
+    local meta_stash_count meta_mstash_count
     meta_stash_count="$(git -C . stash list 2>/dev/null | grep -c . || true)"
     [ "${meta_stash_count:-0}" -gt 0 ] && meta_extras="$meta_extras stash=$meta_stash_count"
+    meta_mstash_count="$(repo_mcrepo_stash_count ".")"
+    [ "${meta_mstash_count:-0}" -gt 0 ] && meta_extras="$meta_extras mcrepo-stash=$meta_mstash_count"
     if [ -n "$GLOBAL_BRANCH" ] && [ -n "$meta_branch" ] && [ "$meta_branch" != "$GLOBAL_BRANCH" ]; then
       meta_extras="$meta_extras OFF-GLOBAL"
     fi
@@ -3660,7 +3838,8 @@ cmd_status() {
 }
 
 # Resume or abort a single repo's mid-operation. action is "continue" or "abort".
-# Returns 0 if a state was handled, 1 if no in-progress state was found.
+# Returns 0 = handled cleanly, 1 = no in-progress state found,
+#         2 = handled but the repo is still stuck (conflicts remain).
 _resume_inprogress() {
   local repo_dir="$1"
   local repo_name="$2"
@@ -3670,23 +3849,39 @@ _resume_inprogress() {
   case "$state" in
     MERGING)
       log "  $repo_name: git merge --$action"
-      git -C "$repo_dir" merge "--$action" || warn "merge --$action failed in '$repo_name' (see git output above)"
-      return 0
+      if git -C "$repo_dir" merge "--$action"; then return 0; fi
+      warn "merge --$action failed in '$repo_name' (see git output above)"
+      return 2
       ;;
     REBASING)
       log "  $repo_name: git rebase --$action"
-      git -C "$repo_dir" rebase "--$action" || warn "rebase --$action failed in '$repo_name' (see git output above)"
-      return 0
+      if git -C "$repo_dir" rebase "--$action"; then return 0; fi
+      warn "rebase --$action failed in '$repo_name' (see git output above)"
+      return 2
       ;;
     CHERRY-PICKING)
       log "  $repo_name: git cherry-pick --$action"
-      git -C "$repo_dir" cherry-pick "--$action" || warn "cherry-pick --$action failed in '$repo_name' (see git output above)"
-      return 0
+      if git -C "$repo_dir" cherry-pick "--$action"; then return 0; fi
+      warn "cherry-pick --$action failed in '$repo_name' (see git output above)"
+      return 2
       ;;
     REVERTING)
       log "  $repo_name: git revert --$action"
-      git -C "$repo_dir" revert "--$action" || warn "revert --$action failed in '$repo_name' (see git output above)"
-      return 0
+      if git -C "$repo_dir" revert "--$action"; then return 0; fi
+      warn "revert --$action failed in '$repo_name' (see git output above)"
+      return 2
+      ;;
+    CONFLICTED)
+      # Unmerged files with no op marker: squash-merge or stash-pop conflict.
+      if [ "$action" = "abort" ]; then
+        log "  $repo_name: git reset --merge (dropping unmerged entries; stashes are preserved)"
+        git -C "$repo_dir" reset --merge || warn "reset --merge failed in '$repo_name' (see git output above)"
+        return 0
+      fi
+      warn "$repo_name: unmerged files but no merge/rebase in progress (squash-merge or stash-pop conflict):"
+      git -C "$repo_dir" diff --name-only --diff-filter=U 2>/dev/null | sed 's/^/    /' >&2 || true
+      warn "  Resolve them, 'git -C $repo_dir add' the files, then finish per 'mcrepo resolve'."
+      return 2
       ;;
     *)
       return 1
@@ -3694,28 +3889,168 @@ _resume_inprogress() {
   esac
 }
 
-# Iterate write+read repos plus meta-context, applying continue/abort to any
-# repo that is mid-merge, mid-rebase, mid-cherry-pick, or mid-revert.
-_iterate_inprogress() {
-  local action="$1"
-  load_repos
-  local handled=0 i repo_dir
+# After continue/abort handled the git-native states, surface leftover mcrepo
+# stashes ("mcrepo: carry to ...", "mcrepo: auto-stash before rebase") in repos
+# that are no longer mid-operation. Never auto-pop/auto-drop: git state alone
+# cannot tell "still needs popping" from "popped with conflict, already
+# applied". Increments the global _INPROGRESS_HANDLED per repo surfaced.
+_finalize_mcrepo_stashes() {
+  local i repo_dir count
+  local -a names=() dirs=()
   for i in "${!REPO_NAMES[@]}"; do
     [ "${REPO_MODES[$i]}" != "sleep" ] || continue
     repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
     [ -d "$repo_dir/.git" ] || continue
-    if _resume_inprogress "$repo_dir" "${REPO_NAMES[$i]}" "$action"; then
-      handled=$((handled + 1))
+    names+=("${REPO_NAMES[$i]}")
+    dirs+=("$repo_dir")
+  done
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    names+=("(meta-context)")
+    dirs+=(".")
+  fi
+  for i in "${!names[@]}"; do
+    [ -z "$(repo_inprogress_state "${dirs[$i]}")" ] || continue
+    count="$(repo_mcrepo_stash_count "${dirs[$i]}")"
+    [ "${count:-0}" -gt 0 ] || continue
+    _INPROGRESS_HANDLED=$((_INPROGRESS_HANDLED + 1))
+    warn "${names[$i]}: $count leftover mcrepo stash(es):"
+    git -C "${dirs[$i]}" stash list 2>/dev/null | grep 'mcrepo:' | sed 's/^/    /' >&2 || true
+    if confirm "  Pop the top stash in '${names[$i]}' now (drop it instead if its changes were already applied)?" n; then
+      if git -C "${dirs[$i]}" stash pop; then
+        log "  ${names[$i]}: stash popped"
+      else
+        warn "  Stash pop conflicted in '${names[$i]}'. Resolve, 'git -C ${dirs[$i]} add', then 'git -C ${dirs[$i]} stash drop'."
+      fi
+    else
+      warn "  Left as-is. Apply with 'git -C ${dirs[$i]} stash pop' or discard with 'git -C ${dirs[$i]} stash drop'."
+    fi
+  done
+}
+
+# Iterate write+read repos plus meta-context, applying continue/abort to any
+# repo that is mid-merge, mid-rebase, mid-cherry-pick, mid-revert, or holding
+# marker-less conflicts (CONFLICTED). Returns 2 while conflicts remain.
+_iterate_inprogress() {
+  local action="$1"
+  load_repos
+  _INPROGRESS_HANDLED=0
+  local rc i repo_dir
+  local -a still_stuck=()
+  for i in "${!REPO_NAMES[@]}"; do
+    [ "${REPO_MODES[$i]}" != "sleep" ] || continue
+    repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
+    [ -d "$repo_dir/.git" ] || continue
+    rc=0
+    _resume_inprogress "$repo_dir" "${REPO_NAMES[$i]}" "$action" || rc=$?
+    if [ "$rc" -ne 1 ]; then
+      _INPROGRESS_HANDLED=$((_INPROGRESS_HANDLED + 1))
+      [ "$rc" -eq 2 ] && still_stuck+=("${REPO_NAMES[$i]}|$repo_dir")
     fi
   done
   if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    if _resume_inprogress "." "(meta-context)" "$action"; then
-      handled=$((handled + 1))
+    rc=0
+    _resume_inprogress "." "(meta-context)" "$action" || rc=$?
+    if [ "$rc" -ne 1 ]; then
+      _INPROGRESS_HANDLED=$((_INPROGRESS_HANDLED + 1))
+      [ "$rc" -eq 2 ] && still_stuck+=("(meta-context)|.")
     fi
   fi
-  if [ "$handled" -eq 0 ]; then
+  _finalize_mcrepo_stashes
+  if [ "$_INPROGRESS_HANDLED" -eq 0 ]; then
     log "No repository is mid-merge / mid-rebase / mid-cherry-pick / mid-revert."
+    return 0
   fi
+  if [ "${#still_stuck[@]}" -gt 0 ]; then
+    warn "Conflicts remain in: $(printf '%s ' "${still_stuck[@]%%|*}")"
+    warn "Run 'mcrepo resolve' for a paste-ready coding-agent prompt."
+    if [ "$action" = "continue" ]; then
+      scan_stuck_states
+      print_stuck_prompts stderr
+    fi
+    return 2
+  fi
+  return 0
+}
+
+# Scan all active repos + meta-context for stuck states. Fills the parallel
+# arrays STUCK_NAMES / STUCK_DIRS / STUCK_KINDS / STUCK_SITS, where kind is a
+# repo_inprogress_state value or MCREPO-STASH, and sit is the matching
+# _emit_agent_prompt_body situation id.
+scan_stuck_states() {
+  STUCK_NAMES=()
+  STUCK_DIRS=()
+  STUCK_KINDS=()
+  STUCK_SITS=()
+  local i repo_dir
+  local -a names=() dirs=()
+  for i in "${!REPO_NAMES[@]}"; do
+    [ "${REPO_MODES[$i]}" != "sleep" ] || continue
+    repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
+    [ -d "$repo_dir/.git" ] || continue
+    names+=("${REPO_NAMES[$i]}")
+    dirs+=("$repo_dir")
+  done
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    names+=("(meta-context)")
+    dirs+=(".")
+  fi
+  local kind sit mstash
+  for i in "${!names[@]}"; do
+    kind="$(repo_inprogress_state "${dirs[$i]}")"
+    mstash="$(repo_mcrepo_stash_count "${dirs[$i]}")"
+    if [ -z "$kind" ]; then
+      [ "${mstash:-0}" -gt 0 ] || continue
+      kind="MCREPO-STASH"
+    fi
+    case "$kind" in
+      REBASING) sit="rebase-conflict" ;;
+      MERGING|CHERRY-PICKING|REVERTING|BISECTING) sit="merge-conflict" ;;
+      CONFLICTED)
+        if git -C "${dirs[$i]}" stash list 2>/dev/null | grep -q 'mcrepo: carry to '; then
+          sit="carry-conflict"
+        elif [ "${mstash:-0}" -gt 0 ]; then
+          sit="stash-conflict"
+        else
+          sit="merge-conflict"
+        fi
+        ;;
+      MCREPO-STASH)
+        if git -C "${dirs[$i]}" stash list 2>/dev/null | grep -q 'mcrepo: carry to '; then
+          sit="carry-conflict"
+        else
+          sit="stash-conflict"
+        fi
+        ;;
+      *) sit="merge-conflict" ;;
+    esac
+    STUCK_NAMES+=("${names[$i]}")
+    STUCK_DIRS+=("${dirs[$i]}")
+    STUCK_KINDS+=("$kind")
+    STUCK_SITS+=("$sit")
+  done
+}
+
+# Group the STUCK_* entries by situation and print one agent prompt per group.
+# mode "stdout": raw prompt bodies to stdout (the 'mcrepo resolve' contract).
+# mode "stderr": framed prompts via print_agent_recovery_prompt.
+print_stuck_prompts() {
+  local mode="$1"
+  local sit i first=1
+  for sit in rebase-conflict merge-conflict stash-conflict carry-conflict; do
+    local -a entries=()
+    for i in "${!STUCK_SITS[@]}"; do
+      [ "${STUCK_SITS[$i]}" = "$sit" ] || continue
+      entries+=("${STUCK_NAMES[$i]}|${STUCK_DIRS[$i]}")
+    done
+    [ "${#entries[@]}" -gt 0 ] || continue
+    if [ "$mode" = "stdout" ]; then
+      [ "$first" -eq 1 ] || printf '\n============================================================\n\n'
+      first=0
+      _emit_agent_prompt_body "$sit" "${entries[@]}"
+    else
+      print_agent_recovery_prompt "$sit" "${entries[@]}"
+    fi
+  done
 }
 
 cmd_continue() {
@@ -3730,6 +4065,31 @@ cmd_abort() {
     die "Unknown abort option: $1"
   fi
   _iterate_inprogress abort
+}
+
+# Read-only diagnosis: report every stuck repo (mid-operation, marker-less
+# conflicts, leftover mcrepo stashes) and print the matching paste-ready
+# coding-agent prompt(s) on stdout ('mcrepo resolve | pbcopy' works).
+cmd_resolve() {
+  if [ "$#" -gt 0 ]; then
+    die "Unknown resolve option: $1"
+  fi
+  load_repos
+  scan_stuck_states
+  if [ "${#STUCK_NAMES[@]}" -eq 0 ]; then
+    log "Nothing to resolve - no repo is mid-operation, conflicted, or holding mcrepo stashes." >&2
+    return 0
+  fi
+  {
+    log "Stuck repos:"
+    local i
+    for i in "${!STUCK_NAMES[@]}"; do
+      printf '  %-20s %-13s (cd %s)\n' "${STUCK_NAMES[$i]}" "${STUCK_KINDS[$i]}" "${STUCK_DIRS[$i]}"
+    done
+    log ""
+    log "Paste the prompt below to your local coding agent (or pipe: mcrepo resolve | pbcopy):"
+  } >&2
+  print_stuck_prompts stdout
 }
 
 # Guard for 'pull --reset': a hard reset that would discard COMMITTED work
@@ -3887,6 +4247,7 @@ cmd_pull() {
   local -a updated_repos=()
   local -a fetch_only_repos=()
   local -a stash_conflict_repos=()
+  local -a stash_conflict_entries=()   # name|dir (for the agent recovery prompt)
   local -a failed_repos=()
   local -a diverged_rebased=()   # safe-force: rebased locally, just needs publishing
   local -a diverged_conflict=()  # remote-work: needs human/agent review
@@ -3953,8 +4314,9 @@ cmd_pull() {
       if run_with_repo_prefix "$rn" git -C "$rd" pull --ff-only; then
         if [ "$stashed" -eq 1 ]; then
           if ! git -C "$rd" stash pop 2>/dev/null; then
-            warn "Stash pop conflict in '$rn'. Stash preserved — resolve manually with: cd $rd && git stash pop"
+            warn "Stash pop conflict in '$rn'. Stash preserved — resolve, 'git -C $rd add', then 'git -C $rd stash drop'."
             stash_conflict_repos+=("$rn")
+            stash_conflict_entries+=("$rn|$rd")
             continue
           fi
         fi
@@ -4018,8 +4380,9 @@ cmd_pull() {
       if run_with_repo_prefix "(meta-context)" git -C . pull --ff-only; then
         if [ "$meta_stashed" -eq 1 ]; then
           if ! git -C . stash pop 2>/dev/null; then
-            warn "Stash pop conflict in (meta-context). Resolve manually: git stash pop"
+            warn "Stash pop conflict in (meta-context). Resolve, 'git add', then 'git stash drop'."
             stash_conflict_repos+=("(meta-context)")
+            stash_conflict_entries+=("(meta-context)|.")
           else
             updated_repos+=("(meta-context)")
           fi
@@ -4090,7 +4453,7 @@ cmd_pull() {
   if [ "${#diverged_rebased[@]}" -gt 0 ]; then
     log ""
     log "These branches were rebased locally and just need publishing — this is expected after"
-    log "'mcrepo merge --rebase', NOT remote work from another machine. They can't fast-forward because"
+    log "'mcrepo sync', NOT remote work from another machine. They can't fast-forward because"
     log "the rebase rewrote their commit hashes. Run 'mcrepo push' to publish them (it will safely"
     log "force-with-lease the rebased branches):"
     local dr2
@@ -4108,6 +4471,10 @@ cmd_pull() {
       log "  - ${dc2%%|*}"
     done
     print_agent_recovery_prompt ambiguous-divergence "${diverged_conflict[@]}"
+  fi
+
+  if [ "${#stash_conflict_entries[@]}" -gt 0 ]; then
+    print_agent_recovery_prompt stash-conflict "${stash_conflict_entries[@]}"
   fi
 
   # Exit-code contract: 0 = success, 2 = partial per-repo failure.
@@ -4163,9 +4530,35 @@ _commit_forward() {
     return 0
   fi
 
+  # Branch-alignment warning (not a blocker): committing on the wrong branch
+  # makes the batch hard to merge/revert later; revert refuses cross-branch.
+  if [ -n "$GLOBAL_BRANCH" ]; then
+    local -a off_branch=()
+    local ob_branch
+    for i in "${!dirty_dirs[@]}"; do
+      ob_branch="$(repo_branch "${dirty_dirs[$i]}")"
+      if [ -n "$ob_branch" ] && [ "$ob_branch" != "$GLOBAL_BRANCH" ]; then
+        off_branch+=("${dirty_names[$i]} (on '$ob_branch')")
+      fi
+    done
+    if [ "$meta_dirty" -eq 1 ]; then
+      ob_branch="$(repo_branch ".")"
+      if [ -n "$ob_branch" ] && [ "$ob_branch" != "$GLOBAL_BRANCH" ]; then
+        off_branch+=("(meta-context) (on '$ob_branch')")
+      fi
+    fi
+    if [ "${#off_branch[@]}" -gt 0 ]; then
+      warn "Global branch is '$GLOBAL_BRANCH' but these repos are elsewhere: ${off_branch[*]}"
+      warn "The commit proceeds, but consider 'mcrepo branch $GLOBAL_BRANCH' to re-align first."
+    fi
+  fi
+
   local batch seq subject
   batch="$(mcrepo_new_batch_id)"
-  seq="$(mcrepo_next_seq)"
+  local -a seq_dirs=()
+  seq_dirs=("${dirty_dirs[@]+"${dirty_dirs[@]}"}")
+  [ "$meta_dirty" -eq 1 ] && seq_dirs+=(".")
+  seq="$(mcrepo_next_seq "${seq_dirs[@]+"${seq_dirs[@]}"}")"
   subject="$(mcrepo_commit_subject "$seq" "$batch" "$user_msg")"
 
   log ""
@@ -4185,18 +4578,22 @@ _commit_forward() {
     return 0
   fi
 
-  local had_failure=0
+  local -a commit_fail_entries=()
   if [ "${#dirty_dirs[@]}" -gt 0 ]; then
     for i in "${!dirty_dirs[@]}"; do
-      mcrepo_do_commit "${dirty_dirs[$i]}" "${dirty_names[$i]}" "$subject" || had_failure=1
+      mcrepo_do_commit "${dirty_dirs[$i]}" "${dirty_names[$i]}" "$subject" || \
+        commit_fail_entries+=("${dirty_names[$i]}|${dirty_dirs[$i]}")
     done
   fi
   if [ "$meta_dirty" -eq 1 ]; then
-    mcrepo_do_commit "." "(meta-context)" "$subject" || had_failure=1
+    mcrepo_do_commit "." "(meta-context)" "$subject" || \
+      commit_fail_entries+=("(meta-context)|.")
   fi
 
-  if [ "$had_failure" -eq 1 ]; then
-    warn "One or more commits failed. Inspect repos and resolve manually."
+  if [ "${#commit_fail_entries[@]}" -gt 0 ]; then
+    warn "One or more commits failed. The batch is incomplete — finish it with the SAME subject."
+    MCREPO_RECOVERY_CONTEXT="Coordinated commit subject (use verbatim): $subject"
+    print_agent_recovery_prompt partial-commit "${commit_fail_entries[@]}"
     return 1
   fi
   log "Coordinated commit #$seq complete."
@@ -6364,7 +6761,7 @@ cmd_branch() {
     if [ "$dirty_action" = "commit" ]; then
       local _bb _bs _bsubj
       _bb="$(mcrepo_new_batch_id)"
-      _bs="$(mcrepo_next_seq)"
+      _bs="$(mcrepo_next_seq "${dirty_repo_dirs[@]+"${dirty_repo_dirs[@]}"}")"
       _bsubj="$(mcrepo_commit_subject "$_bs" "$_bb" "pre-branch-switch to $branch_name")"
       log "Coordinated commit #$_bs before switching ..."
       for ddir in "${dirty_repo_dirs[@]}"; do
@@ -6556,19 +6953,25 @@ cmd_branch() {
   done
   [ "$meta_is_target" -eq 1 ] && carry_scan_dirs+=(".")
   local restored_any=0
+  local -a carry_fail_entries=()
   for ddir in "${carry_scan_dirs[@]}"; do
     local stash_msg
     stash_msg="$(git -C "$ddir" stash list -1 2>/dev/null | head -1)"
     if echo "$stash_msg" | grep -q "mcrepo: carry to $branch_name"; then
       [ "$restored_any" -eq 1 ] || log "Restoring carried changes ..."
       restored_any=1
-      if ! git -C "$ddir" stash pop 2>/dev/null; then
-        warn "Stash pop had issues in '$ddir'. Run 'git -C $ddir stash pop' manually or 'git -C $ddir stash drop' to discard."
+      if ! git -C "$ddir" stash pop; then
+        warn "Stash pop had issues in '$ddir'. Resolve the conflicted files, 'git -C $ddir add' them, then 'git -C $ddir stash drop'."
+        carry_fail_entries+=("$ddir|$ddir")
       else
         log "  Restored in $ddir"
       fi
     fi
   done
+  if [ "${#carry_fail_entries[@]}" -gt 0 ]; then
+    MCREPO_RECOVERY_CONTEXT="Stash name: mcrepo: carry to $branch_name"
+    print_agent_recovery_prompt carry-conflict "${carry_fail_entries[@]}"
+  fi
 
   GLOBAL_BRANCH="$branch_name"
   trap - EXIT
@@ -6817,16 +7220,107 @@ cmd_branch_delete() {
   fi
 }
 
+# A branch is "synced" when it already contains its parent tip — then the
+# merge back into the parent can never conflict. Checks local <parent> AND
+# origin/<parent> (after a best-effort fetch); returns 1 when either is ahead.
+_merge_repo_synced() {
+  local dir="$1" parent="$2"
+  if git -C "$dir" remote get-url origin >/dev/null 2>&1; then
+    git -C "$dir" fetch origin "$parent" --quiet 2>/dev/null || true
+  fi
+  if git -C "$dir" show-ref --verify --quiet "refs/heads/$parent"; then
+    git -C "$dir" merge-base --is-ancestor "$parent" HEAD 2>/dev/null || return 1
+  fi
+  if git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$parent"; then
+    git -C "$dir" merge-base --is-ancestor "origin/$parent" HEAD 2>/dev/null || return 1
+  fi
+  return 0
+}
+
+# Roll a repo back to exactly its pre-merge state after a failed merge attempt:
+# abort any in-progress merge, clear staged/unmerged squash leftovers, return
+# to the source branch. Best-effort; warns when residue remains.
+_merge_rollback_repo() {
+  local dir="$1" name="$2" source_branch="$3"
+  if git -C "$dir" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+    git -C "$dir" merge --abort 2>/dev/null || true
+  fi
+  # Failed squash-merge (unmerged entries) or failed squash-commit (staged
+  # diff): both are reproducible from the source branch, so dropping is safe.
+  git -C "$dir" reset --merge 2>/dev/null || git -C "$dir" reset --hard HEAD 2>/dev/null || true
+  git -C "$dir" checkout "$source_branch" 2>/dev/null || \
+    warn "  $name: could not switch back to '$source_branch' — check manually."
+  if [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]; then
+    warn "  $name: rollback left residue in the working tree — check manually."
+  fi
+}
+
+# Merge $source_branch into $target inside one repo. On success the repo sits
+# on $target with the merge committed. On any failure the repo is rolled back
+# to its pre-merge state on $source_branch and the function returns 1.
+_merge_execute_one() {
+  local dir="$1" name="$2" target="$3" source_branch="$4" do_squash="$5" commit_message="$6"
+  if ! git -C "$dir" checkout "$target"; then
+    warn "  $name: could not check out '$target'."
+    return 1
+  fi
+  # Fast-forward the local parent to origin/<parent> when it is simply behind,
+  # so the merge lands on the same history 'mcrepo sync' rebased onto —
+  # otherwise the parent gets the remote changes as content but not ancestry,
+  # and push later reports phantom divergence.
+  if git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$target"; then
+    git -C "$dir" merge --ff-only "origin/$target" >/dev/null 2>&1 || true
+  fi
+  if [ "$do_squash" -eq 1 ]; then
+    local subject="${commit_message:-$source_branch}"
+    if ! git -C "$dir" merge --squash "$source_branch"; then
+      _merge_rollback_repo "$dir" "$name" "$source_branch"
+      return 1
+    fi
+    if git -C "$dir" diff --cached --quiet; then
+      log "  Already up to date."
+    else
+      if ! git -C "$dir" commit -m "$subject"; then
+        _merge_rollback_repo "$dir" "$name" "$source_branch"
+        return 1
+      fi
+      log "  Done."
+    fi
+  else
+    local nf_subject="${commit_message:-Merge branch '$source_branch' into $target}"
+    if ! git -C "$dir" merge --no-ff "$source_branch" -m "$nf_subject"; then
+      _merge_rollback_repo "$dir" "$name" "$source_branch"
+      return 1
+    fi
+    log "  Done."
+  fi
+  return 0
+}
+
+# EXIT trap during merge execution: persist the manifest (stacks popped so far)
+# and tell the user how to resume when the run was interrupted mid-loop.
+_MERGE_DONE_COUNT=0
+_merge_exit_trap() {
+  save_repos
+  if [ "${_MERGE_DONE_COUNT:-0}" -gt 0 ]; then
+    warn "merge interrupted after ${_MERGE_DONE_COUNT} repo(s) — re-run 'mcrepo merge' to finish the rest."
+  fi
+}
+
 # Merge the global branch into each write-repo's parent branch (local only, no push).
-# Dispatches to cmd_merge_rebase() when --rebase is given.
+# '--rebase' is a deprecated alias for 'mcrepo sync' (rebase onto parent).
 #
 # Default strategy is squash: collapses all commits on the source branch into a single
 # commit on the parent, with the branch name as the default subject. Use --no-squash
 # to fall back to the legacy `git merge --no-ff` behavior.
 #
-# Workflow: pre-flight → dry-run → execute → update parent stacks.
-# If dry-run detects conflicts, aborts and suggests 'merge --rebase'.
-# After merge, pops each repo's parent stack one level (nested branch support).
+# Workflow: pre-flight → sync gate → dry-run → execute → update parent stacks.
+# The sync gate requires each repo's branch to already contain its parent tip
+# (run 'mcrepo sync' first), so the merge itself cannot conflict. Repos not on
+# the source branch are skipped (already merged or manually switched), which
+# makes re-running 'mcrepo merge' the resume path after a partial failure: a
+# failed repo is rolled back to the source branch, the rest keep merging, and
+# each successful repo's parent stack is popped immediately.
 cmd_merge() {
   local do_rebase=0
   local do_squash=1
@@ -6854,7 +7348,8 @@ cmd_merge() {
   local source_branch="$GLOBAL_BRANCH"
 
   if [ "$do_rebase" -eq 1 ]; then
-    cmd_merge_rebase "$source_branch"
+    warn "Deprecation: 'mcrepo merge --rebase' is now 'mcrepo sync' (same behavior)."
+    _sync_run "$source_branch" "$include_read"
     return $?
   fi
 
@@ -6871,6 +7366,7 @@ cmd_merge() {
   local -a merge_parents=()
   local -a preflight_errors=()
   local -a wrong_branch_actuals=()
+  local -a skipped_names=()
   local -a dirty_repos=()
   local -a dirty_repo_dirs=()
 
@@ -6902,12 +7398,15 @@ cmd_merge() {
       continue
     fi
 
-    # Verify repo is on GLOBAL_BRANCH
+    # A repo not on the source branch is skipped, not an error: it was already
+    # merged by a previous (partial) run or manually switched. Merge only what
+    # is actually on the branch; die later only if nothing is left.
     local actual_branch
     actual_branch="$(repo_branch "$repo_dir")"
     if [ "$actual_branch" != "$source_branch" ]; then
-      preflight_errors+=("'$repo_name' is on branch '$actual_branch', expected '$source_branch'.")
+      skipped_names+=("$repo_name (on '$actual_branch')")
       wrong_branch_actuals+=("$actual_branch")
+      continue
     fi
 
     # Verify parent branch exists locally
@@ -6948,13 +7447,15 @@ cmd_merge() {
       local meta_actual
       meta_actual="$(repo_branch ".")"
       if [ "$meta_actual" != "$source_branch" ]; then
-        preflight_errors+=("meta-context repo is on branch '$meta_actual', expected '$source_branch'.")
+        skipped_names+=("(meta-context) (on '$meta_actual')")
+        wrong_branch_actuals+=("$meta_actual")
+      else
+        if [ -n "$(git -C . status --porcelain 2>/dev/null)" ]; then
+          dirty_repos+=("meta-context repo (.)")
+          dirty_repo_dirs+=(".")
+        fi
+        meta_included=1
       fi
-      if [ -n "$(git -C . status --porcelain 2>/dev/null)" ]; then
-        dirty_repos+=("meta-context repo (.)")
-        dirty_repo_dirs+=(".")
-      fi
-      meta_included=1
     fi
   fi
 
@@ -6977,7 +7478,7 @@ cmd_merge() {
       commit)
         local _mb _ms _msubj
         _mb="$(mcrepo_new_batch_id)"
-        _ms="$(mcrepo_next_seq)"
+        _ms="$(mcrepo_next_seq "${dirty_repo_dirs[@]+"${dirty_repo_dirs[@]}"}")"
         _msubj="$(mcrepo_commit_subject "$_ms" "$_mb" "pre-merge stopping point")"
         log "Creating coordinated commit #$_ms @$_mb before merge."
         local _md
@@ -6994,7 +7495,19 @@ cmd_merge() {
     for err in "${preflight_errors[@]}"; do
       log "  - $err"
     done
+    die "Fix the above issues and try again."
+  fi
 
+  if [ "${#skipped_names[@]}" -gt 0 ]; then
+    log ""
+    log "Skipping repos not on '$source_branch' (already merged or manually switched):"
+    local sk
+    for sk in "${skipped_names[@]}"; do
+      log "  - $sk"
+    done
+  fi
+
+  if [ "${#merge_indexes[@]}" -eq 0 ] && [ "$meta_included" -eq 0 ]; then
     if [ "${#wrong_branch_actuals[@]}" -gt 0 ]; then
       local common="${wrong_branch_actuals[0]}"
       local all_same_actual=1
@@ -7002,7 +7515,7 @@ cmd_merge() {
       for wa in "${wrong_branch_actuals[@]}"; do
         if [ "$wa" != "$common" ]; then all_same_actual=0; break; fi
       done
-      if [ "$all_same_actual" -eq 1 ]; then
+      if [ "$all_same_actual" -eq 1 ] && [ "$common" != "$source_branch" ]; then
         log ""
         log "Hint: all repos are on '$common' but mcrepo.yaml says 'branch: $source_branch'."
         log "  If '$common' is the branch you want to merge, run:"
@@ -7010,12 +7523,25 @@ cmd_merge() {
         log "  to re-align the coordinated branch state, then retry 'mcrepo merge'."
       fi
     fi
-
-    die "Fix the above issues and try again."
+    die "No repos on branch '$source_branch' to merge."
   fi
 
-  if [ "${#merge_indexes[@]}" -eq 0 ] && [ "$meta_included" -eq 0 ]; then
-    die "No repos found to merge."
+  # Sync gate (strict two-step model): every participating branch must already
+  # contain its parent tip, so the merge itself cannot conflict. Conflicts are
+  # resolved on the feature branch via 'mcrepo sync', never during the merge.
+  local -a unsynced_names=()
+  local sidx
+  for sidx in "${!merge_indexes[@]}"; do
+    _merge_repo_synced "${merge_dirs[$sidx]}" "${merge_parents[$sidx]}" || \
+      unsynced_names+=("${REPO_NAMES[${merge_indexes[$sidx]}]}")
+  done
+  if [ "$meta_included" -eq 1 ]; then
+    _merge_repo_synced "." "$meta_parent_branch" || unsynced_names+=("(meta-context)")
+  fi
+  if [ "${#unsynced_names[@]}" -gt 0 ]; then
+    log ""
+    log "Branch '$source_branch' is behind its parent in: ${unsynced_names[*]}"
+    die "Run 'mcrepo sync' first — it rebases the branch onto each parent so this merge cannot conflict. Resolve any conflicts there (then 'mcrepo continue'), and re-run 'mcrepo merge'."
   fi
 
   if ! git_supports_merge_tree_write_tree; then
@@ -7092,14 +7618,35 @@ cmd_merge() {
     for cr in "${conflict_repos[@]}"; do
       log "  - $cr"
     done
-    die "Run 'mcrepo merge --rebase' to sync with parent branch and resolve conflicts first."
+    die "Run 'mcrepo sync' to rebase onto the parent branch and resolve conflicts first."
   fi
 
   log "All repos can merge cleanly."
 
-  # Phase 3: Execute merges
-  # Safety trap: save partial progress if the script aborts mid-loop.
-  trap 'save_repos' EXIT
+  # Phase 3: Execute merges (meta-context last, as the final array element).
+  # A failed repo is rolled back to the source branch and the loop keeps
+  # going; each successful repo's parent stack is popped immediately, so a
+  # partial merge is fully represented in the manifest and re-running
+  # 'mcrepo merge' finishes the rest.
+  local -a exec_names=()
+  local -a exec_dirs=()
+  local -a exec_parents=()
+  local -a exec_repo_idx=()   # REPO_* index, or "meta"
+  for idx in "${!merge_indexes[@]}"; do
+    exec_names+=("${REPO_NAMES[${merge_indexes[$idx]}]}")
+    exec_dirs+=("${merge_dirs[$idx]}")
+    exec_parents+=("${merge_parents[$idx]}")
+    exec_repo_idx+=("${merge_indexes[$idx]}")
+  done
+  if [ "$meta_included" -eq 1 ]; then
+    exec_names+=("(meta-context)")
+    exec_dirs+=(".")
+    exec_parents+=("$meta_parent_branch")
+    exec_repo_idx+=("meta")
+  fi
+
+  _MERGE_DONE_COUNT=0
+  trap '_merge_exit_trap' EXIT
 
   log ""
   log "=== Executing merges ==="
@@ -7114,94 +7661,78 @@ cmd_merge() {
   log "Strategy: $strategy_label"
   log ""
 
-  for idx in "${!merge_indexes[@]}"; do
-    local ri="${merge_indexes[$idx]}"
-    repo_name="${REPO_NAMES[$ri]}"
-    repo_dir="${merge_dirs[$idx]}"
-    local target="${merge_parents[$idx]}"
+  local -a merged_names=()
+  local -a failed_names=()
+  local -a failed_entries=()
+  local exec_i rid current_parent
+  for exec_i in "${!exec_names[@]}"; do
+    repo_name="${exec_names[$exec_i]}"
+    repo_dir="${exec_dirs[$exec_i]}"
+    local target="${exec_parents[$exec_i]}"
+    rid="${exec_repo_idx[$exec_i]}"
+
+    if [ "$rid" = "meta" ] && [ "${#failed_names[@]}" -gt 0 ]; then
+      warn "Skipping meta-context merge: ${#failed_names[@]} repo(s) failed — it merges on the next 'mcrepo merge' run."
+      continue
+    fi
 
     log "Merging in '$repo_name' ($source_branch -> $target) ..."
-    git -C "$repo_dir" checkout "$target"
-    if [ "$do_squash" -eq 1 ]; then
-      local subject="${commit_message:-$source_branch}"
-      if ! git -C "$repo_dir" merge --squash "$source_branch"; then
-        die "Squash-merge failed in '$repo_name'. Resolve conflicts manually."
-      fi
-      if git -C "$repo_dir" diff --cached --quiet; then
-        log "  Already up to date."
-      else
-        if ! git -C "$repo_dir" commit -m "$subject"; then
-          die "Squash commit failed in '$repo_name'."
+    if _merge_execute_one "$repo_dir" "$repo_name" "$target" "$source_branch" "$do_squash" "$commit_message"; then
+      merged_names+=("$repo_name")
+      _MERGE_DONE_COUNT=$((_MERGE_DONE_COUNT + 1))
+      # Pop this repo's parent stack now: "main,feature" → "main", "main" → "".
+      if [ "$rid" = "meta" ]; then
+        if [[ "$META_PARENT" == *,* ]]; then
+          META_PARENT="${META_PARENT%,*}"
+        else
+          META_PARENT=""
         fi
-        log "  Done."
+      else
+        current_parent="${REPO_PARENTS[$rid]:-}"
+        if [[ "$current_parent" == *,* ]]; then
+          REPO_PARENTS[$rid]="${current_parent%,*}"
+        else
+          REPO_PARENTS[$rid]=""
+        fi
       fi
     else
-      local nf_subject="${commit_message:-Merge branch '$source_branch' into $target}"
-      if ! git -C "$repo_dir" merge --no-ff "$source_branch" -m "$nf_subject"; then
-        die "Merge failed in '$repo_name'. Resolve conflicts manually."
-      fi
-      log "  Done."
+      failed_names+=("$repo_name")
+      failed_entries+=("$repo_name|$repo_dir")
+      warn "  $repo_name: merge failed — rolled back to '$source_branch'; continuing with the remaining repos."
     fi
   done
 
-  # Merge meta-context
-  if [ "$meta_included" -eq 1 ]; then
-    log "Merging in '(meta-context)' ($source_branch -> $meta_parent_branch) ..."
-    git -C . checkout "$meta_parent_branch"
-    if [ "$do_squash" -eq 1 ]; then
-      local meta_subject="${commit_message:-$source_branch}"
-      if ! git -C . merge --squash "$source_branch"; then
-        die "Squash-merge failed in meta-context repo. Resolve conflicts manually."
-      fi
-      if git -C . diff --cached --quiet; then
-        log "  Already up to date."
-      else
-        if ! git -C . commit -m "$meta_subject"; then
-          die "Squash commit failed in meta-context repo."
-        fi
-        log "  Done."
-      fi
-    else
-      local meta_nf_subject="${commit_message:-Merge branch '$source_branch' into $meta_parent_branch}"
-      if ! git -C . merge --no-ff "$source_branch" -m "$meta_nf_subject"; then
-        die "Merge failed in meta-context repo. Resolve conflicts manually."
-      fi
-      log "  Done."
+  if [ "${#failed_names[@]}" -gt 0 ]; then
+    # Partial merge: the feature branch stays active; merged repos already had
+    # their stacks popped, failed repos keep theirs and sit rolled-back on the
+    # source branch. Re-running 'mcrepo merge' skips the merged repos.
+    trap - EXIT
+    save_repos
+    log ""
+    log "=== Merge summary (PARTIAL) ==="
+    if [ "${#merged_names[@]}" -gt 0 ]; then
+      log "Merged: ${merged_names[*]}"
     fi
+    log "Failed: ${failed_names[*]}"
+    warn "Fix the failed repos, then re-run 'mcrepo merge' — already-merged repos are skipped automatically."
+    local merged_list="(none)"
+    [ "${#merged_names[@]}" -gt 0 ] && merged_list="${merged_names[*]}"
+    MCREPO_RECOVERY_CONTEXT="Failed repos were rolled back to '$source_branch'; their merges did not happen.
+Already merged onto their parent branch: $merged_list.
+After repairing the cause, re-run: ./mcrepo.sh merge"
+    print_agent_recovery_prompt merge-conflict "${failed_entries[@]}"
+    return 2
   fi
 
-  # Phase 4: Post-merge state update
-  # Pop each repo's parent stack one level. "main,feature" → "main", "main" → "".
-  for idx in "${!merge_indexes[@]}"; do
-    local ri="${merge_indexes[$idx]}"
-    local current_parent="${REPO_PARENTS[$ri]:-}"
-    if [[ "$current_parent" == *,* ]]; then
-      REPO_PARENTS[$ri]="${current_parent%,*}"
-    else
-      REPO_PARENTS[$ri]=""
-    fi
-  done
-
-  if [ "$meta_included" -eq 1 ]; then
-    if [[ "$META_PARENT" == *,* ]]; then
-      META_PARENT="${META_PARENT%,*}"
-    else
-      META_PARENT=""
-    fi
-  fi
-
-  # Determine new GLOBAL_BRANCH
-  local first_target="${merge_parents[0]:-}"
+  # Phase 4: Determine new GLOBAL_BRANCH (stacks were popped per-repo above)
+  local first_target="${exec_parents[0]:-}"
   local all_same=1
-  for idx in "${!merge_parents[@]}"; do
-    if [ "${merge_parents[$idx]}" != "$first_target" ]; then
+  for idx in "${!exec_parents[@]}"; do
+    if [ "${exec_parents[$idx]}" != "$first_target" ]; then
       all_same=0
       break
     fi
   done
-  if [ "$meta_included" -eq 1 ] && [ "$meta_parent_branch" != "$first_target" ]; then
-    all_same=0
-  fi
 
   if [ "$all_same" -eq 1 ] && [ -n "$first_target" ]; then
     GLOBAL_BRANCH="$first_target"
@@ -7259,10 +7790,9 @@ cmd_merge() {
   if [ "$do_delete" -eq 1 ]; then
     log ""
     log "Deleting '$source_branch' ..."
-    for idx in "${!merge_indexes[@]}"; do
-      local ri="${merge_indexes[$idx]}"
-      repo_name="${REPO_NAMES[$ri]}"
-      repo_dir="${merge_dirs[$idx]}"
+    for exec_i in "${!exec_names[@]}"; do
+      repo_name="${exec_names[$exec_i]}"
+      repo_dir="${exec_dirs[$exec_i]}"
       if [ "$do_squash" -eq 1 ]; then
         if git -C "$repo_dir" branch -D "$source_branch" 2>/dev/null; then
           log "  $repo_name: deleted (forced)."
@@ -7277,21 +7807,6 @@ cmd_merge() {
         fi
       fi
     done
-    if [ "$meta_included" -eq 1 ]; then
-      if [ "$do_squash" -eq 1 ]; then
-        if git -C . branch -D "$source_branch" 2>/dev/null; then
-          log "  (meta-context): deleted (forced)."
-        else
-          warn "  (meta-context): could not delete '$source_branch'."
-        fi
-      else
-        if git -C . branch -d "$source_branch" 2>/dev/null; then
-          log "  (meta-context): deleted."
-        else
-          warn "  (meta-context): could not safe-delete '$source_branch'. Run 'mcrepo branch --delete' to force."
-        fi
-      fi
-    fi
   fi
 
   log ""
@@ -7677,24 +8192,45 @@ cmd_pr() {
 # Processes ALL repos even if some conflict, giving a complete summary at the end.
 # On rebase conflict the stash is left untouched; on stash-pop conflict the stash
 # remains in the stack (user must 'git stash drop' after resolving).
-cmd_merge_rebase() {
+# Sync: rebase the current global branch onto each parent branch so the later
+# merge back into the parent is conflict-free. Auto-stashes dirty repos.
+# Implementation behind 'mcrepo sync' ('merge --rebase' is a deprecated alias).
+# The meta-context participates as the last element of the target arrays.
+# Sets SYNC_CONFLICTS to the number of repos left conflicted and returns 2
+# when any conflict remains, 0 otherwise.
+_sync_run() {
   local source_branch="$1"
+  local include_read="${2:-0}"
+  SYNC_CONFLICTS=0
 
   log ""
-  log "=== Rebase: syncing current branch onto parent branches ==="
+  log "=== Sync: rebasing current branch onto parent branches ==="
   log ""
 
   # Phase 1: Pre-flight
   local i mode repo_dir repo_name
-  local -a rebase_indexes=()
+  local -a rebase_names=()
   local -a rebase_dirs=()
   local -a rebase_parents=()
   local -a preflight_errors=()
+  local -a read_repos_skipped=()
 
   for i in "${!REPO_NAMES[@]}"; do
     mode="${REPO_MODES[$i]}"
-    [ "$mode" = "write" ] || continue
     repo_name="${REPO_NAMES[$i]}"
+    case "$mode" in
+      write) ;;
+      read)
+        if [ "$include_read" -ne 1 ]; then
+          repo_dir="$(get_repo_dir "$repo_name" "$mode")"
+          if [ -d "$repo_dir/.git" ] && [ "$(repo_branch "$repo_dir")" = "$source_branch" ]; then
+            read_repos_skipped+=("$repo_name")
+          fi
+          continue
+        fi
+        ;;
+      *) continue ;;
+    esac
     repo_dir="$(get_repo_dir "$repo_name" "$mode")"
     [ -d "$repo_dir/.git" ] || continue
 
@@ -7726,14 +8262,13 @@ cmd_merge_rebase() {
       continue
     fi
 
-    rebase_indexes+=("$i")
+    rebase_names+=("$repo_name")
     rebase_dirs+=("$repo_dir")
     rebase_parents+=("$parent_branch")
   done
 
-  # Meta-context pre-flight
+  # Meta-context pre-flight: joins the same target arrays as the Nth repo.
   local meta_parent_branch=""
-  local meta_included=0
   if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     if [ -n "$META_PARENT" ]; then
       meta_parent_branch="${META_PARENT##*,}"
@@ -7747,7 +8282,9 @@ cmd_merge_rebase() {
       if [ "$meta_actual" != "$source_branch" ]; then
         preflight_errors+=("meta-context repo is on branch '$meta_actual', expected '$source_branch'.")
       else
-        meta_included=1
+        rebase_names+=("(meta-context)")
+        rebase_dirs+=(".")
+        rebase_parents+=("$meta_parent_branch")
       fi
     fi
   fi
@@ -7761,12 +8298,16 @@ cmd_merge_rebase() {
     die "Fix the above issues and try again."
   fi
 
-  if [ "${#rebase_indexes[@]}" -eq 0 ] && [ "$meta_included" -eq 0 ]; then
+  if [ "${#read_repos_skipped[@]}" -gt 0 ]; then
+    warn "Read-mode repos on '$source_branch' will NOT be synced: ${read_repos_skipped[*]} — re-run with --include-read to include them."
+  fi
+
+  if [ "${#rebase_names[@]}" -eq 0 ]; then
     log "All repos are already in sync with their parent branches."
     return 0
   fi
 
-  # Phase 2: Fetch + stash + merge + pop per repo
+  # Phase 2: Fetch + stash + rebase + pop per repo (meta-context included)
   local -a clean_repos=()
   local -a merge_conflict_repos=()
   local -a stash_conflict_repos=()
@@ -7774,9 +8315,9 @@ cmd_merge_rebase() {
   local -a stash_conflict_entries=()   # name|dir
   local -a clean_entries=()            # name|dir (for post-rebase publish detection)
 
-  for idx in "${!rebase_indexes[@]}"; do
-    local ri="${rebase_indexes[$idx]}"
-    repo_name="${REPO_NAMES[$ri]}"
+  local idx
+  for idx in "${!rebase_names[@]}"; do
+    repo_name="${rebase_names[$idx]}"
     repo_dir="${rebase_dirs[$idx]}"
     local parent="${rebase_parents[$idx]}"
 
@@ -7839,67 +8380,9 @@ cmd_merge_rebase() {
     log "  Done."
   done
 
-  # Meta-context rebase
-  if [ "$meta_included" -eq 1 ]; then
-    local meta_has_origin=0
-    if git -C . remote get-url origin >/dev/null 2>&1; then
-      git -C . fetch origin --prune 2>/dev/null || true
-      meta_has_origin=1
-    fi
-
-    # Prefer origin/<parent> as the rebase target (freshest), else local <parent>
-    local meta_rebase_target="$meta_parent_branch"
-    if [ "$meta_has_origin" -eq 1 ] && git -C . show-ref --verify --quiet "refs/remotes/origin/$meta_parent_branch"; then
-      meta_rebase_target="origin/$meta_parent_branch"
-    fi
-
-    log "Rebasing '(meta-context)' ($source_branch onto $meta_rebase_target) ..."
-
-    local meta_did_stash=0
-    local meta_dirty
-    meta_dirty="$(git -C . status --porcelain 2>/dev/null)"
-    if [ -n "$meta_dirty" ]; then
-      git -C . stash push -m "mcrepo: auto-stash before rebase" --include-untracked
-      meta_did_stash=1
-    fi
-
-    if ! git -C . rebase "$meta_rebase_target"; then
-      merge_conflict_repos+=("(meta-context)")
-      merge_conflict_entries+=("(meta-context)|.")
-      warn "  Rebase conflicts in (meta-context). The conflict is between three sides:"
-      warn "    - local feature branch : $source_branch (your work)"
-      warn "    - parent target        : $meta_rebase_target (latest main being rebased onto)"
-      if git -C . show-ref --verify --quiet "refs/remotes/origin/$source_branch"; then
-        warn "    - stale remote branch  : origin/$source_branch (pre-rebase history, still on the server)"
-      fi
-      warn "    Conflicts may mix real feature work with mcrepo coordination commits (#N) — keep the intended final state."
-      if [ "$meta_did_stash" -eq 1 ]; then
-        warn "  Resolve, run 'mcrepo continue' (or 'git rebase --continue'), then 'git stash pop' to restore your changes."
-      else
-        warn "  Resolve, then run 'mcrepo continue' (or 'git rebase --continue')."
-      fi
-    else
-      if [ "$meta_did_stash" -eq 1 ]; then
-        if ! git -C . stash pop; then
-          stash_conflict_repos+=("(meta-context)")
-          stash_conflict_entries+=("(meta-context)|.")
-          warn "  Stash pop conflicts. Resolve, then run 'git stash drop'."
-        else
-          clean_repos+=("(meta-context)")
-          clean_entries+=("(meta-context)|.")
-          log "  Done."
-        fi
-      else
-        clean_repos+=("(meta-context)")
-        clean_entries+=("(meta-context)|.")
-        log "  Done."
-      fi
-    fi
-  fi
-
   # Phase 3: Summary
   log ""
-  log "=== Rebase summary ==="
+  log "=== Sync summary ==="
   if [ "${#clean_repos[@]}" -gt 0 ]; then
     log "Synced cleanly: ${clean_repos[*]}"
   fi
@@ -7918,31 +8401,51 @@ cmd_merge_rebase() {
     print_agent_recovery_prompt stash-conflict "${stash_conflict_entries[@]}"
   fi
 
-  if [ "${#merge_conflict_repos[@]}" -eq 0 ] && [ "${#stash_conflict_repos[@]}" -eq 0 ]; then
-    log ""
-    log "All repos synced. You can now run 'mcrepo merge' to merge into parent branches."
-    # The rebase rewrote commit hashes. Any cleanly-rebased branch that was already
-    # pushed now diverges from its origin/<branch> and must be re-published.
-    local -a republish_names=()
-    local ce ce_name ce_dir
-    for ce in "${clean_entries[@]}"; do
-      ce_name="${ce%%|*}"
-      ce_dir="${ce#*|}"
-      if git -C "$ce_dir" show-ref --verify --quiet "refs/remotes/origin/$source_branch"; then
-        republish_names+=("$ce_name")
-      fi
-    done
-    if [ "${#republish_names[@]}" -gt 0 ]; then
-      log ""
-      log "Local history was rewritten by the rebase, so these branches now differ from their remote"
-      log "(this is expected — not remote work from another machine). Run 'mcrepo push' to publish them;"
-      log "mcrepo will safely force-with-lease the rebased branches:"
-      local rpn
-      for rpn in "${republish_names[@]}"; do
-        log "  - $rpn"
-      done
-    fi
+  SYNC_CONFLICTS=$(( ${#merge_conflict_repos[@]} + ${#stash_conflict_repos[@]} ))
+  if [ "$SYNC_CONFLICTS" -gt 0 ]; then
+    return 2
   fi
+
+  log ""
+  log "All repos synced. You can now run 'mcrepo merge' to merge into parent branches."
+  # The rebase rewrote commit hashes. Any cleanly-rebased branch that was already
+  # pushed now diverges from its origin/<branch> and must be re-published.
+  local -a republish_names=()
+  local ce ce_name ce_dir
+  for ce in "${clean_entries[@]}"; do
+    ce_name="${ce%%|*}"
+    ce_dir="${ce#*|}"
+    if git -C "$ce_dir" show-ref --verify --quiet "refs/remotes/origin/$source_branch"; then
+      republish_names+=("$ce_name")
+    fi
+  done
+  if [ "${#republish_names[@]}" -gt 0 ]; then
+    log ""
+    log "Local history was rewritten by the rebase, so these branches now differ from their remote"
+    log "(this is expected — not remote work from another machine). Run 'mcrepo push' to publish them;"
+    log "mcrepo will safely force-with-lease the rebased branches:"
+    local rpn
+    for rpn in "${republish_names[@]}"; do
+      log "  - $rpn"
+    done
+  fi
+  return 0
+}
+
+cmd_sync() {
+  local include_read=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --include-read) include_read=1 ;;
+      *) die "Unknown sync option: $1" ;;
+    esac
+    shift
+  done
+  load_repos
+  if [ -z "$GLOBAL_BRANCH" ]; then
+    die "No feature branch active — start one with 'mcrepo branch <name>' first."
+  fi
+  _sync_run "$GLOBAL_BRANCH" "$include_read"
 }
 
 # Runs once after 'mcrepo update' replaced the script ($1 = old version,
@@ -7958,6 +8461,23 @@ cmd_post_update_migrate() {
   save_repos
   if [ "${schema_before:-0}" != "$MCREPO_SCHEMA_VERSION" ]; then
     log "Migrated $REPOS_FILE to manifest schema $MCREPO_SCHEMA_VERSION."
+  fi
+
+  # 0.7.0: backfill the conflict-resolution skill into existing workspaces
+  # (ensure_skills_files only seeds the pack when NO skills exist). Runs once:
+  # if the user deletes the skill afterwards, this re-creates it only on the
+  # next 'mcrepo update' — disable with 'mcrepo skill disable conflict-resolution'.
+  if [ -d "$SUPPORT_SKILLS_DIR" ] && [ ! -d "$SUPPORT_SKILLS_DIR/conflict-resolution" ]; then
+    create_conflict_resolution_skill
+    if [ -f "$SKILLS_CONFIG_FILE" ] && grep -q '^enabled:' "$SKILLS_CONFIG_FILE" && \
+       ! grep -q '^[[:space:]]*-[[:space:]]*conflict-resolution$' "$SKILLS_CONFIG_FILE"; then
+      local _skb
+      _skb="$(mktemp "$SKILLS_CONFIG_FILE.XXXXXX")"
+      awk '{ print } /^enabled:$/ { print "  - conflict-resolution" }' "$SKILLS_CONFIG_FILE" >"$_skb" && \
+        mv -f "$_skb" "$SKILLS_CONFIG_FILE" || rm -f "$_skb"
+    fi
+    sync_workspace_skills_to_opencode 2>/dev/null || true
+    log "Added the 'conflict-resolution' skill to $SUPPORT_SKILLS_DIR/."
   fi
   return 0
 }
@@ -8232,6 +8752,7 @@ main() {
     sleep) set_mode_command sleep "$@" ;;
     list) cmd_list "$@" ;;
     branch) cmd_branch "$@" ;;
+    sync) cmd_sync "$@" ;;
     merge) cmd_merge "$@" ;;
     pr) cmd_pr "$@" ;;
     pull) cmd_pull "$@" ;;
@@ -8239,6 +8760,7 @@ main() {
     commit) cmd_commit "$@" ;;
     continue) cmd_continue "$@" ;;
     abort) cmd_abort "$@" ;;
+    resolve) cmd_resolve "$@" ;;
     open) cmd_open "$@" ;;
     status) cmd_status "$@" ;;
     skill) cmd_skill "$@" ;;

@@ -29,6 +29,11 @@ Suites:
 - `30-inventory.bats` — command surface consistency: `MCREPO_COMMANDS`
   inventory == `usage()` == `main()` dispatch == generated completions;
   manifest schema stamping and migration
+- `40-conflicts.bats` — REAL merge/rebase conflicts: the strict sync gate
+  (`merge` refuses when behind parent), `sync` conflict handling + agent
+  prompt, `continue`/`abort`/`resolve`, marker-less `CONFLICTED` detection
+  (squash/stash-pop), partial-merge rollback + re-run resume, `#N`/batch-id
+  identity fixes
 
 CI (`.github/workflows/ci.yml`) runs `bash -n`, shellcheck, the full suite on
 ubuntu **and** macOS (stock bash 3.2 — catches `mapfile`-class and

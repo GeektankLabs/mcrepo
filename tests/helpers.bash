@@ -26,6 +26,8 @@ setup_workspace() {
   git config --file "$GIT_CONFIG_GLOBAL" user.name "mcrepo tests"
   git config --file "$GIT_CONFIG_GLOBAL" init.defaultBranch main
   git config --file "$GIT_CONFIG_GLOBAL" protocol.file.allow always
+  # 'git rebase/merge --continue' must not block on an editor in tests.
+  git config --file "$GIT_CONFIG_GLOBAL" core.editor true
 
   cd "$SANDBOX" || return 1
 }
@@ -65,6 +67,18 @@ git_manage_workspace() {
   git init -q -b main .
   git add -A
   git commit -qm "workspace initial commit"
+}
+
+# Advance a repo's remote main by committing new README.md content via the
+# seed clone. Overwrites line 1, so a differing local edit to README.md
+# produces a REAL merge/rebase conflict.
+advance_remote() {
+  local name="$1" content="$2"
+  local seed="$BATS_TEST_TMPDIR/seed-$name"
+  printf '%s\n' "$content" >"$seed/README.md"
+  git -C "$seed" add -A
+  git -C "$seed" commit -qm "remote advance $name"
+  git -C "$seed" push -q "$REMOTES_DIR/$name.git" main
 }
 
 # Append a line to a file in a repo and stage nothing (dirty working tree).

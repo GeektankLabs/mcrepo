@@ -167,9 +167,36 @@ This is the counterpart to `mcrepo merge`. While `merge` saves work into the par
 - Deletes the feature branch locally
 - Pops the parent stack one level (nested branches supported)
 
+### Syncing with the Parent
+
+Merging back is strictly two-step: **sync first, then merge**. `mcrepo sync` rebases the
+coordinated branch onto each repo's parent, so conflicts are resolved *on the feature branch* —
+the later merge into the parent is then always conflict-free.
+
+```bash
+mcrepo sync                  # rebase the global branch onto each parent (auto-stash)
+mcrepo sync --include-read   # also sync read-mode repos that joined via 'branch --include-read'
+```
+
+Behavior details:
+
+- `sync` prefers `origin/<parent>` as the rebase target (so it picks up newly merged work from
+  other PRs; falls back to local `<parent>` when no origin is configured). Auto-stashes
+  uncommitted work, including untracked files.
+- On a rebase conflict, `sync` keeps going through the remaining repos, prints per-repo context
+  for the three colliding sides (local feature branch vs parent vs the stale `origin/<branch>`)
+  plus a paste-ready prompt for a local coding agent, and exits `2`. Resolve, `git add`, then
+  `mcrepo continue` — see [Conflicts & Recovery](#conflicts--recovery).
+- Rebasing rewrites local history, so an already-pushed branch will diverge from its remote.
+  mcrepo flags those branches at the end and tells you to run `mcrepo push` — which auto
+  force-with-leases them (see [Pushing](#pushing)); you do **not** need to force-push by hand.
+- Without `--include-read`, read-mode repos sitting on the branch are listed with a hint instead
+  of being silently stranded.
+- `mcrepo merge --rebase` still works as a deprecated alias and prints a deprecation warning.
+
 ### Merging Back
 
-After feature work is complete, squash the coordinated branch back into each repo's parent branch:
+After the branch is synced, squash it back into each repo's parent branch:
 
 ```bash
 mcrepo merge                  # squash; subject defaults to the source branch name
@@ -180,41 +207,81 @@ mcrepo merge --no-squash      # legacy: --no-ff merge commit per repo
 
 `merge` needs git 2.38+ (it dry-runs conflicts with `git merge-tree --write-tree`; `mcrepo doctor` checks this).
 
-If the dry-run detects conflicts, sync with the parent branch first:
-
-```bash
-mcrepo merge --rebase
-```
-
 Behavior details:
 
-- `mcrepo merge` requires a global branch to be set.
+- `mcrepo merge` requires a global branch to be set, and **requires the branch to be synced**:
+  when any repo's branch is behind its parent (local or `origin/<parent>`), merge refuses and
+  points you to `mcrepo sync`. Because conflicts are always resolved during sync, the merge
+  itself cannot conflict.
 - **Default strategy is squash.** Each repo gets one new commit on its parent whose subject is either `-m "..."` or the source branch name. WIP commits on the feature branch are collapsed away. Use `--no-squash` for the previous `git merge --no-ff` behavior.
 - Parent branches are recorded automatically by `mcrepo branch` — each repo can have a different parent.
-- The meta-context repo (`.`) participates in both branching and merging with its own parent tracking (`meta-parent:` in `mcrepo.yaml`).
-- `merge` performs a dry-run across ALL repos first. If any would conflict, no merges happen.
-- `merge --rebase` rebases the current branch onto its parent (prefers `origin/<parent>` so it picks up newly merged work from other PRs; falls back to local `<parent>` when no origin is configured). Auto-stashes uncommitted work (including untracked files). This rewrites local history, so a branch that was already pushed will diverge from its remote. mcrepo flags those branches at the end of the rebase and tells you to run `mcrepo push` — which auto force-with-leases them (see [Pushing](#pushing)); you do **not** need to force-push by hand.
-- On a rebase conflict, `merge --rebase` prints per-repo context for the three colliding sides (local feature branch vs parent `main` vs the stale `origin/<branch>`) and a paste-ready prompt you can hand to a local coding agent to resolve the conflict, then finish with `mcrepo continue` and `mcrepo push`.
+- The meta-context repo (`.`) participates in both branching and merging with its own parent tracking (`meta-parent:` in `mcrepo.yaml`); it merges last, and only after every sub-repo merged.
+- Repos not on the source branch are **skipped with a notice** (already merged by a previous
+  partial run, or manually switched) instead of failing the whole merge; only an empty merge set
+  is an error.
+- `merge` performs a conflict dry-run across ALL repos before touching anything, and fast-forwards
+  each local parent to `origin/<parent>` before merging so the squash lands on the same history
+  the sync rebased onto (no phantom divergence at push time).
+- **A failed repo never blocks the rest**: the failed repo is rolled back to exactly its
+  pre-merge state on the feature branch, the remaining repos keep merging, the summary reports
+  `PARTIAL`, and the run exits `2` with a paste-ready recovery prompt. Fix the cause and re-run
+  `mcrepo merge` — already-merged repos are skipped automatically.
 - Merges are local only (no push). Review and push per-repo when ready.
 - Nested branches are supported: `main → feature → sub-feature`. Each `merge` pops one level.
 - After a squash merge, the source branch's tip is no longer reachable from the parent, so the post-merge cleanup uses **force-delete** (`git branch -D`) with an explicit confirmation defaulting to **No**. The `--no-squash` path keeps the previous safe-delete (`git branch -d`) prompt.
 - The merge auto-commits the updated `mcrepo.yaml` in the meta-context (subject: `mcrepo: post-merge state — '<source>' merged into '<target>'`) so the popped parent stack and updated global branch land in git history immediately. Run `mcrepo push` afterward to publish the merge along with this state commit. Only `mcrepo.yaml` is staged — unrelated dirty files in the meta-context are left alone.
 - When no parent is recorded, mcrepo falls back to detecting the default branch (via `origin/HEAD`, remote query, or heuristic).
 
-### Resuming or Aborting Mid-Operation Repos
+## Conflicts & Recovery
 
-If `mcrepo merge`, `mcrepo merge --rebase`, or any per-repo `git` operation
-left some repos mid-merge / mid-rebase / mid-cherry-pick / mid-revert, you can
-drive the recovery across all affected repos at once:
+Conflicts are a normal part of coordinated work. mcrepo never auto-resolves them — it explains
+the state, keeps every side of the conflict recoverable, and prints a **paste-ready prompt for
+your local coding agent** whenever it stops on a state it won't resolve itself.
 
-```bash
-mcrepo continue   # runs git <op> --continue in every mid-op repo
-mcrepo abort      # runs git <op> --abort in every mid-op repo
+The recovery loop:
+
+```
+mcrepo sync / pull        # the operation stops on a conflict, prints the agent prompt
+  → resolve the files     # only REAL conflicts — the prompt tells the agent the rules
+  → git add <files>
+  → mcrepo continue       # repeat until 'mcrepo status' is clean
+  → mcrepo merge          # now conflict-free
+  → mcrepo push
 ```
 
-Resolve the conflicts inside each repo first (the per-repo paths are visible
-via `mcrepo status` under `inprogress=…`), then run `mcrepo continue`. Sleep
-mode repos are skipped. The meta-context repo participates as well.
+The stuck states and how `mcrepo status` shows them:
+
+| State | How it happens | `status` shows | How to finish |
+|---|---|---|---|
+| Rebase conflict | `sync`, `pull --rebase` | `inprogress=REBASING` | resolve → `git add` → `mcrepo continue` |
+| Merge conflict | manual `git merge` | `inprogress=MERGING` | resolve → `git add` → `mcrepo continue` |
+| Squash conflict (no git marker!) | manual squash-merge | `inprogress=CONFLICTED` | resolve → `git add` → `git commit` |
+| Stash-pop conflict (no git marker!) | auto-stash restore after sync/pull | `inprogress=CONFLICTED` + `mcrepo-stash=N` | resolve → `git add` → `git stash drop` |
+| Carry conflict | `branch <name>` with carried changes | `mcrepo-stash=N` | resolve → `git add` → `git stash drop` |
+| Ambiguous divergence | remote has work that is not your rebase | `upstream=ahead/behind` | review with the agent prompt; never blind force-push |
+| Partial merge | one repo failed mid-`merge` | repo back on feature branch | fix cause → re-run `mcrepo merge` |
+| Partial coordinated commit | commit failed in some repos | mixed `#N` HEADs | complete the batch with the exact printed subject |
+
+Commands:
+
+```bash
+mcrepo resolve    # read-only diagnosis: lists stuck repos and prints the agent prompt on stdout
+mcrepo continue   # git <op> --continue in every mid-op repo; explains marker-less conflicts;
+                  # offers leftover mcrepo stashes for pop/drop; exits 2 while conflicts remain
+mcrepo abort      # git <op> --abort in every mid-op repo; also clears marker-less conflicts
+                  # (git reset --merge) while preserving stashes
+```
+
+Sleep-mode repos are skipped; the meta-context participates as well.
+
+**How to prompt your coding agent:** paste the prompt mcrepo prints (or run
+`mcrepo resolve | pbcopy` any time — the prompt body goes to stdout). It briefs the agent on the
+coordinated-branch model, lists the affected repos with their paths, and sets the rules: resolve
+only *real* semantic conflicts, keep the parent side's formatting on formatting-only collisions,
+never keep duplicated `mcrepo commit #N` coordination commits, never force-push or reset without
+asking, and finish via `git add` → `mcrepo continue` → `mcrepo push`. Generated workspaces also
+ship a `conflict-resolution` skill and an AGENTS.md "Conflict Recovery" section, so local agents
+know the procedure even without the paste.
 
 ## Coordinated Commits
 
@@ -262,7 +329,7 @@ Behavior details:
 - Before pushing, mcrepo fetches `origin` for every push target (write-mode
   sub-repos plus meta-context). It then computes both **ahead** and **behind**
   per repo.
-- **Rebased branches are auto-published.** After `mcrepo merge --rebase`, a
+- **Rebased branches are auto-published.** After `mcrepo sync`, a
   coordinated branch diverges from its already-pushed `origin/<branch>` (ahead
   *and* behind) purely because the rebase rewrote its commit hashes. mcrepo
   detects this case — local `HEAD` already contains the parent `main` *and* the
@@ -541,7 +608,7 @@ Accepted URL transports: `https`, `ssh`, `git`, `file`, absolute/relative local 
 
 - `0` — success, including a user-declined confirmation
 - `1` — fatal or usage error
-- `2` — partial failure (some repos succeeded, some failed) — returned by `pull`, `push`, `pr`
+- `2` — partial failure (some repos succeeded, some failed, or conflicts remain) — returned by `pull`, `push`, `pr`, `sync`, `merge`, and `continue`
 
 ## Glossary
 
@@ -553,6 +620,45 @@ Accepted URL transports: `https`, `ssh`, `git`, `file`, absolute/relative local 
 - **local incubator** — a repo created by `mcrepo new` that lives committed inside the meta-context until `mcrepo publish` graduates it to its own remote
 - **upstream** — the PR target in the fork workflow (origin = your fork, upstream = the original repo)
 - **coordinated commit `#N @batch`** — one logical change committed across several repos with a shared sequence number and batch id
+
+## Upgrading to 0.7.0
+
+0.7.0 makes the coordinated lifecycle strictly two-step (**sync → merge**) and makes every
+conflict state visible, resumable, and agent-assisted:
+
+- **New commands**: `mcrepo sync` (was `merge --rebase`, which still works but warns) and
+  `mcrepo resolve` (read-only diagnosis; prints the coding-agent recovery prompt on stdout).
+- **Breaking — merge requires a synced branch**: `mcrepo merge` refuses when the branch is
+  behind its parent (locally or on `origin/<parent>`) and points to `mcrepo sync`. Conflicts are
+  resolved on the feature branch during sync, never during the merge.
+- **Breaking — merge no longer dies mid-loop**: repos not on the source branch are skipped with
+  a notice (previously a hard preflight error); a repo that fails to merge is rolled back to the
+  feature branch while the rest keep merging, and the run exits `2`. Re-running `mcrepo merge`
+  finishes the remaining repos.
+- **Breaking — exit codes**: `sync` (né `merge --rebase`) and `continue` exit `2` while
+  conflicts remain (previously `0`). CI scripts checking `$?` must adjust.
+- **Conflict visibility**: `mcrepo status` gains `inprogress=CONFLICTED` (unmerged files without
+  a git op marker — squash and stash-pop conflicts were previously invisible) and
+  `mcrepo-stash=N` (leftover `mcrepo:` auto-stashes). `continue`/`abort` handle both:
+  `continue` explains what to do and surfaces leftover stashes for pop/drop; `abort` clears
+  marker-less conflicts with `git reset --merge` while preserving stashes.
+- **Agent prompts everywhere**: the paste-ready coding-agent prompt now also fires on plain
+  merge failures, pull stash-pop conflicts, branch carry conflicts, and partial coordinated
+  commits — and moved to **stderr** (use `mcrepo resolve` to capture it on stdout).
+- **Fixed — coordinated `#N` numbering**: the next sequence number is now the max across all
+  target repos (+1). Previously only the meta-context log was counted, so a batch touching only
+  sub-repos reused the same `#N`. Batch ids also gained a uniqueness suffix
+  (`@<timestamp>-<hex>`).
+- **Fixed — `sync` honors `--include-read`** (the old `merge --rebase` silently dropped read
+  repos, stranding them on the feature branch) and hints when read repos sit on the branch
+  without the flag.
+- **Fixed — stale local parent**: `merge` fast-forwards the local parent to `origin/<parent>`
+  before merging, eliminating phantom divergence at push time after a sync against origin.
+- `mcrepo commit` now warns (without blocking) when a target repo is off the global branch.
+- **New default skill `conflict-resolution`** and an AGENTS.md "Conflict Recovery" section in
+  generated workspaces. Existing workspaces get the skill backfilled once by `mcrepo update`
+  (re-disable with `mcrepo skill disable conflict-resolution`); adopt the AGENTS.md section
+  manually if your file is customized.
 
 ## Upgrading from 0.5.x
 
