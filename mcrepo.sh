@@ -127,10 +127,23 @@ Usage:  # Show available mcrepo commands
 ═══════════════════════════════════════════════════════════════════════════════
   TOOLING & MAINTENANCE
 ═══════════════════════════════════════════════════════════════════════════════
+  ./mcrepo.sh version                             # Print the mcrepo version (plain, to stdout)
   ./mcrepo.sh update                              # Update mcrepo.sh from canonical upstream when newer version is available
   ./mcrepo.sh install-extension                   # Download and install the mcrepo VS Code extension from GitHub
   ./mcrepo.sh create-patch [--strategy intent|legacy] [topic] # Print a ready-to-submit GitHub issue body (with embedded patch) to stdout
   ./mcrepo.sh help                                # Print this help text
+
+═══════════════════════════════════════════════════════════════════════════════
+  CONVENTIONS
+═══════════════════════════════════════════════════════════════════════════════
+  Exit codes:  0 = success (including a declined confirmation)
+               1 = fatal or usage error
+               2 = partial failure (some repos succeeded, some failed)
+  Prompts:     y/yes confirms, n/no declines, Enter takes the shown default,
+               anything else declines. Non-interactive runs take the default;
+               destructive actions then need --yes/--force (or MCREPO_ASSUME_YES=1).
+  Output:      results go to stdout; version banner, prompts, warnings and
+               errors go to stderr.
 EOF
 }
 
@@ -141,11 +154,44 @@ is_truthy() {
   esac
 }
 
+# Unified confirmation prompt. Usage: confirm "Question?" [y|n]
+# Second arg is the default answer (what Enter means); it defaults to "n".
+# Returns 0 = confirmed, 1 = declined.
+# Contract (identical for every prompt in mcrepo):
+#   - affirmative: y/Y/yes/YES; negative: n/N/no/NO
+#   - empty input takes the default
+#   - any other input DECLINES (safe), never proceeds
+#   - non-TTY: takes the default silently; destructive prompts must therefore
+#     use default "n" and offer a --yes/--force flag for automation
+#   - MCREPO_ASSUME_YES=1 confirms everything (CI escape hatch)
+confirm() {
+  local question="$1"
+  local default="${2:-n}"
+  if is_truthy "${MCREPO_ASSUME_YES:-0}"; then
+    return 0
+  fi
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    [ "$default" = "y" ]
+    return $?
+  fi
+  local suffix="[y/N]"
+  [ "$default" = "y" ] && suffix="[Y/n]"
+  printf '%s %s ' "$question" "$suffix" >&2
+  local _answer=""
+  IFS= read -r _answer || _answer=""
+  case "$_answer" in
+    y|Y|yes|YES) return 0 ;;
+    '') [ "$default" = "y" ]; return $? ;;
+    *) return 1 ;;
+  esac
+}
+
 print_version_banner() {
   if is_truthy "${MCREPO_SUPPRESS_VERSION_BANNER:-0}"; then
     return 0
   fi
-  log "mcrepo version $MCREPO_VERSION"
+  # stderr: stdout belongs to command output (parsers, completions, pipelines).
+  printf 'mcrepo version %s\n' "$MCREPO_VERSION" >&2
 }
 
 update_source_url() {
@@ -314,15 +360,39 @@ check_remote_version() {
   printf '%s' "$remote_version"
 }
 
+_print_update_notice() {
+  local remote_version="$1"
+  if version_greater_than "$remote_version" "$MCREPO_VERSION"; then
+    log_yellow "New version available: $MCREPO_VERSION -> $remote_version" >&2
+    log_yellow "Run 'mcrepo update' to update this script." >&2
+  fi
+}
+
 notify_if_new_version_available() {
   local cmd="$1"
   local remote_tmp_file remote_version
 
-  if [ "$cmd" = "update" ] || [ "$cmd" = "--post-update-migrate" ]; then
-    return 0
-  fi
+  case "$cmd" in
+    update|--post-update-migrate|version) return 0 ;;
+  esac
   if is_truthy "${MCREPO_DISABLE_UPDATE_CHECK:-0}"; then
     return 0
+  fi
+
+  # Throttle: hit the network at most once per 24h. Without this, EVERY
+  # command paid a blocking fetch (up to 4s offline) just to read a version.
+  local cache_file="${HOME:-/tmp}/.mcrepo-update-check"
+  local now cached_at="" cached_version=""
+  now="$(date +%s)"
+  if [ -f "$cache_file" ]; then
+    IFS=' ' read -r cached_at cached_version <"$cache_file" 2>/dev/null || true
+    case "$cached_at" in
+      ''|*[!0-9]*) cached_at=0 ;;
+    esac
+    if [ $((now - cached_at)) -lt 86400 ]; then
+      [ -n "$cached_version" ] && _print_update_notice "$cached_version"
+      return 0
+    fi
   fi
 
   remote_tmp_file="$(mktemp)"
@@ -333,10 +403,8 @@ notify_if_new_version_available() {
     return 0
   fi
 
-  if version_greater_than "$remote_version" "$MCREPO_VERSION"; then
-    log_yellow "New version available: $MCREPO_VERSION -> $remote_version"
-    log_yellow "Run 'mcrepo update' to update this script."
-  fi
+  printf '%s %s\n' "$now" "$remote_version" >"$cache_file" 2>/dev/null || true
+  _print_update_notice "$remote_version"
 }
 
 resolve_script_path() {
@@ -2545,10 +2613,11 @@ cmd_fork_all() {
   [ "${#skip[@]}" -gt 0 ] && log "  skip: ${skip[*]}"
   log ""
 
-  if [ "$assume_yes" -ne 1 ] && [ -t 0 ] && [ -t 1 ]; then
-    printf 'Fork and rewire %d repo(s)? [Y/n] ' "${#fork_labels[@]}" >&2
-    local confirm; IFS= read -r confirm
-    case "$confirm" in n|N|no) log "Aborted."; return 0 ;; esac
+  if [ "$assume_yes" -ne 1 ]; then
+    if ! confirm "Fork and rewire ${#fork_labels[@]} repo(s)?" y; then
+      log "Aborted."
+      return 0
+    fi
   fi
 
   local rewired=0
@@ -2703,17 +2772,15 @@ cmd_remove() {
     elif [ -t 0 ] && [ -t 1 ]; then
       local prompt_text
       if [ "${#concerns[@]}" -gt 0 ]; then
-        prompt_text="Delete '$repo_dir' anyway? This cannot be undone. [y/N] "
+        prompt_text="Delete '$repo_dir' anyway? This cannot be undone."
       else
-        prompt_text="Delete local folder '$repo_dir'? [y/N] "
+        prompt_text="Delete local folder '$repo_dir'?"
       fi
-      printf '%s' "$prompt_text" >&2
-      local confirm
-      IFS= read -r confirm
-      case "$confirm" in
-        y|Y|yes|YES) delete_dir=1 ;;
-        *) delete_dir=0 ;;
-      esac
+      if confirm "$prompt_text" n; then
+        delete_dir=1
+      else
+        delete_dir=0
+      fi
     else
       if [ "${#concerns[@]}" -gt 0 ]; then
         die "Local folder '$repo_dir' has unsaved work and no TTY for confirmation. Re-run with --force to delete, or --keep-files to preserve the folder."
@@ -3183,16 +3250,10 @@ set_mode_command() {
         if [ "$force_sleep" -eq 1 ]; then
           warn "Proceeding due to --force."
         elif [ -t 0 ] && [ -t 1 ]; then
-          printf "Delete this work and sleep '%s' anyway? This cannot be undone. [y/N] " "${REPO_NAMES[$idx]}" >&2
-          local _slc_confirm
-          IFS= read -r _slc_confirm
-          case "$_slc_confirm" in
-            y|Y|yes|YES) ;;
-            *)
-              log "Aborted. Push or commit the work first, or re-run with --force to discard it."
-              return 0
-              ;;
-          esac
+          if ! confirm "Delete this work and sleep '${REPO_NAMES[$idx]}' anyway? This cannot be undone." n; then
+            log "Aborted. Push or commit the work first, or re-run with --force to discard it."
+            return 0
+          fi
         else
           die "Repository '${REPO_NAMES[$idx]}' has local work that sleeping would destroy (see above). Push it first, or re-run './mcrepo.sh sleep ${REPO_NAMES[$idx]} --force' to discard it."
         fi
@@ -3241,9 +3302,9 @@ set_mode_command() {
         if [ -n "$_w_perm" ] && ! gh_perm_can_push "$_w_perm"; then
           local _w_do_fork=0
           if [ -t 0 ] && [ -t 1 ]; then
-            printf "You have no push access to '%s' (%s). Fork it now (origin->your fork, original->upstream)? [Y/n] " "$_w_origin" "$_w_perm" >&2
-            local _w_reply; IFS= read -r _w_reply
-            case "$_w_reply" in n|N|no) _w_do_fork=0 ;; *) _w_do_fork=1 ;; esac
+            if confirm "You have no push access to '$_w_origin' ($_w_perm). Fork it now (origin->your fork, original->upstream)?" y; then
+              _w_do_fork=1
+            fi
           fi
           if [ "$_w_do_fork" -eq 1 ]; then
             if fork_and_rewire_repo "$idx"; then
@@ -3734,13 +3795,8 @@ confirm_reset_discard_commits() {
     return 0
   fi
   if [ -t 0 ] && [ -t 1 ]; then
-    printf "Discard these commits in '%s'? This cannot be undone. [y/N] " "$rn" >&2
-    local _confirm
-    IFS= read -r _confirm
-    case "$_confirm" in
-      y|Y|yes|YES) return 0 ;;
-      *) return 1 ;;
-    esac
+    confirm "Discard these commits in '$rn'? This cannot be undone." n
+    return $?
   fi
   warn "  Non-interactive: keeping '$rn' untouched. Re-run with 'mcrepo pull --reset --yes' to discard."
   return 1
@@ -3820,16 +3876,14 @@ cmd_pull() {
         warn "  $rn"
       done
       warn ""
-      if [ -t 0 ] && [ -t 1 ]; then
-        printf 'This action cannot be undone. Proceed? [y/N] ' >&2
-        local confirm
-        IFS= read -r confirm
-        case "$confirm" in
-          y|Y|yes) ;;
-          *) log "Aborted."; return 0 ;;
-        esac
-      else
-        die "pull --reset requires interactive confirmation. Aborting."
+      if [ "$assume_yes" -ne 1 ]; then
+        if [ ! -t 0 ] || [ ! -t 1 ]; then
+          die "pull --reset requires interactive confirmation (or --yes). Aborting."
+        fi
+        if ! confirm "This action cannot be undone. Proceed?" n; then
+          log "Aborted."
+          return 0
+        fi
       fi
     fi
   fi
@@ -3881,6 +3935,7 @@ cmd_pull() {
   local -a failed_repos=()
   local -a diverged_rebased=()   # safe-force: rebased locally, just needs publishing
   local -a diverged_conflict=()  # remote-work: needs human/agent review
+  local -a reset_declined=()     # user declined discarding committed work (not a failure)
   local had_dirty=0
 
   for i in "${!pull_dirs[@]}"; do
@@ -3911,7 +3966,7 @@ cmd_pull() {
       else
         # Diverged: hard reset to origin — but committed work needs its own approval
         if ! confirm_reset_discard_commits "$rd" "$rn" "$rb" "$assume_yes"; then
-          failed_repos+=("$rn (reset declined - local commits preserved)")
+          reset_declined+=("$rn")
           continue
         fi
         git -C "$rd" reset --hard "origin/$rb" 2>/dev/null || { warn "Reset failed for '$rn'"; failed_repos+=("$rn"); continue; }
@@ -3926,7 +3981,7 @@ cmd_pull() {
       else
         # Clean but diverged: the reset would silently drop committed work
         if ! confirm_reset_discard_commits "$rd" "$rn" "$rb" "$assume_yes"; then
-          failed_repos+=("$rn (reset declined - local commits preserved)")
+          reset_declined+=("$rn")
           continue
         fi
         git -C "$rd" reset --hard "origin/$rb" 2>/dev/null || { warn "Reset failed for '$rn'"; failed_repos+=("$rn"); continue; }
@@ -3994,7 +4049,7 @@ cmd_pull() {
       if run_with_repo_prefix "(meta-context)" git -C . pull --ff-only; then
         updated_repos+=("(meta-context)")
       elif ! confirm_reset_discard_commits "." "(meta-context)" "$meta_branch" "$assume_yes"; then
-        failed_repos+=("(meta-context) (reset declined - local commits preserved)")
+        reset_declined+=("(meta-context)")
       else
         git -C . reset --hard "origin/$meta_branch" 2>/dev/null || { warn "Reset failed for (meta-context)"; failed_repos+=("(meta-context)"); }
         updated_repos+=("(meta-context)")
@@ -4061,6 +4116,9 @@ cmd_pull() {
     for dc in "${diverged_conflict[@]}"; do dc_names+=("${dc%%|*}"); done
     warn "  Diverged:         ${dc_names[*]}"
   fi
+  if [ "${#reset_declined[@]}" -gt 0 ]; then
+    log "  Reset declined (local commits preserved): ${reset_declined[*]}"
+  fi
   if [ "${#failed_repos[@]}" -gt 0 ]; then
     warn "  Failed:           ${failed_repos[*]}"
   fi
@@ -4095,6 +4153,11 @@ cmd_pull() {
       log "  - ${dc2%%|*}"
     done
     print_agent_recovery_prompt ambiguous-divergence "${diverged_conflict[@]}"
+  fi
+
+  # Exit-code contract: 0 = success, 2 = partial per-repo failure.
+  if [ "${#failed_repos[@]}" -gt 0 ] || [ "${#stash_conflict_repos[@]}" -gt 0 ] || [ "${#diverged_conflict[@]}" -gt 0 ]; then
+    return 2
   fi
 }
 
@@ -4162,13 +4225,9 @@ _commit_forward() {
   [ "$meta_dirty" -eq 1 ] && log "  (meta-context)"
   log ""
 
-  if [ -t 0 ] && [ -t 1 ]; then
-    printf 'Proceed? [Y/n] ' >&2
-    local reply; IFS= read -r reply
-    case "$reply" in
-      ""|y|Y|yes) ;;
-      *) log "Aborted."; return 0 ;;
-    esac
+  if ! confirm "Proceed?" y; then
+    log "Aborted."
+    return 0
   fi
 
   local had_failure=0
@@ -4320,15 +4379,14 @@ _commit_revert() {
   fi
   log ""
 
-  if [ -t 0 ] && [ -t 1 ]; then
-    printf 'This is destructive. Proceed? [y/N] ' >&2
-    local reply; IFS= read -r reply
-    case "$reply" in
-      y|Y|yes) ;;
-      *) log "Aborted."; return 0 ;;
-    esac
-  elif [ "$force" -ne 1 ]; then
-    die "Non-interactive run requires --force."
+  if [ "$force" -ne 1 ]; then
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+      die "Non-interactive run requires --force."
+    fi
+    if ! confirm "This is destructive. Proceed?" n; then
+      log "Aborted."
+      return 0
+    fi
   fi
 
   if [ "${#peel_dirs[@]}" -gt 0 ]; then
@@ -4377,15 +4435,14 @@ _commit_reset() {
   [ "$meta_dirty" -eq 1 ] && warn "  (meta-context)"
   warn ""
 
-  if [ -t 0 ] && [ -t 1 ]; then
-    printf 'This action cannot be undone. Proceed? [y/N] ' >&2
-    local reply; IFS= read -r reply
-    case "$reply" in
-      y|Y|yes) ;;
-      *) log "Aborted."; return 0 ;;
-    esac
-  elif [ "$force" -ne 1 ]; then
-    die "Non-interactive run requires --force."
+  if [ "$force" -ne 1 ]; then
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+      die "Non-interactive run requires --force."
+    fi
+    if ! confirm "This action cannot be undone. Proceed?" n; then
+      log "Aborted."
+      return 0
+    fi
   fi
 
   if [ "${#dirty_dirs[@]}" -gt 0 ]; then
@@ -4618,7 +4675,7 @@ cmd_push() {
         action="dirty (needs -m or interactive commit message)"
       fi
     elif [ "${push_is_empty[$i]}" -eq 1 ]; then
-      action="leer (keine Commits gg. ${push_parents[$i]}) -> skip"
+      action="empty (no commits vs ${push_parents[$i]}) -> skip"
     elif [ "${push_has_upstream[$i]}" -eq 0 ]; then
       action="push (new upstream)"
     elif [ "${push_force[$i]}" -eq 1 ]; then
@@ -4843,7 +4900,11 @@ cmd_push() {
   # Push meta-context last
   if [ -n "$meta_dir" ] && [ "$meta_class" = "ahead" ]; then
     log "--- Pushing (meta-context) ---"
-    if [ "$meta_has_upstream" -eq 0 ]; then
+    if ! git -C . remote get-url origin >/dev/null 2>&1; then
+      # Not published yet — that is a normal state, not a failure.
+      log "  (meta-context): no 'origin' remote configured — skipping. Use 'mcrepo publish-base <git-url>' to publish the workspace."
+      skipped_uptodate+=("(meta-context) (no remote)")
+    elif [ "$meta_has_upstream" -eq 0 ]; then
       if ! git -C . push -u origin "$meta_branch"; then
         warn "Push failed for (meta-context) (see git output above)"
         failed_repos+=("(meta-context)")
@@ -4895,7 +4956,7 @@ cmd_push() {
     log "  Skipped (up to date):  ${skipped_uptodate[*]}"
   fi
   if [ "${#skipped_empty[@]}" -gt 0 ]; then
-    log "  Skipped (leer, keine Commits): ${skipped_empty[*]}"
+    log "  Skipped (empty, no commits): ${skipped_empty[*]}"
   fi
   if [ "${#skipped_dirty[@]}" -gt 0 ]; then
     warn "  Skipped (dirty, no -m): ${skipped_dirty[*]}"
@@ -4904,6 +4965,8 @@ cmd_push() {
   fi
   if [ "${#failed_repos[@]}" -gt 0 ]; then
     warn "  Failed:                ${failed_repos[*]}"
+    # Exit-code contract: 0 = success, 2 = partial per-repo failure.
+    return 2
   fi
 }
 
@@ -6276,14 +6339,9 @@ cmd_branch() {
     fi
     log ""
 
-    if [ -t 0 ] && [ -t 1 ]; then
-      printf 'Proceed? [Y/n] ' >&2
-      local confirm
-      IFS= read -r confirm
-      if [ -n "$confirm" ] && [ "$confirm" != "y" ] && [ "$confirm" != "Y" ] && [ "$confirm" != "yes" ]; then
-        log "Aborted."
-        return 0
-      fi
+    if ! confirm "Proceed?" y; then
+      log "Aborted."
+      return 0
     fi
   fi
 
@@ -6707,18 +6765,11 @@ cmd_branch_delete() {
     git -C "$repo_dir" checkout "$target"
     # Safe delete first; if unmerged commits exist, ask before force-deleting
     if ! git -C "$repo_dir" branch -d "$source_branch" 2>/dev/null; then
-      if [ -t 0 ] && [ -t 1 ]; then
-        warn "  '$repo_name': branch '$source_branch' has unmerged/unpushed commits."
-        printf '  Force-delete anyway? Unpushed commits will be lost. [y/N] ' >&2
-        local del_confirm
-        IFS= read -r del_confirm
-        if [ "$del_confirm" = "y" ] || [ "$del_confirm" = "Y" ]; then
-          git -C "$repo_dir" branch -D "$source_branch" 2>/dev/null || true
-        else
-          warn "  Kept branch '$source_branch' in '$repo_name'. Merge or push it first."
-        fi
+      warn "  '$repo_name': branch '$source_branch' has unmerged/unpushed commits."
+      if confirm "  Force-delete anyway? Unpushed commits will be lost." n; then
+        git -C "$repo_dir" branch -D "$source_branch" 2>/dev/null || true
       else
-        warn "  '$repo_name': branch '$source_branch' has unmerged commits. Skipping deletion. Merge or push first."
+        warn "  Kept branch '$source_branch' in '$repo_name'. Merge or push it first."
       fi
     fi
     log "  Switched to '$target'."
@@ -6745,18 +6796,11 @@ cmd_branch_delete() {
     git -C . checkout "$meta_parent_branch"
     # Safe delete for meta-context
     if ! git -C . branch -d "$source_branch" 2>/dev/null; then
-      if [ -t 0 ] && [ -t 1 ]; then
-        warn "  (meta-context): branch '$source_branch' has unmerged/unpushed commits."
-        printf '  Force-delete anyway? Unpushed commits will be lost. [y/N] ' >&2
-        local meta_del_confirm
-        IFS= read -r meta_del_confirm
-        if [ "$meta_del_confirm" = "y" ] || [ "$meta_del_confirm" = "Y" ]; then
-          git -C . branch -D "$source_branch" 2>/dev/null || true
-        else
-          warn "  Kept branch '$source_branch' in meta-context. Merge or push it first."
-        fi
+      warn "  (meta-context): branch '$source_branch' has unmerged/unpushed commits."
+      if confirm "  Force-delete anyway? Unpushed commits will be lost." n; then
+        git -C . branch -D "$source_branch" 2>/dev/null || true
       else
-        warn "  (meta-context): branch '$source_branch' has unmerged commits. Skipping deletion."
+        warn "  Kept branch '$source_branch' in meta-context. Merge or push it first."
       fi
     fi
     log "  Switched to '$meta_parent_branch'."
@@ -7234,15 +7278,15 @@ cmd_merge() {
   # Squash-merge breaks `git branch -d` reachability, so the squash path uses
   # force-delete with an explicit prompt; the --no-ff path keeps safe-delete.
   local do_delete=0
-  if [ -t 0 ] && [ -t 1 ]; then
-    if [ "$do_squash" -eq 1 ]; then
-      printf "Branch '%s' was squash-merged; safe-delete won't detect it — force-delete from all repos? [y/N] " "$source_branch" >&2
-      local del_reply; IFS= read -r del_reply
-      case "$del_reply" in y|Y|yes) do_delete=1 ;; *) do_delete=0 ;; esac
-    else
-      printf "Delete merged branch '%s' from all repos? [Y/n] " "$source_branch" >&2
-      local del_reply; IFS= read -r del_reply
-      case "$del_reply" in n|N) do_delete=0 ;; *) do_delete=1 ;; esac
+  if [ "$do_squash" -eq 1 ]; then
+    if confirm "Branch '$source_branch' was squash-merged; safe-delete won't detect it — force-delete from all repos?" n; then
+      do_delete=1
+    fi
+  else
+    if [ -t 0 ] && [ -t 1 ]; then
+      if confirm "Delete merged branch '$source_branch' from all repos?" y; then
+        do_delete=1
+      fi
     fi
   fi
 
@@ -7544,10 +7588,9 @@ cmd_pr() {
     warn "Uncommitted changes in: ${dirty_repos[*]} — these will NOT be included in the PR(s)."
   fi
   log ""
-  if [ -t 0 ] && [ -t 1 ]; then
-    printf 'Create %d coordinated PR(s)? [Y/n] ' "${#cand_dirs[@]}" >&2
-    local confirm; IFS= read -r confirm
-    case "$confirm" in n|N|no) log "Aborted."; return 0 ;; esac
+  if ! confirm "Create ${#cand_dirs[@]} coordinated PR(s)?" y; then
+    log "Aborted."
+    return 0
   fi
 
   # --- Phase 3: auto-push feature branch to origin (your fork), unless --no-push ---
@@ -7654,7 +7697,11 @@ cmd_pr() {
   [ "${#commented[@]}" -gt 0 ] && log "  Cross-linked (comment): ${commented[*]}"
   [ "${#skipped_empty[@]}" -gt 0 ] && log "  Skipped (no commits vs base): ${skipped_empty[*]}"
   [ "${#skipped_other[@]}" -gt 0 ] && log "  Skipped (other):        ${skipped_other[*]}"
-  [ "${#failed[@]}"   -gt 0 ] && warn "  Failed:      ${failed[*]}"
+  if [ "${#failed[@]}" -gt 0 ]; then
+    warn "  Failed:      ${failed[*]}"
+    # Exit-code contract: 0 = success, 2 = partial per-repo failure.
+    return 2
+  fi
 }
 
 # Sync the current global branch by rebasing it onto its parent.
@@ -8182,10 +8229,12 @@ main() {
   local cmd="${1:-help}"
   shift || true
 
-  if [ "$cmd" = "export-patch" ] || [ "$cmd" = "create-patch" ]; then
-    MCREPO_SUPPRESS_VERSION_BANNER=1
-    MCREPO_DISABLE_UPDATE_CHECK=1
-  fi
+  case "$cmd" in
+    export-patch|create-patch|version|--version|-V)
+      MCREPO_SUPPRESS_VERSION_BANNER=1
+      MCREPO_DISABLE_UPDATE_CHECK=1
+      ;;
+  esac
 
   print_version_banner
   notify_if_new_version_available "$cmd"
@@ -8216,6 +8265,7 @@ main() {
     open) cmd_open "$@" ;;
     status) cmd_status "$@" ;;
     skill) cmd_skill "$@" ;;
+    version|--version|-V) log "mcrepo version $MCREPO_VERSION" ;;
     update) cmd_update "$@" ;;
     install-extension) cmd_install_extension "$@" ;;
     export-patch|create-patch) cmd_export_patch "$@" ;;

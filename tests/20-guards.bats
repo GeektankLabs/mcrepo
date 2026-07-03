@@ -117,7 +117,7 @@ EOF
 
   run mcrepo pull --reset
   [ "$status" -eq 0 ]
-  assert_contains "$output" "reset declined - local commits preserved"
+  assert_contains "$output" "Reset declined (local commits preserved)"
   [ "$(git -C "$SANDBOX/alpha" rev-parse HEAD)" = "$local_sha" ]
 
   run mcrepo pull --reset --yes
@@ -149,4 +149,34 @@ EOF
   run mcrepo status
   [ "$status" -eq 0 ]
   assert_contains "$output" "stash=1"
+}
+
+@test "version banner goes to stderr, not stdout" {
+  init_workspace_with_repos alpha
+  stdout_only="$(MCREPO_SUPPRESS_VERSION_BANNER=0 "$SANDBOX/mcrepo.sh" list 2>/dev/null)"
+  assert_not_contains "$stdout_only" "mcrepo version"
+  stderr_only="$(MCREPO_SUPPRESS_VERSION_BANNER=0 "$SANDBOX/mcrepo.sh" list 2>&1 >/dev/null)"
+  assert_contains "$stderr_only" "mcrepo version"
+}
+
+@test "mcrepo version prints the version to stdout without banner noise" {
+  mcrepo init --no-shell-install >/dev/null
+  out="$(MCREPO_SUPPRESS_VERSION_BANNER=0 "$SANDBOX/mcrepo.sh" version 2>/dev/null)"
+  [[ "$out" == "mcrepo version "* ]]
+  [ "$(printf '%s\n' "$out" | wc -l)" -eq 1 ]
+}
+
+@test "commit --reset non-interactively requires --force and preserves changes" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  echo "dirty" >>alpha/README.md
+  # non-TTY: commit --reset without --force must die (exit 1), not proceed
+  run mcrepo commit --reset
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "requires --force"
+  grep -q "dirty" alpha/README.md
+
+  run mcrepo commit --reset --force
+  [ "$status" -eq 0 ]
+  ! grep -q "dirty" alpha/README.md
 }
