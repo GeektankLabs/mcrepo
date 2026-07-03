@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.7.0"
+MCREPO_VERSION="0.7.1"
 # Manifest (mcrepo.yaml) format version. Bump when the manifest schema changes
 # incompatibly; cmd_post_update_migrate migrates older manifests forward.
 MCREPO_SCHEMA_VERSION="1"
@@ -96,22 +96,24 @@ Usage:  # Show available mcrepo commands
 
 ═══════════════════════════════════════════════════════════════════════════════
   COORDINATED GIT MANAGEMENT
+  The loop:  branch → work → commit → sync → merge → push
+             (pull anytime to stay current · pr instead of push for reviews)
 ═══════════════════════════════════════════════════════════════════════════════
-  ./mcrepo.sh commit [-m "msg"] [--include-read]     # Coordinated commit across dirty write repos + meta-context
+  ./mcrepo.sh branch <branch-name> [--include-read] [--dirty abort|commit|carry|discard]  # STEP 1 — one feature branch across write repos + meta-context (interactive dirty handling; --dirty preselects)
+  ./mcrepo.sh commit [-m "msg"] [--include-read]     # STEP 2 — coordinated checkpoint across dirty write repos + meta-context (#N @batch, revertable as one unit; repeat freely)
+  ./mcrepo.sh sync [--include-read]                  # STEP 3 — rebase the branch onto each parent (auto-stash); resolve conflicts HERE, before merging
+  ./mcrepo.sh merge [-m "subject"] [--include-read]  # STEP 4 — squash the branch back into each repo's parent; requires a synced branch (run 'sync' first)
+  ./mcrepo.sh push [-m "message"] [--no-fetch] [--no-force] [--include-read] # STEP 5 — fetch + push write repos; safe force-with-lease for rebased branches; aborts if genuinely behind
+  ./mcrepo.sh pull                                   # anytime — fetch + ff-pull all active repos; meta-context auto-stashes on dirty, sub-repos skip on dirty
+  ./mcrepo.sh pull --rebase                          # anytime — auto-stash, pull, pop stash for ALL repos (handles dirty sub-repos safely)
+  ./mcrepo.sh pr [-m "title"] [--draft] [--no-push] [--target origin|upstream]  # instead of push — coordinated GitHub PRs per repo; fork->upstream when upstream set; cross-linked
+  ./mcrepo.sh branch                                 # List coordinated branches across write repos (alias: 'branch list')
+  ./mcrepo.sh branch --delete                        # Discard the global branch, switch repos back to parent branches
+  ./mcrepo.sh branch --off                           # Turn off branch coordination (fallback — see merge/--delete)
   ./mcrepo.sh commit --revert [--include-read] [--force]  # Peel the highest-#N coordinated commit off HEAD (reset --hard HEAD~1)
   ./mcrepo.sh commit --reset  [--include-read] [--force]  # Discard uncommitted changes across all target repos
-  ./mcrepo.sh branch                                 # List coordinated branches across write repos (alias: 'branch list')
-  ./mcrepo.sh branch <branch-name> [--include-read] [--dirty abort|commit|carry|discard]  # Switch/create global branch (interactive dirty-change handling; --dirty preselects for non-interactive use)
-  ./mcrepo.sh branch --off                           # Turn off branch coordination (fallback — see merge/--delete)
-  ./mcrepo.sh branch --delete                        # Delete global branch, switch repos back to parent branches
-  ./mcrepo.sh sync [--include-read]                  # Rebase the global branch onto each parent (auto-stash); resolve conflicts HERE, before merging
-  ./mcrepo.sh merge [-m "subject"] [--include-read]  # Squash-merge global branch into each repo's parent; requires a synced branch (run 'sync' first)
   ./mcrepo.sh merge --no-squash                      # Legacy: --no-ff merge commit instead of squash
-  ./mcrepo.sh pr [-m "title"] [--draft] [--no-push] [--target origin|upstream]  # Coordinated GitHub PRs per repo with commits vs base; fork->upstream when upstream set; cross-linked
-  ./mcrepo.sh pull                                   # Fetch + ff-pull all active repos; meta-context auto-stashes on dirty, sub-repos skip on dirty
-  ./mcrepo.sh pull --rebase                          # Auto-stash, pull, pop stash for ALL repos (handles dirty sub-repos safely)
   ./mcrepo.sh pull --reset [--yes]                   # Discard local changes and reset to origin state (destructive!); prompts per repo before discarding committed work, --yes skips
-  ./mcrepo.sh push [-m "message"] [--no-fetch] [--no-force] [--include-read] # Fetch + push write-mode repos; auto force-with-lease branches only rebased onto parent; abort if genuinely behind; --no-force disables auto-force
 
 ═══════════════════════════════════════════════════════════════════════════════
   MID-OPERATION RECOVERY
@@ -3969,6 +3971,11 @@ _iterate_inprogress() {
     fi
     return 2
   fi
+  if [ "$action" = "continue" ]; then
+    log "Next: 'mcrepo status' to verify; if you were syncing, re-run 'mcrepo sync', then 'mcrepo merge'."
+  else
+    log "Next: 'mcrepo status' to verify the clean state."
+  fi
   return 0
 }
 
@@ -4597,6 +4604,11 @@ _commit_forward() {
     return 1
   fi
   log "Coordinated commit #$seq complete."
+  if [ -n "$GLOBAL_BRANCH" ]; then
+    log "Next: keep working (commit again anytime) — when the feature is done: 'mcrepo sync', then 'mcrepo merge'."
+  else
+    log "Next: keep working (commit again anytime) — or 'mcrepo push' to publish."
+  fi
 }
 
 _commit_revert() {
@@ -5325,6 +5337,12 @@ cmd_push() {
     warn "  Failed:                ${failed_repos[*]}"
     # Exit-code contract: 0 = success, 2 = partial per-repo failure.
     return 2
+  fi
+  if [ "${#committed_pushed[@]}" -gt 0 ] || [ "${#pushed_repos[@]}" -gt 0 ] || [ "${#force_pushed_repos[@]}" -gt 0 ]; then
+    if [ -n "$GLOBAL_BRANCH" ]; then
+      log ""
+      log "Next: 'mcrepo pr' to open coordinated PRs for review — or keep working and 'mcrepo sync' + 'mcrepo merge' when the feature is done."
+    fi
   fi
 }
 
@@ -6978,6 +6996,7 @@ cmd_branch() {
   save_repos
 
   log "Branch operation complete. Global branch set to '$GLOBAL_BRANCH'."
+  log "Next: work on the feature; checkpoint anytime with 'mcrepo commit -m \"...\"'. When done: 'mcrepo sync', then 'mcrepo merge'."
 }
 
 # Delete the current global branch in each write-repo and meta-context,
@@ -7218,6 +7237,7 @@ cmd_branch_delete() {
       log "Hint: run 'mcrepo branch --delete' again to delete the next branch level."
     fi
   fi
+  log "Next: 'mcrepo status' to verify — repos are back on their parent branches."
 }
 
 # A branch is "synced" when it already contains its parent tip — then the
@@ -7810,7 +7830,8 @@ After repairing the cause, re-run: ./mcrepo.sh merge"
   fi
 
   log ""
-  log "Merge complete. Changes are local only — review and push when ready."
+  log "Merge complete. Changes are local only."
+  log "Next: run 'mcrepo push' to publish the merged parent branches."
   if [ "$do_delete" -eq 0 ]; then
     log "Hint: run 'mcrepo branch --delete' to remove '$source_branch' when you're ready."
   fi
@@ -8183,17 +8204,18 @@ cmd_pr() {
     # Exit-code contract: 0 = success, 2 = partial per-repo failure.
     return 2
   fi
+  if [ "${#created[@]}" -gt 0 ] || [ "${#reused[@]}" -gt 0 ]; then
+    log ""
+    log "Next: after the PRs are reviewed and merged upstream, run 'mcrepo pull' to update the parent branches."
+  fi
 }
 
-# Sync the current global branch by rebasing it onto its parent.
-# Per repo: fetch → stash dirty work (incl. untracked) → rebase onto parent → pop stash.
-# Prefers 'origin/<parent>' as the rebase target (freshest after fetch), falls back
-# to local '<parent>' when no origin is configured.
-# Processes ALL repos even if some conflict, giving a complete summary at the end.
-# On rebase conflict the stash is left untouched; on stash-pop conflict the stash
-# remains in the stack (user must 'git stash drop' after resolving).
 # Sync: rebase the current global branch onto each parent branch so the later
-# merge back into the parent is conflict-free. Auto-stashes dirty repos.
+# merge back into the parent is conflict-free. Per repo: fetch → stash dirty
+# work (incl. untracked) → rebase onto parent (prefers 'origin/<parent>') →
+# pop stash. Processes ALL repos even if some conflict (full summary at end);
+# on rebase conflict the stash is left untouched, on stash-pop conflict the
+# stash stays in the stack (drop it after resolving).
 # Implementation behind 'mcrepo sync' ('merge --rebase' is a deprecated alias).
 # The meta-context participates as the last element of the target arrays.
 # Sets SYNC_CONFLICTS to the number of repos left conflicted and returns 2
@@ -8403,11 +8425,13 @@ _sync_run() {
 
   SYNC_CONFLICTS=$(( ${#merge_conflict_repos[@]} + ${#stash_conflict_repos[@]} ))
   if [ "$SYNC_CONFLICTS" -gt 0 ]; then
+    warn "Next: resolve the conflicts (prompt above), 'git add' the files, run 'mcrepo continue', then re-run 'mcrepo sync'."
     return 2
   fi
 
   log ""
-  log "All repos synced. You can now run 'mcrepo merge' to merge into parent branches."
+  log "All repos synced."
+  log "Next: run 'mcrepo merge' to fold the branch back into the parent branches."
   # The rebase rewrote commit hashes. Any cleanly-rebased branch that was already
   # pushed now diverges from its origin/<branch> and must be re-published.
   local -a republish_names=()

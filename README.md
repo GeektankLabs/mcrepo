@@ -7,6 +7,27 @@ The workspace root that holds `mcrepo.yaml` and the shared `+-` folders is calle
 
 ![mcrepo workspace banner](assets/mcrepo-banner.svg)
 
+## The Coordinated Workflow
+
+Everything revolves around one loop — and every command tells you the next step when it finishes:
+
+![mcrepo coordinated workflow](assets/mcrepo-workflow.svg)
+
+| Step | Command | What it does |
+|---|---|---|
+| 1 · Branch | `mcrepo branch feat-x` | one feature branch across all write repos + the meta-context ([details](#branch-coordination)) |
+| 2 · Work + commit | `mcrepo commit -m "…"` | coordinated, revertable checkpoints — repeat as often as you like ([details](#coordinated-commits)) |
+| 3 · Sync | `mcrepo sync` | rebase the branch onto each parent; **all conflicts are resolved here** ([details](#syncing-with-the-parent)) |
+| 4 · Merge | `mcrepo merge` | fold the branch back into each parent — conflict-free after a clean sync ([details](#merging-back)) |
+| 5 · Push | `mcrepo push` | publish to origin; rebased branches are force-with-leased safely ([details](#pushing)) |
+
+Around the loop:
+
+- `mcrepo pull` — bring upstream changes in at any time ([details](#pulling))
+- `mcrepo status` — every repo's branch, state, and stuck indicators at a glance
+- Conflict? `mcrepo resolve` prints a paste-ready prompt for your coding agent; finish with `mcrepo continue` ([details](#conflicts--recovery))
+- Review flow instead of a direct push: `mcrepo pr` opens coordinated, cross-linked GitHub PRs ([details](#fork--pr-workflow))
+
 ## Install & Setup
 
 ### Prerequisites
