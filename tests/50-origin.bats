@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
-# Multi-device / origin workflow: 'pull --rebase' as the origin-side twin of
-# 'sync' (real rebase onto origin, safe-force protection) and the
-# stuck-workspace guard on coordinated commands.
+# Multi-device / origin workflow: plain 'mcrepo pull' as the origin-side twin
+# of 'sync' (auto-stash + real rebase onto origin, safe-force protection,
+# --ff-only conservative mode) and the stuck-workspace guard.
 
 load helpers
 
@@ -9,7 +9,7 @@ setup() {
   setup_workspace
 }
 
-@test "multi-device: pull --rebase replays local commits on top of remote work, then plain push" {
+@test "multi-device: pull replays local commits on top of remote work, then plain push" {
   init_workspace_with_repos alpha
   mcrepo write alpha >/dev/null
   printf 'local feature\n' >alpha/local.txt
@@ -17,7 +17,7 @@ setup() {
   git -C alpha commit -qm "device A work"
   advance_remote alpha "device B change"
 
-  run mcrepo pull --rebase
+  run mcrepo pull
   [ "$status" -eq 0 ]
   assert_contains "$output" "Rebased onto origin"
 
@@ -32,7 +32,7 @@ setup() {
   assert_contains "$output" "in-sync"
 }
 
-@test "multi-device conflict: pull --rebase pauses as REBASING, continue + re-run + push finish it" {
+@test "multi-device conflict: pull pauses as REBASING, continue + re-run + push finish it" {
   init_workspace_with_repos alpha
   mcrepo write alpha >/dev/null
   printf 'device A line\n' >alpha/README.md
@@ -40,7 +40,7 @@ setup() {
   git -C alpha commit -qm "device A conflicting"
   advance_remote alpha "device B line"
 
-  run mcrepo pull --rebase
+  run mcrepo pull
   [ "$status" -eq 2 ]
   assert_contains "$output" "Rebase conflicts"
   assert_contains "$output" "Paste the prompt"
@@ -52,7 +52,7 @@ setup() {
   run mcrepo continue
   [ "$status" -eq 0 ]
 
-  run mcrepo pull --rebase
+  run mcrepo pull
   [ "$status" -eq 0 ]
   run mcrepo push
   [ "$status" -eq 0 ]
@@ -60,13 +60,13 @@ setup() {
   assert_contains "$output" "in-sync"
 }
 
-@test "dirty + behind: pull --rebase carries uncommitted work across the update" {
+@test "dirty + behind: pull carries uncommitted work across the update" {
   init_workspace_with_repos alpha
   mcrepo write alpha >/dev/null
   printf 'uncommitted notes\n' >alpha/notes.txt
   advance_remote alpha "remote moved"
 
-  run mcrepo pull --rebase
+  run mcrepo pull
   [ "$status" -eq 0 ]
   assert_contains "$output" "Updated"
   [ -f alpha/notes.txt ]
@@ -74,7 +74,7 @@ setup() {
   assert_contains "$output" "remote advance alpha"
 }
 
-@test "safe-force protection: pull --rebase never rebases onto a stale post-sync remote" {
+@test "safe-force protection: pull never rebases onto a stale post-sync remote" {
   init_workspace_with_repos alpha
   mcrepo write alpha >/dev/null
   mcrepo branch feat-sf >/dev/null 2>&1
@@ -88,7 +88,7 @@ setup() {
   [ "$status" -eq 0 ]
 
   count_before="$(git -C alpha rev-list --count feat-sf)"
-  run mcrepo pull --rebase
+  run mcrepo pull
   [ "$status" -eq 0 ]
   assert_contains "$output" "Rebased locally"
   assert_contains "$output" "mcrepo push"
@@ -119,9 +119,9 @@ setup() {
   git -C "$b_clone" commit -qm "device B new work"
   git -C "$b_clone" push -q origin feat-b3
 
-  # pull --rebase must NOT rebase (would resurrect stale history) and NOT
+  # pull must NOT rebase (would resurrect stale history) and NOT
   # route to push (force would delete device B's commit) — ambiguous prompt.
-  run mcrepo pull --rebase
+  run mcrepo pull
   [ "$status" -eq 2 ]
   assert_contains "$output" "Diverged"
   assert_contains "$output" "Paste the prompt"
@@ -152,7 +152,7 @@ setup() {
   # sent the repo into a rebase onto its own stale remote (resurrection bug).
   advance_remote alpha "parent move 2"
   count_before="$(git -C alpha rev-list --count feat-pa)"
-  run mcrepo pull --rebase
+  run mcrepo pull
   [ "$status" -eq 0 ]
   assert_contains "$output" "Rebased locally"
   assert_not_contains "$output" "Rebased onto origin"
@@ -175,6 +175,28 @@ setup() {
   assert_contains "$output" "mid-operation/conflicted"
   [ "$(git -C alpha log -1 --format=%s)" = "conflicting commit" ]
   [ -n "$(git -C alpha ls-files -u)" ]
+}
+
+@test "pull --ff-only stays conservative (dirty repo skipped, nothing stashed); --rebase alias warns and integrates" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  printf 'uncommitted local\n' >alpha/notes.txt
+  advance_remote alpha "remote moved"
+
+  run mcrepo pull --ff-only
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "(dirty)"
+  [ -f alpha/notes.txt ]
+  [ -z "$(git -C alpha stash list)" ]
+  run git -C alpha log --format=%s
+  assert_not_contains "$output" "remote advance alpha"
+
+  run mcrepo pull --rebase
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "Deprecation"
+  [ -f alpha/notes.txt ]
+  run git -C alpha log --format=%s
+  assert_contains "$output" "remote advance alpha"
 }
 
 @test "a git bisect session neither blocks coordinated commands nor confuses resolve" {

@@ -123,12 +123,12 @@ make_markerless_conflict() {
   assert_contains "$output" "mcrepo-stash=1"
 }
 
-@test "pull --rebase stash-pop conflict exits 2 and prints the stash-conflict prompt" {
+@test "pull stash-pop conflict exits 2 and prints the stash-conflict prompt" {
   init_workspace_with_repos alpha
   mcrepo write alpha >/dev/null
   printf 'uncommitted local\n' >alpha/README.md
   advance_remote alpha "remote moved"
-  run mcrepo pull --rebase
+  run mcrepo pull
   [ "$status" -eq 2 ]
   assert_contains "$output" "Stash pop conflict"
   assert_contains "$output" "Paste the prompt"

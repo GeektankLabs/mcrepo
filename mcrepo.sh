@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.7.2"
+MCREPO_VERSION="0.7.3"
 # Manifest (mcrepo.yaml) format version. Bump when the manifest schema changes
 # incompatibly; cmd_post_update_migrate migrates older manifests forward.
 MCREPO_SCHEMA_VERSION="1"
@@ -104,8 +104,8 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh sync [--include-read]                  # STEP 3 — rebase the branch onto each parent (auto-stash); resolve conflicts HERE, before merging
   ./mcrepo.sh merge [-m "subject"] [--include-read]  # STEP 4 — squash the branch back into each repo's parent; requires a synced branch (run 'sync' first)
   ./mcrepo.sh push [-m "message"] [--no-fetch] [--no-force] [--include-read] # STEP 5 — fetch + push write repos; safe force-with-lease for rebased branches; aborts if genuinely behind
-  ./mcrepo.sh pull                                   # anytime — fetch + ff-pull all active repos; meta-context auto-stashes on dirty, sub-repos skip on dirty
-  ./mcrepo.sh pull --rebase                          # anytime — auto-stash + rebase local commits onto origin (multi-device); conflicts pause for 'mcrepo continue'
+  ./mcrepo.sh pull                                   # anytime — integrate from origin: auto-stash + rebase local commits onto remote work (multi-device); conflicts pause for 'mcrepo continue'
+  ./mcrepo.sh pull --ff-only                         # anytime — conservative pull: fast-forward only, dirty repos skipped (fetch only); never stashes or rebases
   ./mcrepo.sh pr [-m "title"] [--draft] [--no-push] [--target origin|upstream]  # instead of push — coordinated GitHub PRs per repo; fork->upstream when upstream set; cross-linked
   ./mcrepo.sh branch                                 # List coordinated branches across write repos (alias: 'branch list')
   ./mcrepo.sh branch --delete                        # Discard the global branch, switch repos back to parent branches
@@ -1257,7 +1257,7 @@ _mcrepo_complete() {
       COMPREPLY=( $(compgen -W "-m --draft --no-push --target" -- "$cur") )
       ;;
     pull)
-      COMPREPLY=( $(compgen -W "--rebase --reset --yes" -- "$cur") )
+      COMPREPLY=( $(compgen -W "--ff-only --reset --yes" -- "$cur") )
       ;;
     push)
       COMPREPLY=( $(compgen -W "-m --no-fetch --no-force --include-read" -- "$cur") )
@@ -1371,7 +1371,7 @@ _mcrepo_complete() {
       compadd -- -m --draft --no-push --target
       ;;
     pull)
-      compadd -- --rebase --reset --yes
+      compadd -- --ff-only --reset --yes
       ;;
     push)
       compadd -- -m --no-fetch --no-force --include-read
@@ -1457,8 +1457,8 @@ It provides workspace governance across repos, shared documentation, tests, and 
 - `mcrepo sync` rebases the current branch onto its parent (prefers `origin/<parent>`, falls back to local `<parent>`). Auto-stashes uncommitted work. Conflicts are resolved HERE, on the feature branch — never during the merge. Rewrites local history; `mcrepo push` re-publishes safely.
 - `mcrepo merge` merges the global branch into each write repo's parent branch (local only, no push). It requires a synced branch (run `mcrepo sync` first) and performs a conflict dry-run, so the merge itself never conflicts.
 - `mcrepo resolve` diagnoses stuck repos (mid-rebase, conflicts, leftover stashes) and prints a paste-ready prompt for a coding agent.
-- `mcrepo pull` fetches and fast-forward pulls from origin for all non-sleep repos. Meta-context is auto-stashed when dirty (so it always tracks upstream); dirty sub-repos are skipped (fetch only).
-- `mcrepo pull --rebase` is the origin-side twin of `mcrepo sync`: it auto-stashes uncommitted changes, REALLY rebases local commits onto origin (multi-device work integrates cleanly), then pops the stash. Conflicts pause as `inprogress=REBASING` — resolve, then `mcrepo continue`. Safe for dirty repos.
+- `mcrepo pull` is the origin-side twin of `mcrepo sync`: it auto-stashes uncommitted changes, rebases local commits onto origin (multi-device work integrates cleanly), then pops the stash. Conflicts pause as `inprogress=REBASING` — resolve, then `mcrepo continue`. Safe for dirty repos.
+- `mcrepo pull --ff-only` is the conservative pull: fast-forward only, dirty sub-repos are skipped (fetch only); never stashes or rebases.
 - `mcrepo pull --reset` discards all local changes and resets to origin state. Destructive — requires interactive confirmation.
 - `mcrepo push` pushes all write-mode repos with committed changes to origin.
 - `mcrepo push -m "message"` commits uncommitted changes in all dirty write-mode repos with the given message, then pushes.
@@ -1511,7 +1511,7 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 - `mcrepo branch <name>` distinguishes fork (new branch, records parent) from jump (existing branch, no parent change).
 - `mcrepo branch --delete` discards the global branch and reverts repos to their parent branches.
 - `mcrepo branch --off` is a fallback that turns off coordination without switching branches.
-- `mcrepo pull` fetches and pulls from origin for all active repos (ff-only). Meta-context auto-stashes on dirty; dirty sub-repos skip. `mcrepo pull --rebase` is the origin-side twin of `mcrepo sync`: auto-stash + rebase local commits onto origin — the standard move when work from another device is on the remote; conflicts pause for `mcrepo continue`. After `mcrepo sync`, a coordinated branch can't fast-forward because the rebase rewrote its hashes; pull recognizes this and tells you to run `mcrepo push` instead of rebasing onto the stale remote.
+- `mcrepo pull` is the origin-side twin of `mcrepo sync`: auto-stash + rebase local commits onto origin — the standard move when work from another device is on the remote; conflicts pause for `mcrepo continue`. Use `mcrepo pull --ff-only` for a conservative pull (fast-forward only, dirty sub-repos skipped). After `mcrepo sync`, a coordinated branch can't fast-forward because the rebase rewrote its hashes; pull recognizes this and tells you to run `mcrepo push` instead of rebasing onto the stale remote.
 - `mcrepo push [-m "message"]` pushes write-mode repos. With `-m`, also commits uncommitted changes first (same coordinated-commit format as `mcrepo commit`). Branches that were only rebased onto their parent (diverged from a stale remote, but provably your own rebase) are auto-published with `--force-with-lease` after a fresh fetch; pass `--no-force` to disable. Genuinely diverged branches (remote contains other work) are never force-pushed — mcrepo refuses and prints a paste-ready prompt for a local coding agent to resolve.
 - When `branch:` is empty, branch coordination is off and repos manage branches independently.
 - When running non-interactively (e.g., from scripts or agents), `mcrepo branch` aborts if uncommitted changes exist. Ensure clean working trees before switching branches.
@@ -3573,7 +3573,7 @@ _emit_agent_prompt_body() {
       three_sides=1
       ;;
     pull-rebase-conflict)
-      headline="Rebase conflicts during 'mcrepo pull --rebase' (integrating remote work from another device)."
+      headline="Rebase conflicts during 'mcrepo pull' (integrating remote work from another device)."
       detail="A git rebase is paused: MY local commits are being replayed ON TOP of genuinely new commits fetched from origin. The remote commits form the new base - they must ALL be kept."
       ;;
     merge-conflict)
@@ -3643,7 +3643,7 @@ _emit_agent_prompt_body() {
       printf '   ./mcrepo.sh continue to advance every paused rebase (repeat until none remain). If\n'
       printf '   mcrepo reported an auto-stash, run `git -C <dir> stash pop` afterwards; if the pop\n'
       printf '   itself conflicts, resolve the same way, `git add`, then `git -C <dir> stash drop`.\n'
-      printf '   (If this rebase came from `mcrepo pull --rebase` instead of `mcrepo sync`, the\n'
+      printf '   (If this rebase came from `mcrepo pull` instead of `mcrepo sync`, the\n'
       printf '   commits from origin are genuinely NEW work from another device - they form the new\n'
       printf '   base; never drop them.)\n'
       ;;
@@ -3654,8 +3654,8 @@ _emit_agent_prompt_body() {
       printf '   each paused repo: edit the conflicted files, `git -C <dir> add` them, then run\n'
       printf '   ./mcrepo.sh continue (repeat until none remain). If mcrepo reported an auto-stash,\n'
       printf '   `git -C <dir> stash pop` afterwards; if the pop conflicts, resolve, `git add`, then\n'
-      printf '   `git -C <dir> stash drop`. When everything is clean, re-run ./mcrepo.sh pull --rebase\n'
-      printf '   so remaining repos finish.\n'
+      printf '   `git -C <dir> stash drop`. When everything is clean, re-run ./mcrepo.sh pull so\n'
+      printf '   remaining repos finish.\n'
       ;;
     merge-conflict)
       printf '%d. A paused merge (inprogress=MERGING) is finished with: resolve, `git -C <dir> add`,\n' "$step"
@@ -4199,7 +4199,8 @@ confirm_reset_discard_commits() {
   return 1
 }
 
-# One repo's 'pull --rebase' step, shared by sub-repos and the meta-context.
+# One repo's pull-integrate step (the 'mcrepo pull' default), shared by
+# sub-repos and the meta-context.
 # The origin-side twin of 'mcrepo sync': auto-stash dirty work, then either
 # fast-forward or REALLY rebase local commits onto the upstream (the
 # multi-device case — this device's commits replay on top of what another
@@ -4279,11 +4280,18 @@ _pull_one_rebase() {
 }
 
 cmd_pull() {
-  local pull_mode="default"
+  # Default is INTEGRATE: auto-stash dirty work + rebase local commits onto
+  # origin (the multi-device workflow). '--ff-only' opts into the conservative
+  # pull: fast-forward only, dirty repos skipped, never stashes or rebases.
+  local pull_mode="rebase"
   local assume_yes=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --rebase) pull_mode="rebase" ;;
+      --ff-only) pull_mode="ffonly" ;;
+      --rebase)
+        warn "Deprecation: '--rebase' is now the default 'mcrepo pull' behavior ('--ff-only' gives the old conservative pull)."
+        pull_mode="rebase"
+        ;;
       --reset) pull_mode="reset" ;;
       --yes|-y) assume_yes=1 ;;
       *) die "Unknown pull option: $1" ;;
@@ -4371,7 +4379,7 @@ cmd_pull() {
     local action
     if [ "${pull_has_upstream[$i]}" -eq 0 ]; then
       action="fetch only (no upstream)"
-    elif [ "$pull_mode" = "default" ] && [ "${pull_dirty[$i]}" = "dirty" ]; then
+    elif [ "$pull_mode" = "ffonly" ] && [ "${pull_dirty[$i]}" = "dirty" ]; then
       action="fetch only (dirty)"
     elif [ "$pull_mode" = "reset" ]; then
       if [ "${pull_dirty[$i]}" = "dirty" ]; then
@@ -4606,13 +4614,13 @@ cmd_pull() {
     pull_left_stuck=1
   fi
 
-  if [ "$had_dirty" -eq 1 ] && [ "$pull_mode" = "default" ]; then
+  if [ "$had_dirty" -eq 1 ] && [ "$pull_mode" = "ffonly" ]; then
     log ""
     if [ "$pull_left_stuck" -eq 1 ]; then
-      log "Some repos skipped (dirty). First resolve the conflicts above ('mcrepo resolve'), then"
-      log "use 'mcrepo pull --rebase' to bring dirty repos along (or 'mcrepo pull --reset' to discard)."
+      log "Some repos skipped (dirty, --ff-only). First resolve the conflicts above ('mcrepo resolve'),"
+      log "then run 'mcrepo pull' to bring dirty repos along (or 'mcrepo pull --reset' to discard)."
     else
-      log "Some repos skipped (dirty). Use 'mcrepo pull --rebase' to auto-stash and pull,"
+      log "Some repos skipped (dirty, --ff-only). Run 'mcrepo pull' to auto-stash and integrate them,"
       log "or 'mcrepo pull --reset' to discard local changes."
     fi
   fi
@@ -4637,14 +4645,14 @@ cmd_pull() {
       log "force-pushing could delete the new ones. Review with the prompt below before deciding:"
     else
       log "These branches diverged AND their remote contains new work (e.g. pushed from another"
-      log "device) — a plain pull can't fast-forward. Run 'mcrepo pull --rebase' to put your local"
-      log "commits on top of the remote work, or review manually first:"
+      log "device) — a fast-forward-only pull can't integrate that. Run 'mcrepo pull' (without"
+      log "--ff-only) to put your local commits on top of the remote work, or review manually first:"
     fi
     local dc2
     for dc2 in "${diverged_conflict[@]}"; do
       log "  - ${dc2%%|*}"
     done
-    if [ "$pull_mode" = "default" ] && [ "$pull_left_stuck" -eq 1 ]; then
+    if [ "$pull_mode" = "ffonly" ] && [ "$pull_left_stuck" -eq 1 ]; then
       log "(first resolve the conflicts above — coordinated commands refuse to run over conflicted repos)"
     fi
     print_agent_recovery_prompt ambiguous-divergence "${diverged_conflict[@]}"
@@ -4652,7 +4660,7 @@ cmd_pull() {
 
   if [ "${#rebase_conflict_entries[@]}" -gt 0 ]; then
     print_agent_recovery_prompt pull-rebase-conflict "${rebase_conflict_entries[@]}"
-    warn "Next: resolve the conflicts (prompt above), 'git add' the files, run 'mcrepo continue', then re-run 'mcrepo pull --rebase'."
+    warn "Next: resolve the conflicts (prompt above), 'git add' the files, run 'mcrepo continue', then re-run 'mcrepo pull'."
   fi
 
   if [ "${#stash_conflict_entries[@]}" -gt 0 ]; then
@@ -5340,7 +5348,7 @@ cmd_push() {
       log ""
       log "Sync first with one of:"
       log "  mcrepo pull           # fast-forward where possible"
-      log "  mcrepo pull --rebase  # rebase local commits on top of upstream"
+      log "  mcrepo pull           # rebase local commits on top of upstream"
       log "Or rerun with --no-fetch to skip this safety check (still rejected by remote on real conflicts)."
     fi
     if [ "${#remote_work_entries[@]}" -gt 0 ]; then
