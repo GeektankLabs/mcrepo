@@ -20,6 +20,7 @@ setup() {
   run mcrepo pull
   [ "$status" -eq 0 ]
   assert_contains "$output" "Rebased onto origin"
+  assert_contains "$output" "✓ Pull complete"
 
   run git -C alpha log --format=%s
   assert_contains "$output" "device A work"

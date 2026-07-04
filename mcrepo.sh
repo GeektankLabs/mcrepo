@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.7.8"
+MCREPO_VERSION="0.7.9"
 # Manifest (mcrepo.yaml) format version. Bump when the manifest schema changes
 # incompatibly; cmd_post_update_migrate migrates older manifests forward.
 MCREPO_SCHEMA_VERSION="1"
@@ -4787,16 +4787,19 @@ _pull_from_location() {
   if [ "${#conflict_entries[@]}" -gt 0 ]; then
     MCREPO_RERUN_CMD="mcrepo pull $loc"
     print_agent_recovery_prompt pull-rebase-conflict "${conflict_entries[@]}"
-    warn "Next: have the conflicts resolved and staged (prompt above), then re-run 'mcrepo pull $loc'."
+    warn "✗ Pull incomplete — conflicts remain (agent prompt above). Have them resolved and staged, then re-run 'mcrepo pull $loc'."
     return 2
   fi
   if [ "${#failed[@]}" -gt 0 ]; then
+    warn "✗ Pull incomplete — see the report above, then re-run 'mcrepo pull $loc'."
     return 2
   fi
   if [ "${#needs_push[@]}" -gt 0 ]; then
     log ""
     log "Next: 'mcrepo push $loc' to bring the location up to date."
   fi
+  log ""
+  log "✓ Pull from '$loc' complete — continue your work."
   return 0
 }
 
@@ -5276,7 +5279,7 @@ cmd_pull() {
 
   if [ "${#rebase_conflict_entries[@]}" -gt 0 ]; then
     print_agent_recovery_prompt pull-rebase-conflict "${rebase_conflict_entries[@]}"
-    warn "Next: have the conflicts resolved and staged (prompt above), then re-run 'mcrepo pull' — it finishes everything and reports the next step."
+    warn "✗ Pull incomplete — conflicts remain (agent prompt above). Have them resolved and staged, then re-run 'mcrepo pull'."
   fi
 
   if [ "${#stash_conflict_entries[@]}" -gt 0 ]; then
@@ -5290,8 +5293,13 @@ cmd_pull() {
 
   # Exit-code contract: 0 = success, 2 = partial per-repo failure.
   if [ "${#failed_repos[@]}" -gt 0 ] || [ "${#stash_conflict_repos[@]}" -gt 0 ] || [ "${#diverged_conflict[@]}" -gt 0 ] || [ "${#rebase_conflict_repos[@]}" -gt 0 ]; then
+    if [ "${#rebase_conflict_repos[@]}" -eq 0 ] && [ "${#stash_conflict_repos[@]}" -eq 0 ]; then
+      warn "✗ Pull incomplete — see the report above, then re-run 'mcrepo pull'."
+    fi
     return 2
   fi
+  log ""
+  log "✓ Pull complete — workspace is in sync. Continue your work."
 }
 
 # Gather target repos (write; read if include_read=1) + meta-context.
@@ -9311,7 +9319,8 @@ _rebase_run() {
   fi
 
   if [ "${#rebase_names[@]}" -eq 0 ]; then
-    log "All repos are already in sync with their parent branches."
+    log "✓ Rebase complete — all repos are already in sync with their parent branches."
+    log "Next: run 'mcrepo merge' to fold the branch back into the parent branches."
     return 0
   fi
 
@@ -9437,12 +9446,12 @@ _rebase_run() {
 
   REBASE_CONFLICTS=$(( ${#merge_conflict_repos[@]} + ${#stash_conflict_repos[@]} ))
   if [ "$REBASE_CONFLICTS" -gt 0 ]; then
-    warn "Next: have the conflicts resolved and staged (prompt above), then re-run 'mcrepo rebase' — it finishes everything and reports the next step."
+    warn "✗ Rebase incomplete — conflicts remain (agent prompt above). Have them resolved and staged, then re-run 'mcrepo rebase'."
     return 2
   fi
 
   log ""
-  log "All repos synced."
+  log "✓ Rebase complete — all repos are in sync with their parents."
   log "Next: run 'mcrepo merge' to fold the branch back into the parent branches."
   # The rebase rewrote commit hashes. Any cleanly-rebased branch that was already
   # pushed now diverges from its origin/<branch> and must be re-published.

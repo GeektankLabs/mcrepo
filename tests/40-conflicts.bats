@@ -50,6 +50,7 @@ make_markerless_conflict() {
   assert_contains "$output" "Rebase conflicts"
   assert_contains "$output" "Paste the prompt"
   assert_contains "$output" "Resolve ONLY real semantic conflicts"
+  assert_contains "$output" "✗ Rebase incomplete"
   run mcrepo status
   assert_contains "$output" "inprogress=REBASING"
 }
@@ -73,6 +74,7 @@ make_markerless_conflict() {
   run mcrepo rebase
   [ "$status" -eq 0 ]
   assert_contains "$output" "continuing the paused rebase"
+  assert_contains "$output" "✓ Rebase complete"
   run mcrepo status
   assert_not_contains "$output" "inprogress="
 
