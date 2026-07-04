@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.7.7"
+MCREPO_VERSION="0.7.8"
 # Manifest (mcrepo.yaml) format version. Bump when the manifest schema changes
 # incompatibly; cmd_post_update_migrate migrates older manifests forward.
 MCREPO_SCHEMA_VERSION="1"
@@ -3711,7 +3711,7 @@ _stash_is_marked_applied() {
 _mcrepo_stash_push() {
   local dir="$1" msg="$2" before after
   before="$(git -C "$dir" rev-parse -q --verify refs/stash 2>/dev/null || true)"
-  git -C "$dir" stash push --include-untracked -m "$msg" 2>/dev/null || true
+  git -C "$dir" stash push --quiet --include-untracked -m "$msg" 2>/dev/null || true
   after="$(git -C "$dir" rev-parse -q --verify refs/stash 2>/dev/null || true)"
   [ "$after" != "$before" ]
 }
@@ -4234,7 +4234,7 @@ _finalize_mcrepo_stashes() {
     warn "${names[$i]}: $count leftover mcrepo stash(es):"
     git -C "${dirs[$i]}" stash list 2>/dev/null | grep 'mcrepo:' | sed 's/^/    /' >&2 || true
     if confirm "  Pop the top stash in '${names[$i]}' now (drop it instead if its changes were already applied)?" n; then
-      if git -C "${dirs[$i]}" stash pop; then
+      if git -C "${dirs[$i]}" stash pop --quiet; then
         log "  ${names[$i]}: stash popped"
       else
         warn "  Stash pop conflicted in '${names[$i]}'. Resolve, 'git -C ${dirs[$i]} add', then 'git -C ${dirs[$i]} stash drop'."
@@ -4459,7 +4459,7 @@ _resume_inflight_rebase() {
       _clear_rebase_inflight "$dir"
       # Rebase finished — restore the auto-stash this operation parked, if any.
       if git -C "$dir" stash list -1 2>/dev/null | head -1 | grep -q 'mcrepo: auto-stash'; then
-        if ! git -C "$dir" stash pop; then
+        if ! git -C "$dir" stash pop --quiet; then
           _mark_stash_applied "$dir"
           return 3
         fi
@@ -4622,7 +4622,7 @@ _pull_one_rebase() {
   class="$(classify_divergence "$rd" "$rb" "$rp")"
   case "$class" in
     safe-force)
-      [ "$stashed" -eq 1 ] && { git -C "$rd" stash pop 2>/dev/null || true; }
+      [ "$stashed" -eq 1 ] && { git -C "$rd" stash pop --quiet 2>/dev/null || true; }
       diverged_rebased+=("$rn|$rd")
       return 0
       ;;
@@ -4630,7 +4630,7 @@ _pull_one_rebase() {
       # The remote may hold BOTH our stale pre-rebase history AND new work
       # stacked on it - rebasing could resurrect the old commits, forcing
       # could delete the new ones. Hand it to a human/agent untouched.
-      [ "$stashed" -eq 1 ] && { git -C "$rd" stash pop 2>/dev/null || true; }
+      [ "$stashed" -eq 1 ] && { git -C "$rd" stash pop --quiet 2>/dev/null || true; }
       diverged_conflict+=("$rn|$rd")
       warn "'$rn': diverged in a way mcrepo cannot prove safe — not rebasing, not force-publishing."
       return 0
@@ -4653,12 +4653,12 @@ _pull_one_rebase() {
     *)
       # none (in-sync/ahead-only) or behind-only: plain fast-forward.
       if ! git -C "$rd" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
-        [ "$stashed" -eq 1 ] && { git -C "$rd" stash pop 2>/dev/null || true; }
+        [ "$stashed" -eq 1 ] && { git -C "$rd" stash pop --quiet 2>/dev/null || true; }
         fetch_only_repos+=("$rn (no upstream)")
         return 0
       fi
       if ! run_with_repo_prefix "$rn" git -C "$rd" pull --ff-only; then
-        [ "$stashed" -eq 1 ] && { git -C "$rd" stash pop 2>/dev/null || true; }
+        [ "$stashed" -eq 1 ] && { git -C "$rd" stash pop --quiet 2>/dev/null || true; }
         warn "Pull failed for '$rn'"
         failed_repos+=("$rn")
         return 0
@@ -4666,7 +4666,7 @@ _pull_one_rebase() {
       ;;
   esac
   if [ "$stashed" -eq 1 ]; then
-    if ! git -C "$rd" stash pop 2>/dev/null; then
+    if ! git -C "$rd" stash pop --quiet 2>/dev/null; then
       _mark_stash_applied "$rd"
       warn "Stash pop conflict in '$rn'. Stash preserved — have the files resolved and staged, then re-run 'mcrepo pull' (it drops the already-applied stash)."
       stash_conflict_repos+=("$rn")
@@ -4768,7 +4768,7 @@ _pull_from_location() {
       warn "  Have the files resolved and staged, then re-run 'mcrepo pull $loc'."
       continue
     fi
-    if [ "$stashed" -eq 1 ] && ! git -C "$repo_dir" stash pop; then
+    if [ "$stashed" -eq 1 ] && ! git -C "$repo_dir" stash pop --quiet; then
       _mark_stash_applied "$repo_dir"
       conflicts+=("${REPO_NAMES[$i]}")
       conflict_entries+=("${REPO_NAMES[$i]}|$repo_dir")
@@ -5153,7 +5153,7 @@ cmd_pull() {
       fi
       if run_with_repo_prefix "(meta-context)" git -C . pull --ff-only; then
         if [ "$meta_stashed" -eq 1 ]; then
-          if ! git -C . stash pop 2>/dev/null; then
+          if ! git -C . stash pop --quiet 2>/dev/null; then
             _mark_stash_applied "."
             warn "Stash pop conflict in (meta-context). Resolve, 'git add', then re-run 'mcrepo pull'."
             stash_conflict_repos+=("(meta-context)")
@@ -5166,7 +5166,7 @@ cmd_pull() {
         fi
       else
         warn "Pull failed for (meta-context) (diverged). Restoring stash."
-        [ "$meta_stashed" -eq 1 ] && git -C . stash pop 2>/dev/null || true
+        [ "$meta_stashed" -eq 1 ] && git -C . stash pop --quiet 2>/dev/null || true
         case "$(classify_divergence "." "$meta_branch" "$meta_pull_parent")" in
           safe-force) diverged_rebased+=("(meta-context)|.") ;;
           remote-work|ambiguous) diverged_conflict+=("(meta-context)|.") ;;
@@ -7943,7 +7943,7 @@ cmd_branch() {
     if echo "$stash_msg" | grep -q "mcrepo: carry to $branch_name"; then
       [ "$restored_any" -eq 1 ] || log "Restoring carried changes ..."
       restored_any=1
-      if ! git -C "$ddir" stash pop; then
+      if ! git -C "$ddir" stash pop --quiet; then
         _mark_stash_applied "$ddir"
         warn "Stash pop had issues in '$ddir'. Have the files resolved and staged, then re-run 'mcrepo branch $branch_name' to finalize."
         carry_fail_entries+=("$ddir|$ddir")
@@ -9400,7 +9400,7 @@ _rebase_run() {
 
     # Pop stash
     if [ "$did_stash" -eq 1 ]; then
-      if ! git -C "$repo_dir" stash pop; then
+      if ! git -C "$repo_dir" stash pop --quiet; then
         _mark_stash_applied "$repo_dir"
         stash_conflict_repos+=("$repo_name")
         stash_conflict_entries+=("$repo_name|$repo_dir")
