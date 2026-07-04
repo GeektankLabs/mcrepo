@@ -40,12 +40,12 @@ make_markerless_conflict() {
   run mcrepo merge
   [ "$status" -eq 1 ]
   assert_contains "$output" "behind its parent"
-  assert_contains "$output" "mcrepo sync"
+  assert_contains "$output" "mcrepo rebase"
 }
 
-@test "sync surfaces a rebase conflict: exit 2, REBASING state, agent prompt" {
+@test "rebase surfaces a conflict: exit 2, REBASING state, agent prompt" {
   make_conflict
-  run mcrepo sync
+  run mcrepo rebase
   [ "$status" -eq 2 ]
   assert_contains "$output" "Rebase conflicts"
   assert_contains "$output" "Paste the prompt"
@@ -56,7 +56,7 @@ make_markerless_conflict() {
 
 @test "continue exits 2 while unresolved, finishes the rebase after resolving; merge then fast-forwards the parent" {
   make_conflict
-  run mcrepo sync
+  run mcrepo rebase
   [ "$status" -eq 2 ]
 
   # Unresolved: continue must not pretend success.
@@ -71,8 +71,8 @@ make_markerless_conflict() {
   run mcrepo status
   assert_not_contains "$output" "inprogress="
 
-  # Second sync is a no-op, merge passes the gate and completes.
-  run mcrepo sync
+  # Second rebase is a no-op, merge passes the gate and completes.
+  run mcrepo rebase
   [ "$status" -eq 0 ]
   run mcrepo merge
   [ "$status" -eq 0 ]
@@ -84,7 +84,7 @@ make_markerless_conflict() {
 @test "abort restores the pre-rebase state" {
   make_conflict
   pre_sha="$(git -C alpha rev-parse HEAD)"
-  run mcrepo sync
+  run mcrepo rebase
   [ "$status" -eq 2 ]
   run mcrepo abort
   [ "$status" -eq 0 ]
@@ -213,18 +213,18 @@ make_markerless_conflict() {
   assert_contains "$(repo_subject beta)" "mcrepo commit #"
 }
 
-@test "sync honors --include-read; without the flag it hints about read repos on the branch" {
+@test "rebase honors --include-read; without the flag it hints about read repos on the branch" {
   init_workspace_with_repos alpha beta
   mcrepo write alpha >/dev/null
   mcrepo read beta >/dev/null
   mcrepo branch feat-r --include-read >/dev/null 2>&1
   advance_remote beta "remote advance content"
 
-  run mcrepo sync
+  run mcrepo rebase
   [ "$status" -eq 0 ]
   assert_contains "$output" "re-run with --include-read"
 
-  run mcrepo sync --include-read
+  run mcrepo rebase --include-read
   [ "$status" -eq 0 ]
   run git -C beta log --format=%s
   assert_contains "$output" "remote advance beta"
@@ -251,7 +251,7 @@ make_markerless_conflict() {
   assert_contains "$body" "(cd "
   assert_not_contains "$body" "Paste the prompt"
 
-  # Deprecated alias still works and points at sync.
+  # Deprecated alias still works and points at rebase.
   git -C alpha checkout -q -- . 2>/dev/null || true
   git -C alpha reset -q --merge 2>/dev/null || true
   git -C alpha stash drop >/dev/null 2>&1 || true
@@ -259,5 +259,15 @@ make_markerless_conflict() {
   run mcrepo merge --rebase
   [ "$status" -eq 0 ]
   assert_contains "$output" "Deprecation"
-  assert_contains "$output" "mcrepo sync"
+  assert_contains "$output" "mcrepo rebase"
+}
+
+@test "'mcrepo sync' remains a quiet alias of 'mcrepo rebase' (no deprecation warning)" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  mcrepo branch feat-alias >/dev/null 2>&1
+  run mcrepo sync
+  [ "$status" -eq 0 ]
+  assert_not_contains "$output" "Deprecation"
+  assert_contains "$output" "Rebase"
 }

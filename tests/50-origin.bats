@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
 # Multi-device / origin workflow: plain 'mcrepo pull' as the origin-side twin
-# of 'sync' (auto-stash + real rebase onto origin, safe-force protection,
+# of 'mcrepo rebase' (auto-stash + real rebase onto origin, safe-force protection,
 # --ff-only conservative mode) and the stuck-workspace guard.
 
 load helpers
@@ -84,7 +84,7 @@ setup() {
   git -C alpha push -q -u origin feat-sf
   advance_remote alpha "parent moved"
 
-  run mcrepo sync
+  run mcrepo rebase
   [ "$status" -eq 0 ]
 
   count_before="$(git -C alpha rev-list --count feat-sf)"
@@ -108,7 +108,7 @@ setup() {
   git -C alpha commit -qm "feature work"
   git -C alpha push -q -u origin feat-b3
   advance_remote alpha "parent moved"
-  run mcrepo sync
+  run mcrepo rebase
   [ "$status" -eq 0 ]
 
   # Device B pushes a NEW commit onto the (now stale) origin/feat-b3.
@@ -145,7 +145,7 @@ setup() {
   git -C alpha commit -qm "feature work"
   git -C alpha push -q -u origin feat-pa
   advance_remote alpha "parent move 1"
-  run mcrepo sync
+  run mcrepo rebase
   [ "$status" -eq 0 ]
 
   # Parent moves AGAIN after the sync — the old ancestry proof broke here and
