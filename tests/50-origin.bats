@@ -47,13 +47,12 @@ setup() {
   run mcrepo status
   assert_contains "$output" "inprogress=REBASING"
 
+  # Agent-style fix: edit + git add only, then re-run pull (no continue).
   printf 'both lines merged\n' >alpha/README.md
   git -C alpha add README.md
-  run mcrepo continue
-  [ "$status" -eq 0 ]
-
   run mcrepo pull
   [ "$status" -eq 0 ]
+  assert_contains "$output" "continuing the paused rebase"
   run mcrepo push
   [ "$status" -eq 0 ]
   run mcrepo status
@@ -225,12 +224,14 @@ setup() {
   run git -C alpha stash pop
   [ "$status" -ne 0 ]
 
+  # pull may proceed (re-run is the resume path) but reports the conflict.
   run mcrepo pull
-  [ "$status" -eq 1 ]
-  assert_contains "$output" "mid-operation or conflicted"
-  assert_contains "$output" "mcrepo resolve"
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "conflicted"
+  # commit stays strictly guarded; branch dies on the unresolved carry state.
   run mcrepo commit -m "should not work"
   [ "$status" -eq 1 ]
+  assert_contains "$output" "mid-operation or conflicted"
   run mcrepo branch feat-blocked
   [ "$status" -eq 1 ]
 

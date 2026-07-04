@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.7.4"
+MCREPO_VERSION="0.7.5"
 # Manifest (mcrepo.yaml) format version. Bump when the manifest schema changes
 # incompatibly; cmd_post_update_migrate migrates older manifests forward.
 MCREPO_SCHEMA_VERSION="1"
@@ -18,7 +18,7 @@ OPENCODE_PROJECT_SKILLS_DIR=".opencode/skills"
 # Single source of truth for the user-facing command surface. usage(), the
 # dispatch in main(), and the generated completions must stay in sync with
 # this list (checked by tests/30-inventory.bats).
-MCREPO_COMMANDS="init publish-base add upstream fork doctor new publish remove write read sleep list branch rebase merge pr pull push commit continue abort resolve open status skill version update install-extension create-patch help"
+MCREPO_COMMANDS="init publish-base add upstream fork doctor new publish remove write read sleep list branch rebase merge pr pull push commit abort open status skill version update install-extension create-patch help"
 
 COMPLETION_BASH_FILE=".mcrepo-completion.bash"
 COMPLETION_ZSH_FILE=".mcrepo-completion.zsh"
@@ -104,7 +104,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh rebase [--include-read]                  # STEP 3 — rebase the branch onto each parent (auto-stash); resolve conflicts HERE, before merging
   ./mcrepo.sh merge [-m "subject"] [--include-read]  # STEP 4 — squash the branch back into each repo's parent; requires a rebased branch (run 'rebase' first)
   ./mcrepo.sh push [-m "message"] [--no-fetch] [--no-force] [--include-read] # STEP 5 — fetch + push write repos; safe force-with-lease for rebased branches; aborts if genuinely behind
-  ./mcrepo.sh pull                                   # anytime — integrate from origin: auto-stash + rebase local commits onto remote work (multi-device); conflicts pause for 'mcrepo continue'
+  ./mcrepo.sh pull                                   # anytime — integrate from origin: auto-stash + rebase local commits onto remote work (multi-device); on conflict: resolve, then re-run
   ./mcrepo.sh pull --ff-only                         # anytime — conservative pull: fast-forward only, dirty repos skipped (fetch only); never stashes or rebases
   ./mcrepo.sh pr [-m "title"] [--draft] [--no-push] [--target origin|upstream]  # instead of push — coordinated GitHub PRs per repo; fork->upstream when upstream set; cross-linked
   ./mcrepo.sh branch                                 # List coordinated branches across write repos (alias: 'branch list')
@@ -118,9 +118,10 @@ Usage:  # Show available mcrepo commands
 ═══════════════════════════════════════════════════════════════════════════════
   MID-OPERATION RECOVERY
 ═══════════════════════════════════════════════════════════════════════════════
-  ./mcrepo.sh continue                            # Resume any mid-merge/rebase/cherry-pick/revert across repos (--continue); exits 2 while conflicts remain
-  ./mcrepo.sh abort                               # Abort any mid-merge/rebase/cherry-pick/revert across repos (--abort); clears marker-less conflicts too
-  ./mcrepo.sh resolve                             # Read-only diagnosis of stuck repos; prints a paste-ready coding-agent prompt on stdout
+  On conflict, every command prints a coding-agent prompt and pauses; after the
+  conflicts are resolved and staged, RE-RUN the same command — it finishes the
+  paused operations automatically. To back out instead:
+  ./mcrepo.sh abort                               # Abort any mid-merge/rebase/cherry-pick/revert across repos; clears marker-less conflicts too
 
 ═══════════════════════════════════════════════════════════════════════════════
   INSPECTION & NAVIGATION
@@ -1456,8 +1457,8 @@ It provides workspace governance across repos, shared documentation, tests, and 
 - Parent branches are recorded automatically when `mcrepo branch` forks a new branch. Each repo can have a different parent.
 - `mcrepo rebase` rebases the current branch onto its parent (prefers `origin/<parent>`, falls back to local `<parent>`). Auto-stashes uncommitted work. Conflicts are resolved HERE, on the feature branch — never during the merge. Rewrites local history; `mcrepo push` re-publishes safely.
 - `mcrepo merge` merges the global branch into each write repo's parent branch (local only, no push). It requires a synced branch (run `mcrepo rebase` first) and performs a conflict dry-run, so the merge itself never conflicts.
-- `mcrepo resolve` diagnoses stuck repos (mid-rebase, conflicts, leftover stashes) and prints a paste-ready prompt for a coding agent.
-- `mcrepo pull` is the origin-side twin of `mcrepo rebase`: it auto-stashes uncommitted changes, rebases local commits onto origin (multi-device work integrates cleanly), then pops the stash. Conflicts pause as `inprogress=REBASING` — resolve, then `mcrepo continue`. Safe for dirty repos.
+- On conflict, every coordinated command prints a paste-ready prompt for a coding agent and pauses; after the files are resolved and staged, RE-RUN the same command — it finishes automatically.
+- `mcrepo pull` is the origin-side twin of `mcrepo rebase`: it auto-stashes uncommitted changes, rebases local commits onto origin (multi-device work integrates cleanly), then pops the stash. Conflicts pause as `inprogress=REBASING` — resolve, stage, then re-run `mcrepo pull`. Safe for dirty repos.
 - `mcrepo pull --ff-only` is the conservative pull: fast-forward only, dirty sub-repos are skipped (fetch only); never stashes or rebases.
 - `mcrepo pull --reset` discards all local changes and resets to origin state. Destructive — requires interactive confirmation.
 - `mcrepo push` pushes all write-mode repos with committed changes to origin.
@@ -1511,7 +1512,7 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 - `mcrepo branch <name>` distinguishes fork (new branch, records parent) from jump (existing branch, no parent change).
 - `mcrepo branch --delete` discards the global branch and reverts repos to their parent branches.
 - `mcrepo branch --off` is a fallback that turns off coordination without switching branches.
-- `mcrepo pull` is the origin-side twin of `mcrepo rebase`: auto-stash + rebase local commits onto origin — the standard move when work from another device is on the remote; conflicts pause for `mcrepo continue`. Use `mcrepo pull --ff-only` for a conservative pull (fast-forward only, dirty sub-repos skipped). After `mcrepo rebase`, a coordinated branch can't fast-forward because the rebase rewrote its hashes; pull recognizes this and tells you to run `mcrepo push` instead of rebasing onto the stale remote.
+- `mcrepo pull` is the origin-side twin of `mcrepo rebase`: auto-stash + rebase local commits onto origin — the standard move when work from another device is on the remote; on conflict: resolve, stage, re-run `mcrepo pull`. Use `mcrepo pull --ff-only` for a conservative pull (fast-forward only, dirty sub-repos skipped). After `mcrepo rebase`, a coordinated branch can't fast-forward because the rebase rewrote its hashes; pull recognizes this and tells you to run `mcrepo push` instead of rebasing onto the stale remote.
 - `mcrepo push [-m "message"]` pushes write-mode repos. With `-m`, also commits uncommitted changes first (same coordinated-commit format as `mcrepo commit`). Branches that were only rebased onto their parent (diverged from a stale remote, but provably your own rebase) are auto-published with `--force-with-lease` after a fresh fetch; pass `--no-force` to disable. Genuinely diverged branches (remote contains other work) are never force-pushed — mcrepo refuses and prints a paste-ready prompt for a local coding agent to resolve.
 - When `branch:` is empty, branch coordination is off and repos manage branches independently.
 - When running non-interactively (e.g., from scripts or agents), `mcrepo branch` aborts if uncommitted changes exist. Ensure clean working trees before switching branches.
@@ -1519,23 +1520,25 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 ## Conflict Recovery
 
 When a coordinated operation (`mcrepo rebase`, `merge`, `pull`, `push`, `branch`) stops on
-conflicts, follow this procedure instead of improvising:
+conflicts, the loop is always the same — the command itself is the loop:
 
-1. Diagnose with `./mcrepo.sh status`: look for `inprogress=REBASING/MERGING/CONFLICTED`
-   and unexpected `mcrepo-stash=N`. Then run `./mcrepo.sh resolve` — it prints the
-   situation-specific recovery procedure; treat that output as the authoritative instructions.
-2. Resolve ONLY real semantic conflicts inside the conflict markers. Where both sides differ
-   purely in formatting/whitespace, keep the parent branch's formatting and preserve both
-   sides' substantive changes. Never reformat or "clean up" code outside conflict markers.
+1. mcrepo prints a paste-ready recovery prompt at the moment it stops, and `./mcrepo.sh status`
+   shows the stuck repos (`inprogress=REBASING/MERGING/CONFLICTED`, `mcrepo-stash=N`).
+2. Resolve ONLY real semantic conflicts inside the conflict markers, then `git add` the
+   resolved files. Where both sides differ purely in formatting/whitespace, keep the parent
+   branch's formatting and preserve both sides' substantive changes. Never reformat or
+   "clean up" code outside conflict markers.
 3. Conflicting commits are often mcrepo coordination commits (`mcrepo commit #N @<batch>`)
    present in both old and rebased form — never keep both; the target is the real feature
    work on top of the latest parent branch.
-4. Finish with `git add` on resolved files, then `./mcrepo.sh continue`, repeating until
-   `./mcrepo.sh status` is clean. Stash-pop conflicts have nothing to continue: resolve,
-   `git add`, then `git stash drop`.
+4. Do NOT run `git rebase --continue`, `git commit`, or any mcrepo git command yourself:
+   after resolving and staging, tell the user to RE-RUN the command that stopped
+   (`mcrepo rebase` / `mcrepo pull` / `mcrepo merge` / `mcrepo branch <name>`) — it finishes
+   the paused operations, restores auto-stashed changes, and prints the next step. Repeat
+   the loop if the re-run reports further conflicts.
 5. Never run `git push --force`, `git reset --hard`, `git rebase --skip`, or delete branches
-   or stashes without the user's explicit approval. Publishing stays user-driven via
-   `mcrepo push`.
+   or stashes. Publishing stays user-driven via `mcrepo push`; backing out entirely is
+   user-driven via `mcrepo abort`.
 
 ## Coordinated Commits (User-Driven)
 
@@ -1736,20 +1739,21 @@ Recover coordinated multi-repo git operations from conflicts without losing work
 - A coordinated `rebase`, `merge`, `pull`, `push`, or `branch` stopped on conflicts.
 
 ## Procedure
-1. Run `./mcrepo.sh resolve` and treat its output as the authoritative, situation-specific
-   instructions. Orient with `./mcrepo.sh status` and per-repo `git status` before changing anything.
+1. Read the recovery prompt mcrepo printed when it stopped; orient with `git status` and
+   `git log --oneline --graph --all -20` in each affected repo before changing anything.
 2. Resolve ONLY real semantic conflicts. On formatting-only collisions, keep the parent side's
    formatting and preserve both sides' substantive changes. Never reformat outside conflict markers.
 3. Watch for duplicated `mcrepo commit #N @<batch>` coordination commits (old + rebased form) —
    never keep both; the target state is the real feature work on top of the latest parent.
-4. Finish per situation: `git add` resolved files, then `./mcrepo.sh continue` (paused rebase/merge)
-   or `git stash drop` (stash-pop conflict), until `./mcrepo.sh status` is clean.
+4. Stage the resolved files with `git add`, then tell the user to RE-RUN the mcrepo command
+   that stopped (`mcrepo rebase` / `mcrepo pull` / `mcrepo merge` / `mcrepo branch <name>`) —
+   it finishes the paused operations and restores auto-stashed changes. Repeat if it reports
+   further conflicts.
 
 ## Guardrails
-- Never `git push --force`, `git reset --hard`, `git rebase --skip`, or delete branches/stashes
-  without explicit user approval; publishing stays user-driven via `mcrepo push`.
-- Commit only to complete a paused operation or a repair commit the recovery instructions name
-  verbatim; new feature commits stay user-driven.
+- Your action space is editing files and `git add`. Never run mcrepo yourself, never
+  `git rebase/commit/stash/push/pull/reset`, never force anything, never delete branches or
+  stashes; publishing stays user-driven via `mcrepo push`.
 - Respect `mcrepo.yaml` mode gates at all times.
 EOF
 }
@@ -3456,6 +3460,27 @@ repo_mcrepo_stash_count() {
 # 'git stash push' exits 0 with "No local changes to save" when the dirty
 # state is something stash cannot capture (e.g. a moved submodule pointer) —
 # a later blind 'stash pop' would then pop an unrelated pre-existing stash.
+# A conflicted 'git stash pop' APPLIES the stash content (with markers) but
+# keeps the entry as backup. Once the user/agent resolves and stages the
+# files, nothing in git says "this stash was already applied" — so the re-run
+# marks that fact in a git-native ref at the moment the pop conflicts, and
+# drops the entry (instead of re-popping it) when the conflict is resolved.
+_mark_stash_applied() {
+  local dir="$1" sha
+  sha="$(git -C "$dir" rev-parse -q --verify 'stash@{0}' 2>/dev/null || true)"
+  [ -n "$sha" ] && git -C "$dir" update-ref refs/mcrepo/applied-stash "$sha" 2>/dev/null
+  return 0
+}
+_clear_stash_applied() {
+  git -C "$1" update-ref -d refs/mcrepo/applied-stash 2>/dev/null || true
+}
+_stash_is_marked_applied() {
+  local dir="$1" sha ref
+  sha="$(git -C "$dir" rev-parse -q --verify 'stash@{0}' 2>/dev/null || true)"
+  ref="$(git -C "$dir" rev-parse -q --verify refs/mcrepo/applied-stash 2>/dev/null || true)"
+  [ -n "$sha" ] && [ "$sha" = "$ref" ]
+}
+
 _mcrepo_stash_push() {
   local dir="$1" msg="$2" before after
   before="$(git -C "$dir" rev-parse -q --verify refs/stash 2>/dev/null || true)"
@@ -3565,32 +3590,37 @@ classify_divergence() {
 MCREPO_RECOVERY_CONTEXT=""
 _emit_agent_prompt_body() {
   local situation="$1"; shift
-  local headline detail three_sides=0
+  local headline detail three_sides=0 rerun=""
   case "$situation" in
     rebase-conflict)
       headline="Rebase conflicts during 'mcrepo rebase' (coordinated branches across repos)."
-      detail="A git rebase is paused mid-way. Each affected repo has an in-progress rebase to finish."
+      detail="A git rebase is paused mid-way in each affected repo. Your job is ONLY to resolve the conflicted files and stage them - the user finishes the rebase by re-running the command."
       three_sides=1
+      rerun="mcrepo rebase"
       ;;
     pull-rebase-conflict)
       headline="Rebase conflicts during 'mcrepo pull' (integrating remote work from another device)."
       detail="A git rebase is paused: MY local commits are being replayed ON TOP of genuinely new commits fetched from origin. The remote commits form the new base - they must ALL be kept."
+      rerun="mcrepo pull"
       ;;
     merge-conflict)
       headline="A coordinated 'mcrepo merge' into the parent branch failed, or a merge left unmerged files."
-      detail="Some repos may already be merged; the affected ones need repair before re-running 'mcrepo merge'."
+      detail="Some repos may already be merged; the affected ones need repair before the user re-runs 'mcrepo merge'."
+      rerun="mcrepo merge"
       ;;
     stash-conflict)
       headline="Stash-pop conflicts after a coordinated rebase/pull."
-      detail="The git operation succeeded, but re-applying auto-stashed local changes conflicted. The stash entry is still saved."
+      detail="The git operation itself succeeded; only re-applying auto-stashed local changes conflicted. The stash entry is still saved as a backup."
+      rerun="the mcrepo command that stopped ('mcrepo rebase' or 'mcrepo pull')"
       ;;
     carry-conflict)
       headline="Carrying uncommitted changes to another branch conflicted ('mcrepo branch')."
       detail="mcrepo stashed local changes before switching branches and could not re-apply them cleanly."
+      rerun="'mcrepo branch <branch>' with the same branch name"
       ;;
     ambiguous-divergence)
-      headline="A coordinated branch diverged from its remote and it is NOT just a local rebase."
-      detail="The remote branch contains work mcrepo cannot prove came from a local rebase, so it refuses to force-push."
+      headline="A coordinated branch diverged from its remote and it is NOT provably a local rebase."
+      detail="The remote may hold BOTH stale pre-rebase history AND new work. mcrepo will not auto-resolve this; your job is to ANALYZE and REPORT - not to change anything."
       three_sides=1
       ;;
     partial-commit)
@@ -3619,10 +3649,16 @@ _emit_agent_prompt_body() {
     printf '\nAdditional context:\n%s\n' "$MCREPO_RECOVERY_CONTEXT"
   fi
   MCREPO_RECOVERY_CONTEXT=""
+  printf '\nYour working constraints (important):\n'
+  printf -- '- You may edit files inside the listed repo folders, run READ-ONLY git commands\n'
+  printf '  (`git status`, `git log`, `git diff`), and run `git -C <dir> add` to stage resolved files.\n'
+  printf -- '- Do NOT run mcrepo. Do NOT run `git rebase`, `git commit`, `git stash`, `git push`,\n'
+  printf '  `git pull`, `git reset`, or anything needing network access or credentials. The user\n'
+  printf '  finishes the paused operation by re-running the mcrepo command in their workspace.\n'
   local step=1
-  printf '\nPlease resolve this carefully:\n'
-  printf '%d. Orient first, change nothing yet: run ./mcrepo.sh status, then in each affected repo\n' "$step"
-  printf '   `git -C <dir> status` and `git -C <dir> log --oneline --graph --all -20`.\n'
+  printf '\nPlease work through this:\n'
+  printf '%d. Orient first, change nothing yet: in each affected repo run `git -C <dir> status`\n' "$step"
+  printf '   and `git -C <dir> log --oneline --graph --all -20`.\n'
   step=$((step + 1))
   if [ "$three_sides" -eq 1 ]; then
     printf '%d. Three sides can collide here: the local feature branch (my work), the parent branch it\n' "$step"
@@ -3639,74 +3675,69 @@ _emit_agent_prompt_body() {
   step=$((step + 1))
   case "$situation" in
     rebase-conflict)
-      printf '%d. For each paused repo: edit the conflicted files, `git -C <dir> add` them, then run\n' "$step"
-      printf '   ./mcrepo.sh continue to advance every paused rebase (repeat until none remain). If\n'
-      printf '   mcrepo reported an auto-stash, run `git -C <dir> stash pop` afterwards; if the pop\n'
-      printf '   itself conflicts, resolve the same way, `git add`, then `git -C <dir> stash drop`.\n'
-      printf '   (If this rebase came from `mcrepo pull` instead of `mcrepo rebase`, the\n'
-      printf '   commits from origin are genuinely NEW work from another device - they form the new\n'
-      printf '   base; never drop them.)\n'
+      printf '%d. For each paused repo: edit the conflicted files so both sides of the intent survive,\n' "$step"
+      printf '   then `git -C <dir> add` them. Do NOT run `git rebase --continue` - re-running\n'
+      printf '   `mcrepo rebase` finishes the rebase and restores any auto-stashed changes.\n'
       ;;
     pull-rebase-conflict)
       printf '%d. The commits from origin/<branch> are REAL new work (for example pushed from another\n' "$step"
       printf '   device or by a teammate) - they form the new base and must all survive. My local\n'
-      printf '   commits are being replayed on top; resolve each conflict so both sides remain. For\n'
-      printf '   each paused repo: edit the conflicted files, `git -C <dir> add` them, then run\n'
-      printf '   ./mcrepo.sh continue (repeat until none remain). If mcrepo reported an auto-stash,\n'
-      printf '   `git -C <dir> stash pop` afterwards; if the pop conflicts, resolve, `git add`, then\n'
-      printf '   `git -C <dir> stash drop`. When everything is clean, re-run ./mcrepo.sh pull so\n'
-      printf '   remaining repos finish.\n'
+      printf '   commits are being replayed on top; resolve each conflict so both sides remain. Then\n'
+      printf '   `git -C <dir> add` the resolved files. Do NOT run `git rebase --continue` -\n'
+      printf '   re-running `mcrepo pull` finishes the rebase and restores any auto-stashed changes.\n'
       ;;
     merge-conflict)
-      printf '%d. A paused merge (inprogress=MERGING) is finished with: resolve, `git -C <dir> add`,\n' "$step"
-      printf '   then ./mcrepo.sh continue. A SQUASH-merge conflict leaves NO in-progress marker - the\n'
-      printf '   repo sits on its PARENT branch with unmerged files (inprogress=CONFLICTED): resolve,\n'
-      printf '   `git -C <dir> add` the files, then `git -C <dir> commit`. If mcrepo already rolled a\n'
-      printf '   failed repo back to the feature branch, find out why the merge failed (git output,\n'
-      printf '   hooks), fix that, then re-run ./mcrepo.sh merge - already-merged repos are skipped.\n'
+      printf '%d. If a repo holds unmerged files (paused merge or squash conflict): resolve them, then\n' "$step"
+      printf '   `git -C <dir> add`. If mcrepo reported it rolled a repo back to the feature branch,\n'
+      printf '   find out why the merge failed there (hooks, permissions, git output) and fix that\n'
+      printf '   cause - do not redo the merge by hand.\n'
       ;;
     stash-conflict)
-      printf '%d. The rebase/pull itself succeeded; only re-applying auto-stashed local changes\n' "$step"
-      printf '   conflicted, and the stash entry is still saved. Resolve the conflicted files,\n'
-      printf '   `git -C <dir> add` them, then `git -C <dir> stash drop` to discard the now-applied\n'
-      printf '   entry. There is nothing to "continue" - this conflict lives only in the working tree.\n'
+      printf '%d. The operation succeeded; only re-applying my auto-stashed changes conflicted, and the\n' "$step"
+      printf '   stash entry is still saved as backup. Resolve the conflicted files, `git -C <dir> add`\n'
+      printf '   them - nothing else. The re-run detects the resolution and safely drops the\n'
+      printf '   already-applied stash entry.\n'
       ;;
     carry-conflict)
       printf '%d. mcrepo branch stashed my uncommitted changes before switching and could not re-apply\n' "$step"
-      printf '   them. If `git -C <dir> stash list` still shows the mcrepo entry and the working tree\n'
-      printf '   has no conflict markers, `git -C <dir> stash pop` first. Resolve the conflicted files,\n'
-      printf '   `git -C <dir> add` them, then `git -C <dir> stash drop` if the entry is still listed.\n'
+      printf '   them cleanly. Resolve the conflicted files, `git -C <dir> add` them - nothing else.\n'
+      printf '   The re-run finalizes the carried changes.\n'
       ;;
     ambiguous-divergence)
-      printf '%d. Report before acting: show me what the remote has that I lack\n' "$step"
-      printf '   (`git -C <dir> log --oneline HEAD..@{u}`) and what I have locally\n'
-      printf '   (`git -C <dir> log --oneline @{u}..HEAD`). If the remote commits are wanted,\n'
-      printf '   integrate them (rebase my branch onto origin/<branch>, or merge). Only if I\n'
-      printf '   explicitly confirm they are obsolete pre-rebase leftovers may you publish with\n'
-      printf '   `git -C <dir> push --force-with-lease` - never a plain --force, never without asking.\n'
+      printf '%d. ANALYZE ONLY - run `git -C <dir> log --oneline HEAD..@{u}` (what the remote has that\n' "$step"
+      printf '   I lack) and `git -C <dir> log --oneline @{u}..HEAD` (what I have locally). Decide\n'
+      printf '   whether the remote-only commits are genuinely new work or obsolete pre-rebase\n'
+      printf '   leftovers, and REPORT your conclusion. If they are new work, recommend that I run\n'
+      printf '   `mcrepo pull` after you flag which commits matter; if they are provably obsolete,\n'
+      printf '   recommend that I run `git -C <dir> push --force-with-lease` MYSELF. You never push.\n'
       ;;
     partial-commit)
       printf '%d. The coordinated commit was recorded in some repos but failed in the ones listed\n' "$step"
-      printf '   above. In each failed repo find out why the commit failed (hooks, unmerged files,\n'
-      printf '   permissions), fix that, then complete the batch with the EXACT subject given in the\n'
-      printf '   additional context: `git -C <dir> add -A && git -C <dir> commit -m "<subject>"`.\n'
-      printf '   Do not invent a new message and do not run mcrepo commit again - that would start a\n'
-      printf '   new batch number.\n'
+      printf '   above. In each failed repo find out why (hooks, unmerged files, permissions), fix\n'
+      printf '   that, stage everything with `git -C <dir> add -A`, and then tell me to complete the\n'
+      printf '   batch MYSELF with the EXACT subject from the additional context:\n'
+      printf '   `git -C <dir> commit -m "<subject>"`. Never invent a new message and never re-run\n'
+      printf '   mcrepo commit - that would start a new batch number.\n'
       ;;
     *)
-      printf '%d. Inspect each affected repo and bring it back to a clean state without losing work.\n' "$step"
+      printf '%d. Inspect each affected repo and bring it back to a clean state without losing work,\n' "$step"
+      printf '   using only file edits and `git add`.\n'
       ;;
   esac
   step=$((step + 1))
-  printf '%d. Finish sequence: repeat resolve -> `git add` -> ./mcrepo.sh continue until ./mcrepo.sh\n' "$step"
-  printf '   status shows no inprogress= entries, confirm with ./mcrepo.sh resolve that nothing is\n'
-  printf '   left, then run ./mcrepo.sh push to publish (it only force-with-leases branches that are\n'
-  printf '   provably my own rebase and refuses genuinely diverged remotes).\n'
-  printf '\nHard rules: never run `git push --force`, `git reset --hard`, `git rebase --skip`, or\n'
-  printf 'wholesale `git checkout --ours/--theirs`, and never delete branches or stashes on your\n'
-  printf 'own. If one of those seems necessary, stop and ask me first. Commits are allowed ONLY to\n'
-  printf 'finish a paused merge/rebase or a repair commit these instructions name; new feature work\n'
-  printf 'stays user-driven.\n'
+  if [ -n "$rerun" ]; then
+    printf '%d. When every listed repo is resolved and staged, REPORT BACK: say clearly that the\n' "$step"
+    printf '   conflicts are resolved and that I should now re-run %s in my mcrepo\n' "$rerun"
+    printf '   workspace - it finishes the paused operations, restores auto-stashed changes, and\n'
+    printf '   prints the next step. Repeat this loop if the re-run reports further conflicts.\n'
+  else
+    printf '%d. When done, REPORT BACK with what you found, what you staged, and the exact commands\n' "$step"
+    printf '   I should run myself next.\n'
+  fi
+  printf '\nHard rules: your entire action space is editing files and `git add`. Never run mcrepo or\n'
+  printf 'any git command that rewrites history, creates commits, moves stashes, or touches the\n'
+  printf 'network - and never delete branches or stashes. If something outside your action space\n'
+  printf 'seems necessary, stop and tell me instead.\n'
 }
 
 print_agent_recovery_prompt() {
@@ -3927,11 +3958,12 @@ _resume_inprogress() {
       if [ "$action" = "abort" ]; then
         log "  $repo_name: git reset --merge (dropping unmerged entries; stashes are preserved)"
         git -C "$repo_dir" reset --merge || warn "reset --merge failed in '$repo_name' (see git output above)"
+        _clear_stash_applied "$repo_dir"
         return 0
       fi
       warn "$repo_name: unmerged files but no merge/rebase in progress (squash-merge or stash-pop conflict):"
       git -C "$repo_dir" diff --name-only --diff-filter=U 2>/dev/null | sed 's/^/    /' >&2 || true
-      warn "  Resolve them, 'git -C $repo_dir add' the files, then finish per 'mcrepo resolve'."
+      warn "  Resolve them, 'git -C $repo_dir add' the files, then re-run the mcrepo command that stopped."
       return 2
       ;;
     *)
@@ -4013,7 +4045,7 @@ _iterate_inprogress() {
   fi
   if [ "${#still_stuck[@]}" -gt 0 ]; then
     warn "Conflicts remain in: $(printf '%s ' "${still_stuck[@]%%|*}")"
-    warn "Run 'mcrepo resolve' for a paste-ready coding-agent prompt."
+    warn "Have them resolved and staged, then re-run the mcrepo command that stopped."
     if [ "$action" = "continue" ]; then
       scan_stuck_states
       print_stuck_prompts stderr
@@ -4119,12 +4151,20 @@ print_stuck_prompts() {
 # classic "some repos pulled, some stuck" state). Leftover mcrepo stashes
 # (MCREPO-STASH) do NOT block: they are pending work, and 'mcrepo branch'
 # re-runs restore carry stashes itself.
+# Usage: _require_no_stuck_repos <cmd_label> [allowed_kinds]
+# allowed_kinds is a space-separated list of stuck kinds this command can
+# RESUME itself on re-run (e.g. "REBASING CONFLICTED" for rebase/pull) — those
+# do not block. MCREPO-STASH never blocks.
 _require_no_stuck_repos() {
   local cmd_label="$1"
+  local allowed_kinds="${2:-}"
   scan_stuck_states
   local i blocked=0
   for i in "${!STUCK_KINDS[@]}"; do
     [ "${STUCK_KINDS[$i]}" = "MCREPO-STASH" ] && continue
+    case " $allowed_kinds " in
+      *" ${STUCK_KINDS[$i]} "*) continue ;;
+    esac
     if [ "$blocked" -eq 0 ]; then
       warn "Cannot run 'mcrepo $cmd_label' — these repos are mid-operation or conflicted:"
       blocked=1
@@ -4132,7 +4172,84 @@ _require_no_stuck_repos() {
     warn "  - ${STUCK_NAMES[$i]}  (${STUCK_KINDS[$i]})"
   done
   [ "$blocked" -eq 0 ] && return 0
-  die "Finish them first: 'mcrepo resolve' prints the procedure (and a coding-agent prompt); then 'mcrepo continue' or 'mcrepo abort'."
+  die "Have the conflicts resolved first (mcrepo printed a coding-agent prompt when this happened), then re-run the command that stopped. 'mcrepo abort' backs everything out."
+}
+
+# Resume a repo's in-flight rebase / conflict state on re-run of the command
+# that started it ("the command is the loop"). Purely local. Returns:
+#   0 = nothing in flight
+#   1 = resumed cleanly (rebase finished and/or applied stash finalized)
+#   2 = rebase still conflicted (unmerged files remain, or an empty commit
+#       needs a manual decision) — repo stays paused
+#   3 = auto-stash restore conflicted (stash preserved, unmerged files remain)
+_resume_inflight_rebase() {
+  local dir="$1" name="$2"
+  local state guard=0
+  state="$(repo_inprogress_state "$dir")"
+  case "$state" in
+    REBASING)
+      while [ "$(repo_inprogress_state "$dir")" = "REBASING" ]; do
+        if [ -n "$(git -C "$dir" ls-files -u 2>/dev/null)" ]; then
+          return 2
+        fi
+        guard=$((guard + 1))
+        if [ "$guard" -gt 1000 ]; then
+          warn "  $name: rebase does not advance — finish it manually (git -C $dir rebase --continue/--skip/--abort)."
+          return 2
+        fi
+        log "  $name: continuing the paused rebase ..."
+        if ! GIT_EDITOR=true git -C "$dir" rebase --continue; then
+          if [ -z "$(git -C "$dir" ls-files -u 2>/dev/null)" ]; then
+            # Resolution left an empty commit; git wants an explicit decision.
+            warn "  $name: this commit became empty after resolution. Run 'git -C $dir rebase --skip' to drop it, then re-run this command."
+            return 2
+          fi
+          # New conflict in the next commit: loop detects it and returns 2.
+        fi
+      done
+      # Rebase finished — restore the auto-stash this operation parked, if any.
+      if git -C "$dir" stash list -1 2>/dev/null | head -1 | grep -q 'mcrepo: auto-stash'; then
+        if ! git -C "$dir" stash pop; then
+          _mark_stash_applied "$dir"
+          return 3
+        fi
+      fi
+      return 1
+      ;;
+    CONFLICTED)
+      if [ -n "$(git -C "$dir" ls-files -u 2>/dev/null)" ]; then
+        # Still unresolved (stash-pop or squash conflict).
+        if [ "$(repo_mcrepo_stash_count "$dir")" -gt 0 ]; then
+          return 3
+        fi
+        return 2
+      fi
+      # Resolved and staged. If an mcrepo stash is still parked, its content
+      # was already applied by the conflicted pop — drop the now-stale entry.
+      if git -C "$dir" stash list -1 2>/dev/null | head -1 | grep -q 'mcrepo:'; then
+        git -C "$dir" stash drop >/dev/null 2>&1 || true
+        _clear_stash_applied "$dir"
+        log "  $name: conflict resolved — dropped the already-applied mcrepo stash."
+      fi
+      return 1
+      ;;
+    *)
+      # No git op marker. A resolved-and-staged pop conflict leaves only the
+      # applied-stash ref behind — finalize it so the entry is not re-popped.
+      if _stash_is_marked_applied "$dir"; then
+        git -C "$dir" stash drop >/dev/null 2>&1 || true
+        _clear_stash_applied "$dir"
+        log "  $name: conflict resolved — dropped the already-applied mcrepo stash."
+        return 1
+      fi
+      return 0
+      ;;
+  esac
+}
+
+# List a repo's unmerged (conflicted) files, one per line, for reports/prompts.
+_conflicted_files() {
+  git -C "$1" diff --name-only --diff-filter=U 2>/dev/null || true
 }
 
 cmd_continue() {
@@ -4212,6 +4329,34 @@ confirm_reset_discard_commits() {
 # stash_conflict_repos/_entries, diverged_rebased, failed_repos.
 _pull_one_rebase() {
   local rd="$1" rn="$2" rb="$3" rp="$4" rdirty="$5"
+
+  # Re-run resume: finish a rebase this command paused earlier (conflicts now
+  # resolved + staged), or finalize a resolved stash-pop conflict.
+  local resume_rc=0
+  _resume_inflight_rebase "$rd" "$rn" || resume_rc=$?
+  case "$resume_rc" in
+    2)
+      rebase_conflict_repos+=("$rn")
+      rebase_conflict_entries+=("$rn|$rd")
+      warn "  '$rn' is still conflicted:"
+      _conflicted_files "$rd" | sed 's/^/      /' >&2
+      return 0
+      ;;
+    3)
+      stash_conflict_repos+=("$rn")
+      stash_conflict_entries+=("$rn|$rd")
+      warn "  '$rn': restoring auto-stashed changes conflicted:"
+      _conflicted_files "$rd" | sed 's/^/      /' >&2
+      return 0
+      ;;
+    1)
+      # Rebase finished / stash finalized — refresh state and fall through.
+      rb="$(repo_branch "$rd")"
+      rdirty="clean"
+      [ -n "$(git -C "$rd" status --porcelain 2>/dev/null)" ] && rdirty="dirty"
+      ;;
+  esac
+
   local stashed=0
   if [ "$rdirty" = "dirty" ]; then
     if _mcrepo_stash_push "$rd" "mcrepo: auto-stash before pull"; then
@@ -4243,17 +4388,19 @@ _pull_one_rebase() {
       if ! git -C "$rd" rebase "$upstream_ref"; then
         rebase_conflict_repos+=("$rn")
         rebase_conflict_entries+=("$rn|$rd")
-        warn "  Rebase conflicts in '$rn' while integrating $upstream_ref."
-        if [ "$stashed" -eq 1 ]; then
-          warn "  Resolve, run 'mcrepo continue' (or 'git -C $rd rebase --continue'), then 'git -C $rd stash pop'."
-        else
-          warn "  Resolve, then run 'mcrepo continue' (or 'git -C $rd rebase --continue')."
-        fi
+        warn "  Rebase conflicts in '$rn' while integrating $upstream_ref:"
+        _conflicted_files "$rd" | sed 's/^/      /' >&2
+        warn "  Have the files resolved and staged (agent prompt below), then re-run 'mcrepo pull' — it finishes the rebase and restores stashed changes."
         return 0
       fi
       ;;
     *)
-      # none (in-sync/ahead-only/no-upstream) or behind-only: plain fast-forward.
+      # none (in-sync/ahead-only) or behind-only: plain fast-forward.
+      if ! git -C "$rd" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+        [ "$stashed" -eq 1 ] && { git -C "$rd" stash pop 2>/dev/null || true; }
+        fetch_only_repos+=("$rn (no upstream)")
+        return 0
+      fi
       if ! run_with_repo_prefix "$rn" git -C "$rd" pull --ff-only; then
         [ "$stashed" -eq 1 ] && { git -C "$rd" stash pop 2>/dev/null || true; }
         warn "Pull failed for '$rn'"
@@ -4264,7 +4411,8 @@ _pull_one_rebase() {
   esac
   if [ "$stashed" -eq 1 ]; then
     if ! git -C "$rd" stash pop 2>/dev/null; then
-      warn "Stash pop conflict in '$rn'. Stash preserved — resolve, 'git -C $rd add', then 'git -C $rd stash drop'."
+      _mark_stash_applied "$rd"
+      warn "Stash pop conflict in '$rn'. Stash preserved — have the files resolved and staged, then re-run 'mcrepo pull' (it drops the already-applied stash)."
       stash_conflict_repos+=("$rn")
       stash_conflict_entries+=("$rn|$rd")
       return 0
@@ -4300,7 +4448,13 @@ cmd_pull() {
   done
 
   load_repos
-  _require_no_stuck_repos "pull"
+  if [ "$pull_mode" = "rebase" ]; then
+    # Re-run is the resume path: pull may proceed over its own paused
+    # rebases/conflicts and finishes them; foreign states still block.
+    _require_no_stuck_repos "pull" "REBASING CONFLICTED"
+  else
+    _require_no_stuck_repos "pull"
+  fi
 
   # --- Phase 1: Pre-flight - collect target repos ---
   local -a pull_dirs=()
@@ -4448,6 +4602,13 @@ cmd_pull() {
       continue
     fi
 
+    # In-flight repos must reach the resume logic (mid-rebase HEAD is detached,
+    # so the upstream gate below would misroute them to fetch-only).
+    if [ "$pull_mode" = "rebase" ] && [ -n "$(repo_inprogress_state "$rd")" ]; then
+      _pull_one_rebase "$rd" "$rn" "$rb" "$rp" "$rdirty"
+      continue
+    fi
+
     if [ "$rup" -eq 0 ]; then
       fetch_only_repos+=("$rn (no upstream)")
       continue
@@ -4515,6 +4676,9 @@ cmd_pull() {
     if ! git -C . fetch origin --prune 2>/dev/null; then
       warn "Fetch failed for (meta-context)"
       failed_repos+=("(meta-context)")
+    elif [ "$pull_mode" = "rebase" ] && [ -n "$(repo_inprogress_state ".")" ]; then
+      # In-flight meta must reach the resume logic before the upstream gate.
+      _pull_one_rebase "." "(meta-context)" "$meta_branch" "$meta_pull_parent" "$meta_dirty"
     elif [ "$meta_has_upstream" -eq 0 ]; then
       fetch_only_repos+=("(meta-context) (no upstream)")
     elif [ "$pull_mode" = "reset" ] && [ "$meta_dirty" = "dirty" ]; then
@@ -4539,7 +4703,8 @@ cmd_pull() {
       if run_with_repo_prefix "(meta-context)" git -C . pull --ff-only; then
         if [ "$meta_stashed" -eq 1 ]; then
           if ! git -C . stash pop 2>/dev/null; then
-            warn "Stash pop conflict in (meta-context). Resolve, 'git add', then 'git stash drop'."
+            _mark_stash_applied "."
+            warn "Stash pop conflict in (meta-context). Resolve, 'git add', then re-run 'mcrepo pull'."
             stash_conflict_repos+=("(meta-context)")
             stash_conflict_entries+=("(meta-context)|.")
           else
@@ -4617,7 +4782,7 @@ cmd_pull() {
   if [ "$had_dirty" -eq 1 ] && [ "$pull_mode" = "ffonly" ]; then
     log ""
     if [ "$pull_left_stuck" -eq 1 ]; then
-      log "Some repos skipped (dirty, --ff-only). First resolve the conflicts above ('mcrepo resolve'),"
+      log "Some repos skipped (dirty, --ff-only). First have the conflicts above resolved,"
       log "then run 'mcrepo pull' to bring dirty repos along (or 'mcrepo pull --reset' to discard)."
     else
       log "Some repos skipped (dirty, --ff-only). Run 'mcrepo pull' to auto-stash and integrate them,"
@@ -4660,7 +4825,7 @@ cmd_pull() {
 
   if [ "${#rebase_conflict_entries[@]}" -gt 0 ]; then
     print_agent_recovery_prompt pull-rebase-conflict "${rebase_conflict_entries[@]}"
-    warn "Next: resolve the conflicts (prompt above), 'git add' the files, run 'mcrepo continue', then re-run 'mcrepo pull'."
+    warn "Next: have the conflicts resolved and staged (prompt above), then re-run 'mcrepo pull' — it finishes everything and reports the next step."
   fi
 
   if [ "${#stash_conflict_entries[@]}" -gt 0 ]; then
@@ -5223,7 +5388,7 @@ cmd_push() {
   fi
 
   if [ "${#stuck_names[@]}" -gt 0 ]; then
-    warn "Skipping mid-operation/conflicted repos: ${stuck_names[*]} — finish them first ('mcrepo resolve')."
+    warn "Skipping mid-operation/conflicted repos: ${stuck_names[*]} — have them resolved, then re-run the command that stopped."
   fi
 
   # Check if there is anything to do
@@ -5554,7 +5719,7 @@ cmd_push() {
     log "Use 'mcrepo push -m \"message\"' to commit and push dirty repos."
   fi
   if [ "${#stuck_names[@]}" -gt 0 ]; then
-    warn "  Skipped (stuck):       ${stuck_names[*]} — finish with 'mcrepo resolve' first"
+    warn "  Skipped (stuck):       ${stuck_names[*]} — resolve, then re-run the command that stopped"
   fi
   if [ "${#failed_repos[@]}" -gt 0 ]; then
     warn "  Failed:                ${failed_repos[*]}"
@@ -6848,7 +7013,34 @@ cmd_branch() {
   validate_branch_name "$branch_name" || die "Invalid branch name: '$branch_name'"
 
   load_repos
-  _require_no_stuck_repos "branch"
+  # CONFLICTED is allowed: a re-run finalizes resolved carry conflicts below.
+  _require_no_stuck_repos "branch" "CONFLICTED"
+
+  # Re-run finalize: a previous 'branch' left a carry stash-pop conflict that
+  # has since been resolved and staged — drop the applied stash and proceed.
+  # Still-unresolved conflicts stop here with the carry prompt.
+  local _cf_i _cf_dir _cf_rc
+  local -a _cf_fail_entries=()
+  for _cf_i in "${!REPO_NAMES[@]}"; do
+    [ "${REPO_MODES[$_cf_i]}" != "sleep" ] || continue
+    _cf_dir="$(get_repo_dir "${REPO_NAMES[$_cf_i]}" "${REPO_MODES[$_cf_i]}")"
+    [ -d "$_cf_dir/.git" ] || continue
+    [ "$(repo_inprogress_state "$_cf_dir")" = "CONFLICTED" ] || continue
+    _cf_rc=0
+    _resume_inflight_rebase "$_cf_dir" "${REPO_NAMES[$_cf_i]}" || _cf_rc=$?
+    if [ "$_cf_rc" -ge 2 ]; then
+      _cf_fail_entries+=("${REPO_NAMES[$_cf_i]}|$_cf_dir")
+    fi
+  done
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1 &&      [ "$(repo_inprogress_state ".")" = "CONFLICTED" ]; then
+    _cf_rc=0
+    _resume_inflight_rebase "." "(meta-context)" || _cf_rc=$?
+    [ "$_cf_rc" -ge 2 ] && _cf_fail_entries+=("(meta-context)|.")
+  fi
+  if [ "${#_cf_fail_entries[@]}" -gt 0 ]; then
+    print_agent_recovery_prompt carry-conflict "${_cf_fail_entries[@]}"
+    die "Carried changes are still conflicted. Have them resolved and staged (prompt above), then re-run 'mcrepo branch $branch_name'."
+  fi
 
   # --- Phase 1: Fetch and classify repos (fork vs jump) ---
   local i mode repo_dir
@@ -7203,7 +7395,8 @@ cmd_branch() {
       [ "$restored_any" -eq 1 ] || log "Restoring carried changes ..."
       restored_any=1
       if ! git -C "$ddir" stash pop; then
-        warn "Stash pop had issues in '$ddir'. Resolve the conflicted files, 'git -C $ddir add' them, then 'git -C $ddir stash drop'."
+        _mark_stash_applied "$ddir"
+        warn "Stash pop had issues in '$ddir'. Have the files resolved and staged, then re-run 'mcrepo branch $branch_name' to finalize."
         carry_fail_entries+=("$ddir|$ddir")
       else
         log "  Restored in $ddir"
@@ -7584,7 +7777,12 @@ cmd_merge() {
   done
 
   load_repos
-  _require_no_stuck_repos "merge"
+  if [ "$do_rebase" -eq 1 ]; then
+    # Deprecated alias of 'mcrepo rebase': same resume semantics on re-run.
+    _require_no_stuck_repos "rebase" "REBASING CONFLICTED"
+  else
+    _require_no_stuck_repos "merge"
+  fi
 
   if [ -z "$GLOBAL_BRANCH" ]; then
     die "No feature branch active — repos are on their default/parent branch already, so there is nothing to merge here. Use 'mcrepo commit' and 'mcrepo push' to send changes directly to origin, or run 'mcrepo branch <name>' to start a new feature branch first."
@@ -7786,7 +7984,7 @@ cmd_merge() {
   if [ "${#unsynced_names[@]}" -gt 0 ]; then
     log ""
     log "Branch '$source_branch' is behind its parent in: ${unsynced_names[*]}"
-    die "Run 'mcrepo rebase' first — it rebases the branch onto each parent so this merge cannot conflict. Resolve any conflicts there (then 'mcrepo continue'), and re-run 'mcrepo merge'."
+    die "Run 'mcrepo rebase' first — it rebases the branch onto each parent so this merge cannot conflict. If it reports conflicts, have them resolved and re-run 'mcrepo rebase', then 'mcrepo merge'."
   fi
 
   if ! git_supports_merge_tree_write_tree; then
@@ -8493,6 +8691,16 @@ _rebase_run() {
       continue
     fi
 
+    # In-flight repos (paused rebase / resolved conflicts) join the target set
+    # unconditionally: re-running 'mcrepo rebase' is the resume path, and a
+    # mid-rebase HEAD is detached so the branch check below would misfire.
+    if [ -n "$(repo_inprogress_state "$repo_dir")" ]; then
+      rebase_names+=("$repo_name")
+      rebase_dirs+=("$repo_dir")
+      rebase_parents+=("$parent_branch")
+      continue
+    fi
+
     local actual_branch
     actual_branch="$(repo_branch "$repo_dir")"
     if [ "$actual_branch" != "$source_branch" ]; then
@@ -8526,7 +8734,11 @@ _rebase_run() {
     if [ -n "$meta_parent_branch" ] && [ "$meta_parent_branch" != "$source_branch" ]; then
       local meta_actual
       meta_actual="$(repo_branch ".")"
-      if [ "$meta_actual" != "$source_branch" ]; then
+      if [ -n "$(repo_inprogress_state ".")" ]; then
+        rebase_names+=("(meta-context)")
+        rebase_dirs+=(".")
+        rebase_parents+=("$meta_parent_branch")
+      elif [ "$meta_actual" != "$source_branch" ]; then
         preflight_errors+=("meta-context repo is on branch '$meta_actual', expected '$source_branch'.")
       else
         rebase_names+=("(meta-context)")
@@ -8568,6 +8780,28 @@ _rebase_run() {
     repo_dir="${rebase_dirs[$idx]}"
     local parent="${rebase_parents[$idx]}"
 
+    # Re-run resume: finish a rebase paused earlier (conflicts now resolved
+    # and staged) or finalize a resolved stash-pop conflict, before deciding
+    # whether a fresh rebase is even needed.
+    local resume_rc=0
+    _resume_inflight_rebase "$repo_dir" "$repo_name" || resume_rc=$?
+    case "$resume_rc" in
+      2)
+        merge_conflict_repos+=("$repo_name")
+        merge_conflict_entries+=("$repo_name|$repo_dir")
+        warn "  '$repo_name' is still conflicted:"
+        _conflicted_files "$repo_dir" | sed 's/^/      /' >&2
+        continue
+        ;;
+      3)
+        stash_conflict_repos+=("$repo_name")
+        stash_conflict_entries+=("$repo_name|$repo_dir")
+        warn "  '$repo_name': restoring auto-stashed changes conflicted:"
+        _conflicted_files "$repo_dir" | sed 's/^/      /' >&2
+        continue
+        ;;
+    esac
+
     # Fetch first so origin/<parent> reflects the latest state
     local has_origin=0
     if git -C "$repo_dir" remote get-url origin >/dev/null 2>&1; then
@@ -8604,20 +8838,19 @@ _rebase_run() {
         warn "    - stale remote branch  : origin/$source_branch (pre-rebase history, still on the server)"
       fi
       warn "    Conflicts may mix real feature work with mcrepo coordination commits (#N) — keep the intended final state."
-      if [ "$did_stash" -eq 1 ]; then
-        warn "  Resolve, run 'mcrepo continue' (or 'git -C $repo_dir rebase --continue'), then 'git -C $repo_dir stash pop' to restore your changes."
-      else
-        warn "  Resolve, then run 'mcrepo continue' (or 'git -C $repo_dir rebase --continue')."
-      fi
+      warn "    Conflicted files:"
+      _conflicted_files "$repo_dir" | sed 's/^/      /' >&2
+      warn "  Have the files resolved and staged (agent prompt below), then re-run 'mcrepo rebase' — it finishes the rebase and restores stashed changes."
       continue
     fi
 
     # Pop stash
     if [ "$did_stash" -eq 1 ]; then
       if ! git -C "$repo_dir" stash pop; then
+        _mark_stash_applied "$repo_dir"
         stash_conflict_repos+=("$repo_name")
         stash_conflict_entries+=("$repo_name|$repo_dir")
-        warn "  Stash pop conflicts. Resolve, then run 'git -C $repo_dir stash drop'."
+        warn "  Stash pop conflicts. Have the files resolved and staged, then re-run 'mcrepo rebase' (it drops the already-applied stash)."
         continue
       fi
     fi
@@ -8634,10 +8867,10 @@ _rebase_run() {
     log "Synced cleanly: ${clean_repos[*]}"
   fi
   if [ "${#merge_conflict_repos[@]}" -gt 0 ]; then
-    log "Rebase conflicts (resolve, run 'mcrepo continue', then 'git stash pop' if stashed): ${merge_conflict_repos[*]}"
+    log "Rebase conflicts (resolve + 'git add', then re-run 'mcrepo rebase'): ${merge_conflict_repos[*]}"
   fi
   if [ "${#stash_conflict_repos[@]}" -gt 0 ]; then
-    log "Stash conflicts (resolve, then 'git stash drop'): ${stash_conflict_repos[*]}"
+    log "Stash conflicts (resolve + 'git add', then re-run 'mcrepo rebase'): ${stash_conflict_repos[*]}"
   fi
 
   # Conflict recovery: offer a paste-ready prompt for a local coding agent.
@@ -8650,7 +8883,7 @@ _rebase_run() {
 
   REBASE_CONFLICTS=$(( ${#merge_conflict_repos[@]} + ${#stash_conflict_repos[@]} ))
   if [ "$REBASE_CONFLICTS" -gt 0 ]; then
-    warn "Next: resolve the conflicts (prompt above), 'git add' the files, run 'mcrepo continue', then re-run 'mcrepo rebase'."
+    warn "Next: have the conflicts resolved and staged (prompt above), then re-run 'mcrepo rebase' — it finishes everything and reports the next step."
     return 2
   fi
 
@@ -8691,7 +8924,9 @@ cmd_rebase() {
     shift
   done
   load_repos
-  _require_no_stuck_repos "rebase"
+  # Re-run is the resume path: rebase may proceed over its own paused
+  # rebases/conflicts and finishes them; foreign states still block.
+  _require_no_stuck_repos "rebase" "REBASING CONFLICTED"
   if [ -z "$GLOBAL_BRANCH" ]; then
     die "No feature branch active — start one with 'mcrepo branch <name>' first."
   fi

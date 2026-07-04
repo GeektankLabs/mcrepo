@@ -54,26 +54,28 @@ make_markerless_conflict() {
   assert_contains "$output" "inprogress=REBASING"
 }
 
-@test "continue exits 2 while unresolved, finishes the rebase after resolving; merge then fast-forwards the parent" {
+@test "re-run loop: rebase again while unresolved reports files; after resolve+add the re-run finishes; merge fast-forwards the parent" {
   make_conflict
   run mcrepo rebase
   [ "$status" -eq 2 ]
 
-  # Unresolved: continue must not pretend success.
-  run mcrepo continue
+  # Unresolved: the re-run must not pretend success — it names the files.
+  run mcrepo rebase
   [ "$status" -eq 2 ]
-  assert_contains "$output" "mcrepo resolve"
+  assert_contains "$output" "still conflicted"
+  assert_contains "$output" "README.md"
 
+  # Agent-style fix: edit + git add ONLY (no continue, no mcrepo needed).
   printf 'merged content\n' >alpha/README.md
   git -C alpha add README.md
-  run mcrepo continue
+
+  # The re-run finishes the paused rebase itself.
+  run mcrepo rebase
   [ "$status" -eq 0 ]
+  assert_contains "$output" "continuing the paused rebase"
   run mcrepo status
   assert_not_contains "$output" "inprogress="
 
-  # Second rebase is a no-op, merge passes the gate and completes.
-  run mcrepo rebase
-  [ "$status" -eq 0 ]
   run mcrepo merge
   [ "$status" -eq 0 ]
   [ "$(repo_branch alpha)" = "main" ]
@@ -101,14 +103,14 @@ make_markerless_conflict() {
   assert_contains "$output" "mcrepo-stash=1"
 }
 
-@test "continue on a marker-less conflict explains and prints the prompt instead of 'No repository is mid-'" {
+@test "hidden continue on a marker-less conflict explains and prints the prompt instead of 'No repository is mid-'" {
   make_markerless_conflict
   run mcrepo continue
   [ "$status" -eq 2 ]
   assert_not_contains "$output" "No repository is mid-"
   assert_contains "$output" "unmerged files but no merge/rebase in progress"
   assert_contains "$output" "Paste the prompt"
-  assert_contains "$output" "stash drop"
+  assert_contains "$output" "re-run"
 }
 
 @test "abort clears a marker-less conflict and preserves the stash" {
@@ -123,7 +125,7 @@ make_markerless_conflict() {
   assert_contains "$output" "mcrepo-stash=1"
 }
 
-@test "pull stash-pop conflict exits 2 and prints the stash-conflict prompt" {
+@test "pull stash-pop conflict exits 2 with prompt; resolve + add + re-run drops the stash and finishes" {
   init_workspace_with_repos alpha
   mcrepo write alpha >/dev/null
   printf 'uncommitted local\n' >alpha/README.md
@@ -132,6 +134,14 @@ make_markerless_conflict() {
   [ "$status" -eq 2 ]
   assert_contains "$output" "Stash pop conflict"
   assert_contains "$output" "Paste the prompt"
+
+  # Agent-style fix: edit + git add only, then re-run pull.
+  printf 'both kept\n' >alpha/README.md
+  git -C alpha add README.md
+  run mcrepo pull
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "dropped the already-applied mcrepo stash"
+  [ -z "$(git -C alpha stash list)" ]
 }
 
 @test "partial merge rolls back the failed repo, keeps going, exits 2, and re-running finishes" {
