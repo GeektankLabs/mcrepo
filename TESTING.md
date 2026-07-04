@@ -39,6 +39,9 @@ Suites:
   conflict pause + continue + re-run, `--ff-only` conservative mode,
   safe-force/ambiguous protection (never rebase onto a stale post-sync
   remote, never force away another device's commits), stuck-workspace guard
+- `60-remotes.bats` — named remote locations: `mcrepo remote` management,
+  manifest round-trip of `locations:`/`remotes:`, `pull/push <location>`
+  incl. stale-mirror routing and the never-force rule
 
 CI (`.github/workflows/ci.yml`) runs `bash -n`, shellcheck, the full suite on
 ubuntu **and** macOS (stock bash 3.2 — catches `mapfile`-class and

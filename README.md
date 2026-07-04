@@ -9,24 +9,37 @@ The workspace root that holds `mcrepo.yaml` and the shared `+-` folders is calle
 
 ## The Coordinated Workflow
 
-Everything revolves around one loop — and every command tells you the next step when it finishes:
+Two simple loops — and on conflict the rule is always the same: mcrepo prints a paste-ready
+prompt for your coding agent, the agent fixes and stages the files, and you **re-run the same
+command** until it reports done.
 
-![mcrepo coordinated workflow](assets/mcrepo-workflow.svg)
+### Local branches — feature work
+
+![mcrepo coordinated workflow — local branches](assets/mcrepo-workflow-local.svg)
 
 | Step | Command | What it does |
 |---|---|---|
 | 1 · Branch | `mcrepo branch feat-x` | one feature branch across all write repos + the meta-context ([details](#branch-coordination)) |
 | 2 · Work + commit | `mcrepo commit -m "…"` | coordinated, revertable checkpoints — repeat as often as you like ([details](#coordinated-commits)) |
-| 3 · Rebase | `mcrepo rebase` | rebase the branch onto each parent; **all conflicts are resolved here** ([details](#rebasing-onto-the-parent)) |
-| 4 · Merge | `mcrepo merge` | fold the branch back into each parent — conflict-free after a clean rebase ([details](#merging-back)) |
-| 5 · Push | `mcrepo push` | publish to origin; rebased branches are force-with-leased safely ([details](#pushing)) |
+| 3 · Rebase | `mcrepo rebase` | bring the parent's changes into the branch; **all conflicts are resolved here** — on conflict, re-run after the fix ([details](#rebasing-onto-the-parent)) |
+| 4 · Merge | `mcrepo merge` | fold the branch back into each parent — conflict-free after a clean rebase; offers branch cleanup ([details](#merging-back)) |
 
-Around the loop:
+### Remote repositories — origin and named locations
 
-- `mcrepo pull` — bring upstream changes in at any time; it auto-stashes dirty work and puts your local commits on top of work pushed from another device (`--ff-only` for a look-don't-touch update) ([details](#pulling))
+![mcrepo coordinated workflow — remote repositories](assets/mcrepo-workflow-remote.svg)
+
+| Step | Command | What it does |
+|---|---|---|
+| Work + commit | `mcrepo commit -m "…"` | same coordinated checkpoints as above |
+| Pull (integrate) | `mcrepo pull` | auto-stash + rebase your local commits on top of what other devices pushed — on conflict, re-run after the fix ([details](#pulling)) |
+| Push (publish) | `mcrepo push` | plain push after a pull; force-with-lease only when provably safe ([details](#pushing)) |
+
+Around the loops:
+
 - `mcrepo status` — every repo's branch, state, and stuck indicators at a glance
-- Conflict? `mcrepo resolve` prints a paste-ready prompt for your coding agent; finish with `mcrepo continue` ([details](#conflicts--recovery))
+- `mcrepo remote add backup` — declare a named location; then `mcrepo pull backup` / `mcrepo push backup` ([details](#named-remote-locations))
 - Review flow instead of a direct push: `mcrepo pr` opens coordinated, cross-linked GitHub PRs ([details](#fork--pr-workflow))
+- Backing out entirely: `mcrepo abort` ([details](#conflicts--recovery))
 
 ## Install & Setup
 
@@ -205,9 +218,9 @@ Behavior details:
   other PRs; falls back to local `<parent>` when no origin is configured). Auto-stashes
   uncommitted work, including untracked files.
 - On a rebase conflict, `rebase` keeps going through the remaining repos, prints per-repo context
-  for the three colliding sides (local feature branch vs parent vs the stale `origin/<branch>`)
-  plus a paste-ready prompt for a local coding agent, and exits `2`. Resolve, `git add`, then
-  `mcrepo continue` — see [Conflicts & Recovery](#conflicts--recovery).
+  (including the conflicted files) plus a paste-ready prompt for a local coding agent, and exits
+  `2`. After the files are resolved and staged, **re-run `mcrepo rebase`** — it finishes the
+  paused rebases and restores auto-stashed changes — see [Conflicts & Recovery](#conflicts--recovery).
 - Rebasing rewrites local history, so an already-pushed branch will diverge from its remote.
   mcrepo flags those branches at the end and tells you to run `mcrepo push` — which auto
   force-with-leases them (see [Pushing](#pushing)); you do **not** need to force-push by hand.
@@ -259,50 +272,48 @@ Conflicts are a normal part of coordinated work. mcrepo never auto-resolves them
 the state, keeps every side of the conflict recoverable, and prints a **paste-ready prompt for
 your local coding agent** whenever it stops on a state it won't resolve itself.
 
-The recovery loop:
+The recovery loop — **the command is the loop**:
 
 ```
-mcrepo rebase / pull        # the operation stops on a conflict, prints the agent prompt
+mcrepo rebase / pull      # the operation stops on a conflict, prints the agent prompt
   → resolve the files     # only REAL conflicts — the prompt tells the agent the rules
-  → git add <files>
-  → mcrepo continue       # repeat until 'mcrepo status' is clean
-  → mcrepo merge          # now conflict-free
-  → mcrepo push
+  → git add <files>       # staging is the "resolved" signal (agent does this too)
+  → re-run the command    # finishes paused rebases, restores stashes, reports next step
+                          # (repeat if it finds further conflicts)
 ```
 
 The stuck states and how `mcrepo status` shows them:
 
 | State | How it happens | `status` shows | How to finish |
 |---|---|---|---|
-| Rebase conflict | `rebase`, `pull` | `inprogress=REBASING` | resolve → `git add` → `mcrepo continue` |
-| Merge conflict | manual `git merge` | `inprogress=MERGING` | resolve → `git add` → `mcrepo continue` |
+| Rebase conflict | `rebase`, `pull` | `inprogress=REBASING` | resolve → `git add` → re-run the command |
+| Merge conflict | manual `git merge` | `inprogress=MERGING` | resolve → `git add` → `git commit` |
 | Squash conflict (no git marker!) | manual squash-merge | `inprogress=CONFLICTED` | resolve → `git add` → `git commit` |
-| Stash-pop conflict (no git marker!) | auto-stash restore after rebase/pull | `inprogress=CONFLICTED` + `mcrepo-stash=N` | resolve → `git add` → `git stash drop` |
-| Carry conflict | `branch <name>` with carried changes | `mcrepo-stash=N` | resolve → `git add` → `git stash drop` |
+| Stash-pop conflict (no git marker!) | auto-stash restore after rebase/pull | `inprogress=CONFLICTED` + `mcrepo-stash=N` | resolve → `git add` → re-run the command (drops the applied stash) |
+| Carry conflict | `branch <name>` with carried changes | `mcrepo-stash=N` | resolve → `git add` → re-run `mcrepo branch <name>` |
 | Ambiguous divergence | remote has work that is not your rebase | `upstream=ahead/behind` | review with the agent prompt; never blind force-push |
 | Partial merge | one repo failed mid-`merge` | repo back on feature branch | fix cause → re-run `mcrepo merge` |
 | Partial coordinated commit | commit failed in some repos | mixed `#N` HEADs | complete the batch with the exact printed subject |
 
-Commands:
+Backing out instead of finishing:
 
 ```bash
-mcrepo resolve    # read-only diagnosis: lists stuck repos and prints the agent prompt on stdout
-mcrepo continue   # git <op> --continue in every mid-op repo; explains marker-less conflicts;
-                  # offers leftover mcrepo stashes for pop/drop; exits 2 while conflicts remain
 mcrepo abort      # git <op> --abort in every mid-op repo; also clears marker-less conflicts
                   # (git reset --merge) while preserving stashes
 ```
 
 Sleep-mode repos are skipped; the meta-context participates as well.
 
-**How to prompt your coding agent:** paste the prompt mcrepo prints (or run
-`mcrepo resolve | pbcopy` any time — the prompt body goes to stdout). It briefs the agent on the
-coordinated-branch model, lists the affected repos with their paths, and sets the rules: resolve
-only *real* semantic conflicts, keep the parent side's formatting on formatting-only collisions,
-never keep duplicated `mcrepo commit #N` coordination commits, never force-push or reset without
-asking, and finish via `git add` → `mcrepo continue` → `mcrepo push`. Generated workspaces also
-ship a `conflict-resolution` skill and an AGENTS.md "Conflict Recovery" section, so local agents
-know the procedure even without the paste.
+**How to prompt your coding agent:** paste the prompt mcrepo prints at the moment it stops. It
+briefs the agent on the coordinated-branch model, lists the affected repos, paths, and files,
+and sets a strictly LOCAL contract: the agent may only edit files and `git add` — no mcrepo, no
+`git rebase/commit/stash/push`, nothing needing network access or credentials (it works even
+when the agent runs in a VM without your git logins). The rules: resolve only *real* semantic
+conflicts, keep the parent side's formatting on formatting-only collisions, never keep
+duplicated `mcrepo commit #N` coordination commits — and when done, the agent tells you to
+re-run the mcrepo command in your workspace. Generated workspaces also ship a
+`conflict-resolution` skill and an AGENTS.md "Conflict Recovery" section, so local agents know
+the procedure even without the paste.
 
 ## Coordinated Commits
 
@@ -340,9 +351,9 @@ When you sit down at a device that has local work while another device already p
 ```
 mcrepo pull             # per repo: auto-stash dirty work → rebase local commits
                         # on top of the remote work → restore the stash
-   ⇣ conflict?          # exit 2 — repo pauses as inprogress=REBASING
-mcrepo resolve          # prints the agent prompt; resolve → git add → mcrepo continue
-mcrepo pull             # re-run to finish any remaining repos
+   ⇣ conflict?          # exit 2 — repo pauses, agent prompt printed
+(agent fixes + git add) # strictly local: edit files, stage them — nothing else
+mcrepo pull             # re-run: finishes the paused rebases, restores stashes
 mcrepo push             # plain push — your commits now sit on top of origin
 ```
 
@@ -367,10 +378,32 @@ Behavior details:
 - The meta-context auto-stashes on dirty so unrelated edits never block its pull.
 - Uncommitted changes ride along via auto-stash; if restoring them conflicts, the stash is
   preserved and the repo shows `inprogress=CONFLICTED` (see [Conflicts & Recovery](#conflicts--recovery)).
-- Coordinated commands (`branch`, `commit`, `rebase`, `merge`, `pull`) refuse to start while any
-  repo is mid-operation or conflicted — resolve first (`mcrepo resolve`), so a stuck repo can
-  never turn into a half-pulled workspace.
+- `rebase`, `pull`, and `branch` may run over their *own* paused states — re-running them IS the
+  resume. Foreign states (a manual `git merge` in progress) still block, and `commit`/`merge`
+  stay strictly guarded, so a stuck repo can never turn into a half-pulled workspace.
 - `--reset` confirms before discarding uncommitted changes, and **separately per repo** before discarding committed-but-unpushed commits (it lists them first). `--yes` skips both confirmations for automation; without it, non-interactive runs keep such repos untouched.
+
+### Named Remote Locations
+
+Beyond `origin` (and the fork-workflow `upstream`), a workspace can declare additional named
+locations — a backup host, a mirror, a second forge:
+
+```bash
+mcrepo remote add backup             # declare the location; asks one URL per repo (Enter = skip)
+mcrepo remote set alpha backup <url> # set/change a single repo's URL (--off clears it)
+mcrepo remote list                   # locations + per-repo URLs
+mcrepo pull backup                   # integrate from the location (rebase local commits on top)
+mcrepo push backup                   # plain-push write repos there — locations are NEVER forced
+mcrepo remote remove backup          # remove the location everywhere (confirmed)
+```
+
+- Location names live in `mcrepo.yaml` (`locations:`), per-repo URLs under each repo's
+  `remotes:` field — repos without a URL for a location are simply skipped and reported.
+- `mcrepo add` asks for each declared location when you add a new repo interactively.
+- `pull <location>` uses the same conflict loop as origin pull (pause → agent prompt → re-run),
+  and never rebases onto a provably stale mirror — it routes you to `push <location>` instead.
+- `push <location>` refuses when the location holds commits you lack (pull from it first);
+  there is no force variant for locations by design.
 
 ## Pushing
 
@@ -638,6 +671,7 @@ You can keep component repositories public/open-source while keeping the `mcrepo
 ```yaml
 schema: 1                     # manifest format version (checked on load)
 organization: my-org          # optional: GitHub org for 'init <organization>' sync
+locations: backup mirror      # optional: declared named remote locations (space-separated)
 branch: feature-x             # optional: the active global (coordinated) branch
 meta-parent: main             # parent-branch stack of the meta-context (comma-separated, rightmost = immediate parent)
 meta-upstream: <url>          # optional: PR target for the meta-context itself
@@ -648,6 +682,7 @@ repos:
     description: "..."        # one-line functional description (agent-maintained)
     parent: main              # parent-branch stack (recorded by 'mcrepo branch')
     upstream: <url>           # optional: PR target for the fork workflow
+    remotes: backup=<url>     # optional: URLs for named locations (comma-separated name=url)
     local: true               # local incubator repo (no external remote yet)
     localpath: ./service-a
 ```
@@ -667,7 +702,7 @@ Accepted URL transports: `https`, `ssh`, `git`, `file`, absolute/relative local 
 
 - `0` — success, including a user-declined confirmation
 - `1` — fatal or usage error
-- `2` — partial failure (some repos succeeded, some failed, or conflicts remain) — returned by `pull`, `push`, `pr`, `rebase`, `merge`, and `continue`
+- `2` — partial failure (some repos succeeded, some failed, or conflicts remain) — returned by `pull`, `push`, `pr`, `rebase`, and `merge`
 
 ## Glossary
 
@@ -681,6 +716,19 @@ Accepted URL transports: `https`, `ssh`, `git`, `file`, absolute/relative local 
 - **coordinated commit `#N @batch`** — one logical change committed across several repos with a shared sequence number and batch id
 
 ## Upgrading to 0.7.x
+
+Since **0.7.5 / 0.7.6** (the re-run loop + named locations):
+
+- **The command is the loop**: on conflict, `rebase`/`pull`/`branch` pause, print the agent
+  prompt (now listing the conflicted files), and finish on RE-RUN — the re-run continues paused
+  rebases, restores auto-stashed changes, and finalizes resolved stash-pop conflicts. The agent
+  contract is strictly local (edit files + `git add`; no mcrepo, no network) so it works from a
+  VM without your git credentials.
+- **Hidden**: `mcrepo continue` and `mcrepo resolve` still work but left help/completions/docs;
+  `mcrepo abort` stays as the visible escape hatch. Prompts and hints no longer reference them.
+- **New**: named remote locations — `mcrepo remote add/set/list/remove` plus
+  `mcrepo pull <location>` / `mcrepo push <location>` (`locations:`/`remotes:` fields in
+  mcrepo.yaml); locations are never force-pushed.
 
 Since **0.7.4**:
 
