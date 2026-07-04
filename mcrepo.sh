@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.7.5"
+MCREPO_VERSION="0.7.6"
 # Manifest (mcrepo.yaml) format version. Bump when the manifest schema changes
 # incompatibly; cmd_post_update_migrate migrates older manifests forward.
 MCREPO_SCHEMA_VERSION="1"
@@ -18,7 +18,7 @@ OPENCODE_PROJECT_SKILLS_DIR=".opencode/skills"
 # Single source of truth for the user-facing command surface. usage(), the
 # dispatch in main(), and the generated completions must stay in sync with
 # this list (checked by tests/30-inventory.bats).
-MCREPO_COMMANDS="init publish-base add upstream fork doctor new publish remove write read sleep list branch rebase merge pr pull push commit abort open status skill version update install-extension create-patch help"
+MCREPO_COMMANDS="init publish-base add upstream fork doctor new publish remove remote write read sleep list branch rebase merge pr pull push commit abort open status skill version update install-extension create-patch help"
 
 COMPLETION_BASH_FILE=".mcrepo-completion.bash"
 COMPLETION_ZSH_FILE=".mcrepo-completion.zsh"
@@ -82,6 +82,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh add <git-url> [name] [opts]         # Add a repository (interactive when GitHub+gh: offers origin/fork/upstream/read-only)
                                                   #   opts: --as-origin|--as-upstream --upstream <url> --origin <url> --mode read|write --fork --no-clone --yes
   ./mcrepo.sh upstream [<repo> <url>|--off|--origin <url>]  # Show or set per-repo upstream (PR target) for the fork workflow
+  ./mcrepo.sh remote [list|add <name>|remove <name>|set <repo> <name> <url|--off>]  # Manage named remote locations (e.g. backup) for 'pull <location>' / 'push <location>'; repos without a URL are skipped
   ./mcrepo.sh fork <repo-name-or-url> [name]      # Fork a GitHub repo (gh): origin=your fork, upstream=original
   ./mcrepo.sh fork --all [--yes]                  # Fork+rewire every repo (incl. meta) where you lack push access (plan + confirm)
   ./mcrepo.sh doctor                              # Report git/gh/auth + per-repo origin/upstream/access; guidance for setup
@@ -104,6 +105,8 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh rebase [--include-read]                  # STEP 3 — rebase the branch onto each parent (auto-stash); resolve conflicts HERE, before merging
   ./mcrepo.sh merge [-m "subject"] [--include-read]  # STEP 4 — squash the branch back into each repo's parent; requires a rebased branch (run 'rebase' first)
   ./mcrepo.sh push [-m "message"] [--no-fetch] [--no-force] [--include-read] # STEP 5 — fetch + push write repos; safe force-with-lease for rebased branches; aborts if genuinely behind
+  ./mcrepo.sh push <location>                        # publish write repos to a named location (plain push, never forced)
+  ./mcrepo.sh pull <location>                        # integrate from a named location (rebase local commits on top; stale mirrors route to push)
   ./mcrepo.sh pull                                   # anytime — integrate from origin: auto-stash + rebase local commits onto remote work (multi-device); on conflict: resolve, then re-run
   ./mcrepo.sh pull --ff-only                         # anytime — conservative pull: fast-forward only, dirty repos skipped (fetch only); never stashes or rebases
   ./mcrepo.sh pr [-m "title"] [--draft] [--no-push] [--target origin|upstream]  # instead of push — coordinated GitHub PRs per repo; fork->upstream when upstream set; cross-linked
@@ -644,11 +647,13 @@ parse_repos_tsv() {
         local = v
       } else if (k == "upstream") {
         upstream = v
+      } else if (k == "remotes") {
+        remotes = v
       }
     }
     function emit() {
       if (in_item) {
-        print url SEP name SEP mode SEP description SEP parent SEP local SEP upstream
+        print url SEP name SEP mode SEP description SEP parent SEP local SEP upstream SEP remotes
       }
     }
     BEGIN {
@@ -660,6 +665,7 @@ parse_repos_tsv() {
       parent = ""
       local = ""
       upstream = ""
+      remotes = ""
     }
     {
       line = $0
@@ -673,6 +679,7 @@ parse_repos_tsv() {
         parent = ""
         local = ""
         upstream = ""
+      remotes = ""
         sub(/^[ \t]*-[ \t]*/, "", line)
         parse_kv(line)
         next
@@ -709,6 +716,30 @@ parse_organization() {
       line = $0
       if (line ~ /^[ \t]*organization:[ \t]*/) {
         sub(/^[ \t]*organization:[ \t]*/, "", line)
+        print unquote(line)
+        exit
+      }
+    }
+  ' "$REPOS_FILE"
+}
+
+parse_locations() {
+  awk '
+    function trim(s) {
+      gsub(/^[ \t]+|[ \t]+$/, "", s)
+      return s
+    }
+    function unquote(s) {
+      s = trim(s)
+      if ((s ~ /^".*"$/) || (s ~ /^\047.*\047$/)) {
+        return substr(s, 2, length(s) - 2)
+      }
+      return s
+    }
+    {
+      line = $0
+      if (line ~ /^locations:[ \t]*/) {
+        sub(/^locations:[ \t]*/, "", line)
         print unquote(line)
         exit
       }
@@ -820,6 +851,11 @@ REPO_LOCALS=()
 # (your fork/own repo), upstream is the original repo that PRs target. Empty when
 # you work directly in your own repo. Tracked via 'upstream:' in mcrepo.yaml.
 REPO_UPSTREAMS=()
+# Named remote locations per repo, compact "name=url,name=url" scalar.
+# Location NAMES are declared workspace-wide in the top-level 'locations:'
+# field; a repo without an entry for a location is simply skipped there.
+REPO_REMOTES=()
+LOCATIONS=""
 ORGANIZATION=""
 GLOBAL_BRANCH=""
 # Parent branch stack for the meta-context repo itself (same comma-separated
@@ -846,6 +882,8 @@ load_repos() {
   REPO_PARENTS=()
   REPO_LOCALS=()
   REPO_UPSTREAMS=()
+  REPO_REMOTES=()
+  LOCATIONS=""
   ORGANIZATION=""
   GLOBAL_BRANCH=""
   META_PARENT=""
@@ -865,12 +903,13 @@ load_repos() {
   fi
 
   ORGANIZATION="$(parse_organization || true)"
+  LOCATIONS="$(parse_locations || true)"
   GLOBAL_BRANCH="$(parse_branch || true)"
   META_PARENT="$(parse_meta_parent || true)"
   META_UPSTREAM="$(parse_meta_upstream || true)"
 
-  local parsed_url parsed_name parsed_mode parsed_description parsed_parent parsed_local parsed_upstream
-  while IFS=$'\x1f' read -r parsed_url parsed_name parsed_mode parsed_description parsed_parent parsed_local parsed_upstream; do
+  local parsed_url parsed_name parsed_mode parsed_description parsed_parent parsed_local parsed_upstream parsed_remotes
+  while IFS=$'\x1f' read -r parsed_url parsed_name parsed_mode parsed_description parsed_parent parsed_local parsed_upstream parsed_remotes; do
     local is_local="false"
     case "${parsed_local:-}" in
       true|1|yes|TRUE|YES) is_local="true" ;;
@@ -896,6 +935,7 @@ load_repos() {
     REPO_PARENTS+=("${parsed_parent:-}")
     REPO_LOCALS+=("$is_local")
     REPO_UPSTREAMS+=("${parsed_upstream:-}")
+    REPO_REMOTES+=("${parsed_remotes:-}")
   done < <(parse_repos_tsv)
 }
 
@@ -908,6 +948,9 @@ save_repos() {
     printf 'schema: %s\n' "$MCREPO_SCHEMA_VERSION"
     if [ -n "$ORGANIZATION" ]; then
       printf 'organization: %s\n' "$ORGANIZATION"
+    fi
+    if [ -n "$LOCATIONS" ]; then
+      printf 'locations: %s\n' "$LOCATIONS"
     fi
     if [ -n "$GLOBAL_BRANCH" ]; then
       printf 'branch: %s\n' "$GLOBAL_BRANCH"
@@ -938,6 +981,9 @@ save_repos() {
         fi
         if [ -n "${REPO_UPSTREAMS[$i]:-}" ]; then
           printf '    upstream: %s\n' "${REPO_UPSTREAMS[$i]}"
+        fi
+        if [ -n "${REPO_REMOTES[$i]:-}" ]; then
+          printf '    remotes: %s\n' "${REPO_REMOTES[$i]}"
         fi
         if is_repo_local "$i"; then
           printf '    local: true\n'
@@ -1018,6 +1064,7 @@ sync_organization_repos() {
     REPO_PARENTS+=("")
     REPO_LOCALS+=("false")
     REPO_UPSTREAMS+=("")
+    REPO_REMOTES+=("")
     ensure_gitignore_repo_entry "$repo_name"
     imported=$((imported + 1))
   done <<<"$repo_rows"
@@ -1260,6 +1307,11 @@ _mcrepo_complete() {
     pull)
       COMPREPLY=( $(compgen -W "--ff-only --reset --yes" -- "$cur") )
       ;;
+    remote)
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        COMPREPLY=( $(compgen -W "list add remove set" -- "$cur") )
+      fi
+      ;;
     push)
       COMPREPLY=( $(compgen -W "-m --no-fetch --no-force --include-read" -- "$cur") )
       ;;
@@ -1373,6 +1425,11 @@ _mcrepo_complete() {
       ;;
     pull)
       compadd -- --ff-only --reset --yes
+      ;;
+    remote)
+      if (( CURRENT == 3 )); then
+        compadd -- list add remove set
+      fi
       ;;
     push)
       compadd -- -m --no-fetch --no-force --include-read
@@ -2260,6 +2317,7 @@ register_repo_entry() {
   REPO_PARENTS+=("")
   REPO_LOCALS+=("false")
   REPO_UPSTREAMS+=("$up_url")
+  REPO_REMOTES+=("")
   save_repos
 
   ensure_gitignore_repo_entry "$name"
@@ -2273,6 +2331,26 @@ register_repo_entry() {
   if [ -n "$up_url" ] && [ -d "$repo_dir/.git" ]; then
     ensure_upstream_remote "$repo_dir" "$up_url"
     git -C "$repo_dir" fetch upstream --quiet 2>/dev/null || true
+  fi
+  # Steered setup for declared named locations (Enter = skip per location).
+  if [ -n "$LOCATIONS" ] && [ -t 0 ] && [ -t 1 ]; then
+    local nidx=$(( ${#REPO_NAMES[@]} - 1 ))
+    local loc lurl loc_changed=0
+    for loc in $LOCATIONS; do
+      printf "URL for location '%s' of '%s' (Enter = skip): " "$loc" "$name" >&2
+      IFS= read -r lurl || lurl=""
+      [ -n "$lurl" ] || continue
+      case "$lurl" in
+        *[,=' ']*) warn "URL may not contain ',', '=' or spaces — skipped."; continue ;;
+      esac
+      validate_repo_url "$lurl" || { warn "Unsupported or unsafe URL — skipped."; continue; }
+      set_repo_remote "$nidx" "$loc" "$lurl"
+      ensure_named_remote "$repo_dir" "$loc" "$lurl"
+      loc_changed=1
+    done
+    if [ "$loc_changed" -eq 1 ]; then
+      save_repos
+    fi
   fi
   refresh_generated_files
   sync_vscode_git_ignored_repositories
@@ -2445,6 +2523,133 @@ cmd_add() {
 #   mcrepo upstream <repo> <url>          # set/replace upstream
 #   mcrepo upstream <repo> --off          # remove upstream
 #   mcrepo upstream <repo> --origin <url> # set origin for an upstream-only entry
+# Manage named remote locations: a location NAME (e.g. "backup") is declared
+# once per workspace (top-level 'locations:' in mcrepo.yaml); each repo may
+# carry a URL for it under 'remotes:' — repos without one are simply skipped.
+# 'mcrepo pull <location>' and 'mcrepo push <location>' use them.
+cmd_remote() {
+  local sub="${1:-list}"
+  [ "$#" -gt 0 ] && shift
+  load_repos
+  case "$sub" in
+    list)
+      [ "$#" -eq 0 ] || die "Usage: mcrepo remote [list]"
+      if [ -z "$LOCATIONS" ]; then
+        log "No named locations declared. Add one with 'mcrepo remote add <name>'."
+        return 0
+      fi
+      log "Locations: $LOCATIONS"
+      local i loc url line any
+      for i in "${!REPO_NAMES[@]}"; do
+        if is_repo_local "$i"; then continue; fi
+        line="  ${REPO_NAMES[$i]}:"
+        any=0
+        for loc in $LOCATIONS; do
+          url="$(repo_remote_url "$i" "$loc")"
+          if [ -n "$url" ]; then
+            line="$line $loc=$url"
+            any=1
+          fi
+        done
+        [ "$any" -eq 1 ] || line="$line (none)"
+        log "$line"
+      done
+      ;;
+    add)
+      local name="${1:-}"
+      [ -n "$name" ] || die "Usage: mcrepo remote add <name>"
+      shift
+      [ "$#" -eq 0 ] || die "Unexpected argument: $1"
+      validate_location_name "$name" || die "Invalid location name '$name' (lowercase letters, digits, '-' and '_'; 'origin' and 'upstream' are reserved)."
+      case " $LOCATIONS " in
+        *" $name "*) die "Location '$name' is already declared." ;;
+      esac
+      LOCATIONS="${LOCATIONS:+$LOCATIONS }$name"
+      save_repos
+      log "Location '$name' declared."
+      if [ -t 0 ] && [ -t 1 ]; then
+        # Steered setup: one URL question per repo, Enter skips that repo.
+        local ri rurl rdir
+        for ri in "${!REPO_NAMES[@]}"; do
+          if is_repo_local "$ri"; then continue; fi
+          printf "URL for '%s' of repo '%s' (Enter = skip): " "$name" "${REPO_NAMES[$ri]}" >&2
+          IFS= read -r rurl || rurl=""
+          [ -n "$rurl" ] || continue
+          case "$rurl" in
+            *[,=' ']*) warn "URL may not contain ',', '=' or spaces — skipped."; continue ;;
+          esac
+          validate_repo_url "$rurl" || { warn "Unsupported or unsafe URL — skipped."; continue; }
+          set_repo_remote "$ri" "$name" "$rurl"
+          rdir="$(get_repo_dir "${REPO_NAMES[$ri]}" "${REPO_MODES[$ri]}")"
+          ensure_named_remote "$rdir" "$name" "$rurl"
+        done
+        save_repos
+      else
+        log "Set per-repo URLs with: mcrepo remote set <repo> $name <url>"
+      fi
+      log "Next: 'mcrepo push $name' publishes write repos there; 'mcrepo pull $name' integrates from it."
+      ;;
+    remove)
+      local name="${1:-}"
+      [ -n "$name" ] || die "Usage: mcrepo remote remove <name>"
+      shift
+      [ "$#" -eq 0 ] || die "Unexpected argument: $1"
+      _require_known_location "$name"
+      if ! confirm "Remove location '$name' from the workspace and all repos?" n; then
+        log "Aborted."
+        return 0
+      fi
+      local newlocs="" l i rdir
+      for l in $LOCATIONS; do
+        [ "$l" = "$name" ] || newlocs="${newlocs:+$newlocs }$l"
+      done
+      LOCATIONS="$newlocs"
+      for i in "${!REPO_NAMES[@]}"; do
+        [ -n "$(repo_remote_url "$i" "$name")" ] || continue
+        set_repo_remote "$i" "$name" ""
+        rdir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
+        if [ -d "$rdir/.git" ]; then
+          git -C "$rdir" remote remove "$name" 2>/dev/null || true
+        fi
+      done
+      save_repos
+      log "Location '$name' removed."
+      ;;
+    set)
+      local rname="${1:-}" lname="${2:-}" url="${3:-}"
+      { [ -n "$rname" ] && [ -n "$lname" ]; } || die "Usage: mcrepo remote set <repo> <location> <url|--off>"
+      _require_known_location "$lname"
+      local idx="" i
+      for i in "${!REPO_NAMES[@]}"; do
+        if [ "${REPO_NAMES[$i]}" = "$rname" ]; then idx="$i"; break; fi
+      done
+      [ -n "$idx" ] || die "Unknown repo: '$rname'"
+      local repo_dir
+      repo_dir="$(get_repo_dir "$rname" "${REPO_MODES[$idx]}")"
+      if [ "$url" = "--off" ] || [ -z "$url" ]; then
+        set_repo_remote "$idx" "$lname" ""
+        if [ -d "$repo_dir/.git" ]; then
+          git -C "$repo_dir" remote remove "$lname" 2>/dev/null || true
+        fi
+        save_repos
+        log "'$rname': location '$lname' cleared."
+        return 0
+      fi
+      case "$url" in
+        *[,=' ']*) die "URL may not contain ',', '=' or spaces." ;;
+      esac
+      validate_repo_url "$url" || die "Unsupported or unsafe URL: '$url'"
+      set_repo_remote "$idx" "$lname" "$url"
+      ensure_named_remote "$repo_dir" "$lname" "$url"
+      save_repos
+      log "'$rname': $lname -> $url"
+      ;;
+    *)
+      die "Unknown remote subcommand: '$sub' (list|add|remove|set)"
+      ;;
+  esac
+}
+
 cmd_upstream() {
   load_repos
 
@@ -2826,6 +3031,7 @@ cmd_remove() {
   local old_parents=("${REPO_PARENTS[@]}")
   local old_locals=("${REPO_LOCALS[@]}")
   local old_upstreams=("${REPO_UPSTREAMS[@]}")
+  local old_remotes=("${REPO_REMOTES[@]+"${REPO_REMOTES[@]}"}")
 
   REPO_URLS=()
   REPO_NAMES=()
@@ -2834,6 +3040,7 @@ cmd_remove() {
   REPO_PARENTS=()
   REPO_LOCALS=()
   REPO_UPSTREAMS=()
+  REPO_REMOTES=()
 
   local i
   for i in "${!old_names[@]}"; do
@@ -2845,6 +3052,7 @@ cmd_remove() {
       REPO_PARENTS+=("${old_parents[$i]}")
       REPO_LOCALS+=("${old_locals[$i]}")
       REPO_UPSTREAMS+=("${old_upstreams[$i]}")
+      REPO_REMOTES+=("${old_remotes[$i]:-}")
     fi
   done
   save_repos
@@ -2957,6 +3165,7 @@ cmd_new() {
   REPO_PARENTS+=("")
   REPO_LOCALS+=("true")
   REPO_UPSTREAMS+=("")
+  REPO_REMOTES+=("")
   save_repos
 
   mkdir -p "./$name"
@@ -4427,12 +4636,169 @@ _pull_one_rebase() {
   return 0
 }
 
+# Pull from a named location: fetch + integrate per repo that carries a URL
+# for it (others are skipped). Same loop as origin pull: diverged-with-new-
+# content rebases, a stale mirror routes to 'push <location>', conflicts
+# pause for resolve + re-run. Targets all non-sleep repos.
+_pull_from_location() {
+  local loc="$1"
+  _require_known_location "$loc"
+  _require_no_stuck_repos "pull" "REBASING CONFLICTED"
+  log ""
+  log "=== Pull from location '$loc' ==="
+  local i repo_dir url branch rc
+  local -a updated=() skipped=() conflicts=() conflict_entries=() failed=() needs_push=()
+  for i in "${!REPO_NAMES[@]}"; do
+    [ "${REPO_MODES[$i]}" != "sleep" ] || continue
+    repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
+    [ -d "$repo_dir/.git" ] || continue
+    url="$(repo_remote_url "$i" "$loc")"
+    if [ -z "$url" ]; then
+      skipped+=("${REPO_NAMES[$i]} (no $loc URL)")
+      continue
+    fi
+    ensure_named_remote "$repo_dir" "$loc" "$url" || { failed+=("${REPO_NAMES[$i]}"); continue; }
+    rc=0
+    _resume_inflight_rebase "$repo_dir" "${REPO_NAMES[$i]}" || rc=$?
+    if [ "$rc" -ge 2 ]; then
+      conflicts+=("${REPO_NAMES[$i]}")
+      conflict_entries+=("${REPO_NAMES[$i]}|$repo_dir")
+      warn "  '${REPO_NAMES[$i]}' is still conflicted:"
+      _conflicted_files "$repo_dir" | sed 's/^/      /' >&2
+      continue
+    fi
+    if ! git -C "$repo_dir" fetch "$loc" --prune 2>/dev/null; then
+      warn "Fetch from '$loc' failed for '${REPO_NAMES[$i]}'"
+      failed+=("${REPO_NAMES[$i]}")
+      continue
+    fi
+    branch="$(repo_branch "$repo_dir")"
+    if ! git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/$loc/$branch"; then
+      skipped+=("${REPO_NAMES[$i]} (no '$branch' on $loc)")
+      continue
+    fi
+    local lref="$loc/$branch" ab behind ahead
+    ab="$(git -C "$repo_dir" rev-list --left-right --count "$lref...HEAD" 2>/dev/null)" || { failed+=("${REPO_NAMES[$i]}"); continue; }
+    behind="$(printf '%s' "$ab" | awk '{print $1+0}')"
+    ahead="$(printf '%s' "$ab" | awk '{print $2+0}')"
+    if [ "$behind" -eq 0 ]; then
+      if [ "$ahead" -gt 0 ]; then
+        needs_push+=("${REPO_NAMES[$i]}")
+      else
+        updated+=("${REPO_NAMES[$i]} (up to date)")
+      fi
+      continue
+    fi
+    # Patch-equivalence guard: a stale mirror (only holds commits that exist
+    # locally, as-is or rebased) must be pushed, never rebased onto.
+    local remote_new
+    remote_new="$(git -C "$repo_dir" rev-list --left-only --cherry-pick "$lref...HEAD" 2>/dev/null || true)"
+    if [ "$ahead" -gt 0 ] && [ -z "$remote_new" ]; then
+      needs_push+=("${REPO_NAMES[$i]} (location is stale)")
+      continue
+    fi
+    local dirty stashed=0
+    dirty="$(git -C "$repo_dir" status --porcelain 2>/dev/null)"
+    if [ -n "$dirty" ] && _mcrepo_stash_push "$repo_dir" "mcrepo: auto-stash before pull"; then
+      stashed=1
+    fi
+    log "Rebasing '${REPO_NAMES[$i]}' onto $lref ..."
+    if ! git -C "$repo_dir" rebase "$lref"; then
+      conflicts+=("${REPO_NAMES[$i]}")
+      conflict_entries+=("${REPO_NAMES[$i]}|$repo_dir")
+      warn "  Rebase conflicts in '${REPO_NAMES[$i]}':"
+      _conflicted_files "$repo_dir" | sed 's/^/      /' >&2
+      warn "  Have the files resolved and staged, then re-run 'mcrepo pull $loc'."
+      continue
+    fi
+    if [ "$stashed" -eq 1 ] && ! git -C "$repo_dir" stash pop; then
+      _mark_stash_applied "$repo_dir"
+      conflicts+=("${REPO_NAMES[$i]}")
+      conflict_entries+=("${REPO_NAMES[$i]}|$repo_dir")
+      warn "  Stash pop conflict in '${REPO_NAMES[$i]}'. Have the files resolved and staged, then re-run 'mcrepo pull $loc'."
+      continue
+    fi
+    updated+=("${REPO_NAMES[$i]}")
+  done
+  log ""
+  log "=== Pull '$loc' summary ==="
+  if [ "${#updated[@]}" -gt 0 ]; then log "  Updated:   ${updated[*]}"; fi
+  if [ "${#needs_push[@]}" -gt 0 ]; then log "  Ahead of '$loc' (push to update it): ${needs_push[*]}"; fi
+  if [ "${#skipped[@]}" -gt 0 ]; then log "  Skipped:   ${skipped[*]}"; fi
+  if [ "${#conflicts[@]}" -gt 0 ]; then warn "  Conflicts: ${conflicts[*]}"; fi
+  if [ "${#failed[@]}" -gt 0 ]; then warn "  Failed:    ${failed[*]}"; fi
+  if [ "${#conflict_entries[@]}" -gt 0 ]; then
+    print_agent_recovery_prompt pull-rebase-conflict "${conflict_entries[@]}"
+    warn "Next: have the conflicts resolved and staged (prompt above), then re-run 'mcrepo pull $loc'."
+    return 2
+  fi
+  if [ "${#failed[@]}" -gt 0 ]; then
+    return 2
+  fi
+  if [ "${#needs_push[@]}" -gt 0 ]; then
+    log ""
+    log "Next: 'mcrepo push $loc' to bring the location up to date."
+  fi
+  return 0
+}
+
+# Push write repos to a named location. Plain pushes only — a location is
+# never force-pushed; when it holds commits you lack, pull from it first.
+_push_to_location() {
+  local loc="$1"
+  _require_known_location "$loc"
+  log ""
+  log "=== Push to location '$loc' ==="
+  local i repo_dir url branch
+  local -a pushed=() skipped=() failed=() behind_loc=()
+  for i in "${!REPO_NAMES[@]}"; do
+    [ "${REPO_MODES[$i]}" = "write" ] || continue
+    repo_dir="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
+    [ -d "$repo_dir/.git" ] || continue
+    url="$(repo_remote_url "$i" "$loc")"
+    if [ -z "$url" ]; then
+      skipped+=("${REPO_NAMES[$i]} (no $loc URL)")
+      continue
+    fi
+    if [ -n "$(repo_inprogress_state "$repo_dir")" ]; then
+      skipped+=("${REPO_NAMES[$i]} (mid-operation)")
+      continue
+    fi
+    ensure_named_remote "$repo_dir" "$loc" "$url" || { failed+=("${REPO_NAMES[$i]}"); continue; }
+    git -C "$repo_dir" fetch "$loc" --prune 2>/dev/null || true
+    branch="$(repo_branch "$repo_dir")"
+    if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/$loc/$branch" &&        ! git -C "$repo_dir" merge-base --is-ancestor "$loc/$branch" HEAD 2>/dev/null; then
+      behind_loc+=("${REPO_NAMES[$i]}")
+      warn "  '${REPO_NAMES[$i]}': '$loc/$branch' has commits you don't have — run 'mcrepo pull $loc' first (locations are never force-pushed)."
+      continue
+    fi
+    log "--- Pushing ${REPO_NAMES[$i]} -> $loc ---"
+    if git -C "$repo_dir" push "$loc" "$branch"; then
+      pushed+=("${REPO_NAMES[$i]}")
+    else
+      warn "Push to '$loc' failed for '${REPO_NAMES[$i]}' (see git output above)"
+      failed+=("${REPO_NAMES[$i]}")
+    fi
+  done
+  log ""
+  log "=== Push '$loc' summary ==="
+  if [ "${#pushed[@]}" -gt 0 ]; then log "  Pushed:  ${pushed[*]}"; fi
+  if [ "${#skipped[@]}" -gt 0 ]; then log "  Skipped: ${skipped[*]}"; fi
+  if [ "${#behind_loc[@]}" -gt 0 ]; then warn "  Behind '$loc' (pull first): ${behind_loc[*]}"; fi
+  if [ "${#failed[@]}" -gt 0 ]; then warn "  Failed:  ${failed[*]}"; fi
+  if [ "${#failed[@]}" -gt 0 ] || [ "${#behind_loc[@]}" -gt 0 ]; then
+    return 2
+  fi
+  return 0
+}
+
 cmd_pull() {
   # Default is INTEGRATE: auto-stash dirty work + rebase local commits onto
   # origin (the multi-device workflow). '--ff-only' opts into the conservative
   # pull: fast-forward only, dirty repos skipped, never stashes or rebases.
   local pull_mode="rebase"
   local assume_yes=0
+  local location=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --ff-only) pull_mode="ffonly" ;;
@@ -4442,10 +4808,21 @@ cmd_pull() {
         ;;
       --reset) pull_mode="reset" ;;
       --yes|-y) assume_yes=1 ;;
-      *) die "Unknown pull option: $1" ;;
+      -*) die "Unknown pull option: $1" ;;
+      *)
+        [ -z "$location" ] || die "Unexpected argument: $1 (location already given: '$location')"
+        location="$1"
+        ;;
     esac
     shift
   done
+
+  if [ -n "$location" ]; then
+    { [ "$pull_mode" = "rebase" ] && [ "$assume_yes" -eq 0 ]; } || die "--ff-only/--reset/--yes are not supported with a named location."
+    load_repos
+    _pull_from_location "$location"
+    return $?
+  fi
 
   load_repos
   if [ "$pull_mode" = "rebase" ]; then
@@ -5218,18 +5595,30 @@ cmd_push() {
   local do_fetch=1
   local allow_force=1
   local include_read=0
+  local location=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -m) shift; commit_message="${1:-}"; [ -n "$commit_message" ] || die "-m requires a message" ;;
       --no-fetch) do_fetch=0 ;;
       --no-force) allow_force=0 ;;
       --include-read) include_read=1 ;;
-      *) die "Unknown push option: $1" ;;
+      -*) die "Unknown push option: $1" ;;
+      *)
+        [ -z "$location" ] || die "Unexpected argument: $1 (location already given: '$location')"
+        location="$1"
+        ;;
     esac
     shift
   done
 
   load_repos
+
+  if [ -n "$location" ]; then
+    { [ -z "$commit_message" ] && [ "$do_fetch" -eq 1 ] && [ "$allow_force" -eq 1 ] && [ "$include_read" -eq 0 ]; } || \
+      die "push options are not supported with a named location (plain committed state is pushed)."
+    _push_to_location "$location"
+    return $?
+  fi
 
   # --- Phase 1: Pre-flight - collect target repos ---
   local -a push_dirs=()
@@ -6731,6 +7120,77 @@ ensure_upstream_remote() {
   elif [ "$cur" != "$url" ]; then
     git -C "$repo_dir" remote set-url upstream "$url" 2>/dev/null || true
   fi
+}
+
+# --- Named remote locations ("mcrepo remote", "pull/push <location>") -------
+
+# Location names are git-remote-safe, lowercase, and never shadow the two
+# reserved remotes.
+validate_location_name() {
+  case "$1" in
+    origin|upstream|'') return 1 ;;
+  esac
+  case "$1" in
+    [!a-z0-9]*) return 1 ;;
+    *[!a-z0-9_-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Extract the URL for location <name> from a repo's compact remotes field.
+# Usage: repo_remote_url <idx> <name>  (prints nothing when unset)
+repo_remote_url() {
+  local entry
+  local IFS=','
+  for entry in ${REPO_REMOTES[$1]:-}; do
+    case "$entry" in
+      "$2="*) printf '%s' "${entry#*=}"; return 0 ;;
+    esac
+  done
+  return 0
+}
+
+# Set/replace/clear (url="") location <name> in a repo's remotes field.
+set_repo_remote() {
+  local idx="$1" name="$2" url="$3"
+  local out="" entry
+  local IFS=','
+  for entry in ${REPO_REMOTES[$idx]:-}; do
+    case "$entry" in
+      "$name="*|'') ;;
+      *) out="${out:+$out,}$entry" ;;
+    esac
+  done
+  if [ -n "$url" ]; then
+    out="${out:+$out,}$name=$url"
+  fi
+  REPO_REMOTES[$idx]="$out"
+}
+
+# Configure the git remote <name> in a clone from the manifest URL (same
+# contract as ensure_upstream_remote).
+ensure_named_remote() {
+  local repo_dir="$1" rname="$2" url="$3"
+  [ -n "$url" ] || return 0
+  [ -d "$repo_dir/.git" ] || return 0
+  if ! validate_repo_url "$url"; then
+    warn "Refusing to wire remote '$rname' for '$repo_dir': unsupported or unsafe URL '$url'."
+    return 1
+  fi
+  local cur
+  cur="$(git -C "$repo_dir" remote get-url "$rname" 2>/dev/null || true)"
+  if [ -z "$cur" ]; then
+    git -C "$repo_dir" remote add "$rname" "$url" 2>/dev/null || true
+  elif [ "$cur" != "$url" ]; then
+    git -C "$repo_dir" remote set-url "$rname" "$url" 2>/dev/null || true
+  fi
+}
+
+_require_known_location() {
+  case " $LOCATIONS " in
+    *" $1 "*) return 0 ;;
+  esac
+  die "Unknown location '$1'. Declared locations: ${LOCATIONS:-<none>} — manage them with 'mcrepo remote add <name>'."
 }
 
 # Detect the default branch of a given remote (default: origin). Mirrors the
@@ -9226,6 +9686,7 @@ main() {
     init) cmd_init "$@" ;;
     add) cmd_add "$@" ;;
     upstream) cmd_upstream "$@" ;;
+    remote) cmd_remote "$@" ;;
     fork) cmd_fork "$@" ;;
     doctor) cmd_doctor "$@" ;;
     new) cmd_new "$@" ;;
