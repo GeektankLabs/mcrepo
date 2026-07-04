@@ -57,8 +57,8 @@
   <!-- arrows: commit -> pull -> push, and cycle back -->
   <line x1="380" y1="173" x2="565" y2="173" stroke="#94a3b8" stroke-width="2.5" marker-end="url(#arrow)"/>
   <line x1="830" y1="173" x2="1015" y2="173" stroke="#94a3b8" stroke-width="2.5" marker-end="url(#arrow)"/>
-  <path d="M 1150 120 C 1150 64, 250 64, 250 116" fill="none" stroke="#94a3b8" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
-  <text x="700" y="105" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11.5" fill="#64748b">keep working — the cycle repeats</text>
+  <path d="M 1250 120 C 1250 100, 1230 96, 1200 96 L 320 96 C 290 96, 270 100, 270 116" fill="none" stroke="#475569" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+  <text x="760" y="110" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11.5" fill="#64748b">↻ keep working — the cycle repeats</text>
 
   <!-- conflict loop under PULL -->
   <g filter="url(#shadow)">
