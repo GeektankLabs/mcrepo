@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.7.6"
+MCREPO_VERSION="0.7.7"
 # Manifest (mcrepo.yaml) format version. Bump when the manifest schema changes
 # incompatibly; cmd_post_update_migrate migrates older manifests forward.
 MCREPO_SCHEMA_VERSION="1"
@@ -97,14 +97,15 @@ Usage:  # Show available mcrepo commands
 
 ═══════════════════════════════════════════════════════════════════════════════
   COORDINATED GIT MANAGEMENT
-  The loop:  branch → work → commit → rebase → merge → push
-             (pull anytime to stay current · pr instead of push for reviews)
+  Two loops: LOCAL   branch → work → commit → rebase → merge
+             REMOTE  commit → pull (integrate) → push (publish)
+             (pr instead of push for review flows)
 ═══════════════════════════════════════════════════════════════════════════════
   ./mcrepo.sh branch <branch-name> [--include-read] [--dirty abort|commit|carry|discard]  # STEP 1 — one feature branch across write repos + meta-context (interactive dirty handling; --dirty preselects)
   ./mcrepo.sh commit [-m "msg"] [--include-read]     # STEP 2 — coordinated checkpoint across dirty write repos + meta-context (#N @batch, revertable as one unit; repeat freely)
   ./mcrepo.sh rebase [--include-read]                  # STEP 3 — rebase the branch onto each parent (auto-stash); resolve conflicts HERE, before merging
   ./mcrepo.sh merge [-m "subject"] [--include-read]  # STEP 4 — squash the branch back into each repo's parent; requires a rebased branch (run 'rebase' first)
-  ./mcrepo.sh push [-m "message"] [--no-fetch] [--no-force] [--include-read] # STEP 5 — fetch + push write repos; safe force-with-lease for rebased branches; aborts if genuinely behind
+  ./mcrepo.sh push [-m "message"] [--no-fetch] [--no-force] [--include-read] # publish — fetch + push write repos; safe force-with-lease for rebased branches; aborts if genuinely behind
   ./mcrepo.sh push <location>                        # publish write repos to a named location (plain push, never forced)
   ./mcrepo.sh pull <location>                        # integrate from a named location (rebase local commits on top; stale mirrors route to push)
   ./mcrepo.sh pull                                   # anytime — integrate from origin: auto-stash + rebase local commits onto remote work (multi-device); on conflict: resolve, then re-run
@@ -2626,7 +2627,8 @@ cmd_remote() {
       [ -n "$idx" ] || die "Unknown repo: '$rname'"
       local repo_dir
       repo_dir="$(get_repo_dir "$rname" "${REPO_MODES[$idx]}")"
-      if [ "$url" = "--off" ] || [ -z "$url" ]; then
+      [ -n "$url" ] || die "Usage: mcrepo remote set <repo> <location> <url|--off> (pass --off explicitly to clear)"
+      if [ "$url" = "--off" ]; then
         set_repo_remote "$idx" "$lname" ""
         if [ -d "$repo_dir/.git" ]; then
           git -C "$repo_dir" remote remove "$lname" 2>/dev/null || true
@@ -3677,8 +3679,24 @@ repo_mcrepo_stash_count() {
 _mark_stash_applied() {
   local dir="$1" sha
   sha="$(git -C "$dir" rev-parse -q --verify 'stash@{0}' 2>/dev/null || true)"
-  [ -n "$sha" ] && git -C "$dir" update-ref refs/mcrepo/applied-stash "$sha" 2>/dev/null
+  [ -n "$sha" ] && git -C "$dir" update-ref refs/mcrepo/applied-stash "$sha" 2>/dev/null || true
   return 0
+}
+
+# A rebase mcrepo itself paused is marked so re-runs know it is OURS to
+# resume. An unmarked rebase-in-progress belongs to the user (e.g. a paused
+# 'git rebase -i') and must never be auto-continued.
+_mark_rebase_inflight() {
+  local dir="$1" sha
+  sha="$(git -C "$dir" rev-parse -q --verify HEAD 2>/dev/null || true)"
+  [ -n "$sha" ] && git -C "$dir" update-ref refs/mcrepo/rebase-inflight "$sha" 2>/dev/null || true
+  return 0
+}
+_clear_rebase_inflight() {
+  git -C "$1" update-ref -d refs/mcrepo/rebase-inflight 2>/dev/null || true
+}
+_rebase_is_marked_inflight() {
+  git -C "$1" rev-parse -q --verify refs/mcrepo/rebase-inflight >/dev/null 2>&1
 }
 _clear_stash_applied() {
   git -C "$1" update-ref -d refs/mcrepo/applied-stash 2>/dev/null || true
@@ -3805,17 +3823,17 @@ _emit_agent_prompt_body() {
       headline="Rebase conflicts during 'mcrepo rebase' (coordinated branches across repos)."
       detail="A git rebase is paused mid-way in each affected repo. Your job is ONLY to resolve the conflicted files and stage them - the user finishes the rebase by re-running the command."
       three_sides=1
-      rerun="mcrepo rebase"
+      rerun="'mcrepo rebase' (or 'mcrepo pull' if that is the command that stopped)"
       ;;
     pull-rebase-conflict)
       headline="Rebase conflicts during 'mcrepo pull' (integrating remote work from another device)."
       detail="A git rebase is paused: MY local commits are being replayed ON TOP of genuinely new commits fetched from origin. The remote commits form the new base - they must ALL be kept."
-      rerun="mcrepo pull"
+      rerun="'mcrepo pull'"
       ;;
     merge-conflict)
       headline="A coordinated 'mcrepo merge' into the parent branch failed, or a merge left unmerged files."
       detail="Some repos may already be merged; the affected ones need repair before the user re-runs 'mcrepo merge'."
-      rerun="mcrepo merge"
+      rerun="'mcrepo merge'"
       ;;
     stash-conflict)
       headline="Stash-pop conflicts after a coordinated rebase/pull."
@@ -3841,6 +3859,10 @@ _emit_agent_prompt_body() {
       detail=""
       ;;
   esac
+  if [ -n "${MCREPO_RERUN_CMD:-}" ]; then
+    rerun="'$MCREPO_RERUN_CMD'"
+  fi
+  MCREPO_RERUN_CMD=""
   printf 'I am working in an mcrepo workspace (./mcrepo.sh): a meta-context repo plus managed\n'
   printf 'sub-repos share one coordinated feature branch. mcrepo records the parent branch of each\n'
   printf 'repo in mcrepo.yaml and rebases/merges all repos together. Coordinated commits share\n'
@@ -3897,9 +3919,10 @@ _emit_agent_prompt_body() {
       ;;
     merge-conflict)
       printf '%d. If a repo holds unmerged files (paused merge or squash conflict): resolve them, then\n' "$step"
-      printf '   `git -C <dir> add`. If mcrepo reported it rolled a repo back to the feature branch,\n'
-      printf '   find out why the merge failed there (hooks, permissions, git output) and fix that\n'
-      printf '   cause - do not redo the merge by hand.\n'
+      printf '   `git -C <dir> add`. A merge paused as MERGING is afterwards finished by ME (the user)\n'
+      printf '   with `git -C <dir> commit` - tell me when it is ready. If mcrepo reported it rolled a\n'
+      printf '   repo back to the feature branch, find out why the merge failed there (hooks,\n'
+      printf '   permissions, git output) and fix that cause - do not redo the merge by hand.\n'
       ;;
     stash-conflict)
       printf '%d. The operation succeeded; only re-applying my auto-stashed changes conflicted, and the\n' "$step"
@@ -4146,7 +4169,10 @@ _resume_inprogress() {
       ;;
     REBASING)
       log "  $repo_name: git rebase --$action"
-      if git -C "$repo_dir" rebase "--$action"; then return 0; fi
+      if git -C "$repo_dir" rebase "--$action"; then
+        _clear_rebase_inflight "$repo_dir"
+        return 0
+      fi
       warn "rebase --$action failed in '$repo_name' (see git output above)"
       return 2
       ;;
@@ -4388,15 +4414,22 @@ _require_no_stuck_repos() {
 # that started it ("the command is the loop"). Purely local. Returns:
 #   0 = nothing in flight
 #   1 = resumed cleanly (rebase finished and/or applied stash finalized)
-#   2 = rebase still conflicted (unmerged files remain, or an empty commit
-#       needs a manual decision) — repo stays paused
+#   2 = rebase still conflicted (unmerged files remain, or the continue needs
+#       a manual decision) — repo stays paused
 #   3 = auto-stash restore conflicted (stash preserved, unmerged files remain)
+#   4 = FOREIGN rebase in progress (started by the user, no inflight marker) —
+#       never touched; the user finishes it with git rebase --continue/--abort
 _resume_inflight_rebase() {
   local dir="$1" name="$2"
   local state guard=0
   state="$(repo_inprogress_state "$dir")"
   case "$state" in
     REBASING)
+      # Only rebases mcrepo itself paused carry the inflight marker; anything
+      # else is a user-driven rebase we must not touch.
+      if ! _rebase_is_marked_inflight "$dir"; then
+        return 4
+      fi
       while [ "$(repo_inprogress_state "$dir")" = "REBASING" ]; do
         if [ -n "$(git -C "$dir" ls-files -u 2>/dev/null)" ]; then
           return 2
@@ -4409,13 +4442,21 @@ _resume_inflight_rebase() {
         log "  $name: continuing the paused rebase ..."
         if ! GIT_EDITOR=true git -C "$dir" rebase --continue; then
           if [ -z "$(git -C "$dir" ls-files -u 2>/dev/null)" ]; then
-            # Resolution left an empty commit; git wants an explicit decision.
-            warn "  $name: this commit became empty after resolution. Run 'git -C $dir rebase --skip' to drop it, then re-run this command."
+            if git -C "$dir" diff --cached --quiet 2>/dev/null && git -C "$dir" diff --quiet 2>/dev/null; then
+              # Provably nothing staged or modified: the commit really became
+              # empty after resolution and git wants an explicit decision.
+              warn "  $name: this commit became empty after resolution. Run 'git -C $dir rebase --skip' to drop it, then re-run this command."
+            else
+              # NOT empty — most often unstaged changes or untracked files
+              # colliding with the next commit. Never advise --skip here.
+              warn "  $name: could not continue the rebase (see git output above). Commonly unstaged/untracked changes are in the way — have them staged or moved aside, then re-run this command."
+            fi
             return 2
           fi
           # New conflict in the next commit: loop detects it and returns 2.
         fi
       done
+      _clear_rebase_inflight "$dir"
       # Rebase finished — restore the auto-stash this operation parked, if any.
       if git -C "$dir" stash list -1 2>/dev/null | head -1 | grep -q 'mcrepo: auto-stash'; then
         if ! git -C "$dir" stash pop; then
@@ -4544,6 +4585,11 @@ _pull_one_rebase() {
   local resume_rc=0
   _resume_inflight_rebase "$rd" "$rn" || resume_rc=$?
   case "$resume_rc" in
+    4)
+      fetch_only_repos+=("$rn (manual rebase in progress)")
+      warn "  '$rn': a rebase you started manually is in progress — mcrepo leaves it untouched (finish with git -C $rd rebase --continue/--abort)."
+      return 0
+      ;;
     2)
       rebase_conflict_repos+=("$rn")
       rebase_conflict_entries+=("$rn|$rd")
@@ -4595,6 +4641,7 @@ _pull_one_rebase() {
       [ -n "$upstream_ref" ] || upstream_ref="origin/$rb"
       log "Rebasing '$rn' onto $upstream_ref (remote has new work) ..."
       if ! git -C "$rd" rebase "$upstream_ref"; then
+        _mark_rebase_inflight "$rd"
         rebase_conflict_repos+=("$rn")
         rebase_conflict_entries+=("$rn|$rd")
         warn "  Rebase conflicts in '$rn' while integrating $upstream_ref:"
@@ -4660,6 +4707,11 @@ _pull_from_location() {
     ensure_named_remote "$repo_dir" "$loc" "$url" || { failed+=("${REPO_NAMES[$i]}"); continue; }
     rc=0
     _resume_inflight_rebase "$repo_dir" "${REPO_NAMES[$i]}" || rc=$?
+    if [ "$rc" -eq 4 ]; then
+      skipped+=("${REPO_NAMES[$i]} (manual rebase in progress)")
+      warn "  '${REPO_NAMES[$i]}': a rebase you started manually is in progress — mcrepo leaves it untouched."
+      continue
+    fi
     if [ "$rc" -ge 2 ]; then
       conflicts+=("${REPO_NAMES[$i]}")
       conflict_entries+=("${REPO_NAMES[$i]}|$repo_dir")
@@ -4673,6 +4725,10 @@ _pull_from_location() {
       continue
     fi
     branch="$(repo_branch "$repo_dir")"
+    if [ "$branch" = "HEAD" ]; then
+      skipped+=("${REPO_NAMES[$i]} (detached HEAD)")
+      continue
+    fi
     if ! git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/$loc/$branch"; then
       skipped+=("${REPO_NAMES[$i]} (no '$branch' on $loc)")
       continue
@@ -4704,6 +4760,7 @@ _pull_from_location() {
     fi
     log "Rebasing '${REPO_NAMES[$i]}' onto $lref ..."
     if ! git -C "$repo_dir" rebase "$lref"; then
+      _mark_rebase_inflight "$repo_dir"
       conflicts+=("${REPO_NAMES[$i]}")
       conflict_entries+=("${REPO_NAMES[$i]}|$repo_dir")
       warn "  Rebase conflicts in '${REPO_NAMES[$i]}':"
@@ -4728,6 +4785,7 @@ _pull_from_location() {
   if [ "${#conflicts[@]}" -gt 0 ]; then warn "  Conflicts: ${conflicts[*]}"; fi
   if [ "${#failed[@]}" -gt 0 ]; then warn "  Failed:    ${failed[*]}"; fi
   if [ "${#conflict_entries[@]}" -gt 0 ]; then
+    MCREPO_RERUN_CMD="mcrepo pull $loc"
     print_agent_recovery_prompt pull-rebase-conflict "${conflict_entries[@]}"
     warn "Next: have the conflicts resolved and staged (prompt above), then re-run 'mcrepo pull $loc'."
     return 2
@@ -4767,13 +4825,29 @@ _push_to_location() {
     ensure_named_remote "$repo_dir" "$loc" "$url" || { failed+=("${REPO_NAMES[$i]}"); continue; }
     git -C "$repo_dir" fetch "$loc" --prune 2>/dev/null || true
     branch="$(repo_branch "$repo_dir")"
-    if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/$loc/$branch" &&        ! git -C "$repo_dir" merge-base --is-ancestor "$loc/$branch" HEAD 2>/dev/null; then
-      behind_loc+=("${REPO_NAMES[$i]}")
-      warn "  '${REPO_NAMES[$i]}': '$loc/$branch' has commits you don't have — run 'mcrepo pull $loc' first (locations are never force-pushed)."
+    if [ "$branch" = "HEAD" ]; then
+      skipped+=("${REPO_NAMES[$i]} (detached HEAD)")
       continue
     fi
+    local push_force_flag=""
+    if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/$loc/$branch" && \
+       ! git -C "$repo_dir" merge-base --is-ancestor "$loc/$branch" HEAD 2>/dev/null; then
+      # Diverged. Force-with-lease ONLY under the patch-equivalence proof
+      # (every location-only commit exists locally, as-is or rebased) — the
+      # same safety rule as origin. Anything else must be pulled first.
+      local loc_new
+      loc_new="$(git -C "$repo_dir" rev-list --left-only --cherry-pick "$loc/$branch...HEAD" 2>/dev/null || true)"
+      if [ -z "$loc_new" ]; then
+        push_force_flag="--force-with-lease"
+        log "  '${REPO_NAMES[$i]}': '$loc/$branch' holds only stale pre-rebase history — updating with --force-with-lease."
+      else
+        behind_loc+=("${REPO_NAMES[$i]}")
+        warn "  '${REPO_NAMES[$i]}': '$loc/$branch' has commits you don't have — run 'mcrepo pull $loc' first (locations are force-updated only when provably nothing is lost)."
+        continue
+      fi
+    fi
     log "--- Pushing ${REPO_NAMES[$i]} -> $loc ---"
-    if git -C "$repo_dir" push "$loc" "$branch"; then
+    if git -C "$repo_dir" push $push_force_flag "$loc" "$branch"; then
       pushed+=("${REPO_NAMES[$i]}")
     else
       warn "Push to '$loc' failed for '${REPO_NAMES[$i]}' (see git output above)"
@@ -7130,9 +7204,14 @@ validate_location_name() {
   case "$1" in
     origin|upstream|'') return 1 ;;
   esac
+  # Explicit character lists: bracket ranges are locale-dependent on stock
+  # bash 3.2 and would accept uppercase (incl. 'Origin').
   case "$1" in
-    [!a-z0-9]*) return 1 ;;
-    *[!a-z0-9_-]*) return 1 ;;
+    [abcdefghijklmnopqrstuvwxyz0123456789]*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *[!abcdefghijklmnopqrstuvwxyz0123456789_-]*) return 1 ;;
   esac
   return 0
 }
@@ -7485,14 +7564,18 @@ cmd_branch() {
     [ "${REPO_MODES[$_cf_i]}" != "sleep" ] || continue
     _cf_dir="$(get_repo_dir "${REPO_NAMES[$_cf_i]}" "${REPO_MODES[$_cf_i]}")"
     [ -d "$_cf_dir/.git" ] || continue
-    [ "$(repo_inprogress_state "$_cf_dir")" = "CONFLICTED" ] || continue
+    if [ "$(repo_inprogress_state "$_cf_dir")" != "CONFLICTED" ] && \
+       ! _stash_is_marked_applied "$_cf_dir"; then
+      continue
+    fi
     _cf_rc=0
     _resume_inflight_rebase "$_cf_dir" "${REPO_NAMES[$_cf_i]}" || _cf_rc=$?
     if [ "$_cf_rc" -ge 2 ]; then
       _cf_fail_entries+=("${REPO_NAMES[$_cf_i]}|$_cf_dir")
     fi
   done
-  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1 &&      [ "$(repo_inprogress_state ".")" = "CONFLICTED" ]; then
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1 && \
+     { [ "$(repo_inprogress_state ".")" = "CONFLICTED" ] || _stash_is_marked_applied "."; }; then
     _cf_rc=0
     _resume_inflight_rebase "." "(meta-context)" || _cf_rc=$?
     [ "$_cf_rc" -ge 2 ] && _cf_fail_entries+=("(meta-context)|.")
@@ -7603,6 +7686,12 @@ cmd_branch() {
   for idx in "${!target_indexes[@]}"; do
     local ti="${target_indexes[$idx]}"
     repo_dir="${target_dirs[$idx]}"
+    # A repo already ON the target branch needs no checkout — its local
+    # changes are safe where they are (e.g. finalized carried work on a
+    # re-run) and must not trigger the dirty gate.
+    if [ "$(repo_branch "$repo_dir")" = "$branch_name" ]; then
+      continue
+    fi
     if [ -n "$(git -C "$repo_dir" status --porcelain 2>/dev/null)" ]; then
       dirty_found=1
       dirty_repos+=("${REPO_NAMES[$ti]} ($repo_dir)")
@@ -7611,7 +7700,7 @@ cmd_branch() {
   done
 
   local meta_dirty=0
-  if [ "$meta_is_target" -eq 1 ]; then
+  if [ "$meta_is_target" -eq 1 ] && [ "$(repo_branch ".")" != "$branch_name" ]; then
     if [ -n "$(git -C . status --porcelain 2>/dev/null)" ]; then
       dirty_found=1
       meta_dirty=1
@@ -9246,6 +9335,10 @@ _rebase_run() {
     local resume_rc=0
     _resume_inflight_rebase "$repo_dir" "$repo_name" || resume_rc=$?
     case "$resume_rc" in
+      4)
+        warn "  '$repo_name': a rebase you started manually is in progress — mcrepo leaves it untouched (finish with git -C $repo_dir rebase --continue/--abort)."
+        continue
+        ;;
       2)
         merge_conflict_repos+=("$repo_name")
         merge_conflict_entries+=("$repo_name|$repo_dir")
@@ -9288,6 +9381,7 @@ _rebase_run() {
 
     # Rebase current branch onto target
     if ! git -C "$repo_dir" rebase "$rebase_target"; then
+      _mark_rebase_inflight "$repo_dir"
       merge_conflict_repos+=("$repo_name")
       merge_conflict_entries+=("$repo_name|$repo_dir")
       # Per-repo conflict context: the three sides that collided.

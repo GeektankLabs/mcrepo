@@ -126,6 +126,33 @@ setup_backup_location() {
   assert_contains "$output" "backup only"
 }
 
+@test "remote set without a URL dies instead of silently clearing" {
+  setup_backup_location
+  run mcrepo remote set alpha backup
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "--off"
+  # entry still present
+  grep -q 'remotes: backup=file://' mcrepo.yaml
+}
+
+@test "push <location> force-with-leases a provably stale mirror after mcrepo rebase" {
+  setup_backup_location
+  mcrepo branch feat-loc >/dev/null 2>&1
+  printf 'feature work\n' >alpha/f.txt
+  git -C alpha add -A && git -C alpha commit -qm "feature work"
+  git -C alpha push -q backup feat-loc
+  advance_remote alpha "parent moved"
+  run mcrepo rebase
+  [ "$status" -eq 0 ]
+
+  # Location now holds only stale pre-rebase history -> safe force.
+  run mcrepo push backup
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "force-with-lease"
+  run git --git-dir="$BACKUP_BARE" log --format=%s feat-loc
+  assert_contains "$output" "remote advance alpha"
+}
+
 @test "remote remove clears the location from workspace, repos, and clones" {
   setup_backup_location
   MCREPO_ASSUME_YES=1 run mcrepo remote remove backup

@@ -198,6 +198,40 @@ setup() {
   assert_contains "$output" "remote advance alpha"
 }
 
+@test "a rebase the USER started is never touched by pull (foreign-rebase protection)" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  # Manufacture a user-started rebase paused on a conflict (plain git).
+  git -C alpha checkout -qb side HEAD
+  printf 'side change\n' >alpha/README.md
+  git -C alpha add -A && git -C alpha commit -qm "side work"
+  git -C alpha checkout -q main
+  printf 'main change\n' >alpha/README.md
+  git -C alpha add -A && git -C alpha commit -qm "main work"
+  git -C alpha checkout -q side
+  run git -C alpha rebase main
+  [ "$status" -ne 0 ]
+
+  run mcrepo pull
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "manual rebase in progress"
+  # The user's rebase is still paused, untouched.
+  run mcrepo status
+  assert_contains "$output" "inprogress=REBASING"
+  git -C alpha rebase --abort
+}
+
+@test "branch re-run does not dirty-gate repos already on the target branch" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  mcrepo branch feat-dg >/dev/null 2>&1
+  printf 'kept local work\n' >alpha/notes.txt
+  run mcrepo branch feat-dg
+  [ "$status" -eq 0 ]
+  [ -f alpha/notes.txt ]
+  [ "$(repo_branch alpha)" = "feat-dg" ]
+}
+
 @test "a git bisect session neither blocks coordinated commands nor confuses resolve" {
   init_workspace_with_repos alpha
   mcrepo write alpha >/dev/null
