@@ -34,6 +34,10 @@ Suites:
   prompt, `continue`/`abort`/`resolve`, marker-less `CONFLICTED` detection
   (squash/stash-pop), partial-merge rollback + re-run resume, `#N`/batch-id
   identity fixes
+- `50-origin.bats` — multi-device / origin workflow: `pull --rebase` really
+  rebases local commits onto remote work (then plain push), conflict pause +
+  continue + re-run, dirty work carried via auto-stash, safe-force protection
+  (never rebase onto a stale post-sync remote), stuck-workspace guard
 
 CI (`.github/workflows/ci.yml`) runs `bash -n`, shellcheck, the full suite on
 ubuntu **and** macOS (stock bash 3.2 — catches `mapfile`-class and

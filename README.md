@@ -23,7 +23,7 @@ Everything revolves around one loop — and every command tells you the next ste
 
 Around the loop:
 
-- `mcrepo pull` — bring upstream changes in at any time ([details](#pulling))
+- `mcrepo pull` — bring upstream changes in at any time; `mcrepo pull --rebase` puts your local commits on top of work pushed from another device ([details](#pulling))
 - `mcrepo status` — every repo's branch, state, and stuck indicators at a glance
 - Conflict? `mcrepo resolve` prints a paste-ready prompt for your coding agent; finish with `mcrepo continue` ([details](#conflicts--recovery))
 - Review flow instead of a direct push: `mcrepo pr` opens coordinated, cross-linked GitHub PRs ([details](#fork--pr-workflow))
@@ -324,16 +324,52 @@ Behavior details:
 ## Pulling
 
 ```bash
-mcrepo pull            # fetch + ff-pull all active repos; dirty sub-repos are skipped
-mcrepo pull --rebase   # auto-stash, pull, pop stash for ALL repos (handles dirty repos safely)
+mcrepo pull            # fetch + ff-pull all active repos; dirty sub-repos are skipped (safe default)
+mcrepo pull --rebase   # auto-stash + REBASE local commits onto origin — the multi-device workhorse
 mcrepo pull --reset    # discard local changes and reset to origin state (destructive!)
 ```
 
+### Working from Multiple Devices
+
+`mcrepo pull --rebase` is the origin-side twin of `mcrepo sync` — the same pattern, pointed at a
+different base: `sync` rebases the feature branch onto its **parent**, `pull --rebase` rebases
+your local commits onto **origin**. Same recovery loop, same commands.
+
+When you sit down at a device that has local work while another device already pushed:
+
+```
+mcrepo pull --rebase    # per repo: auto-stash dirty work → rebase local commits
+                        # on top of the remote work → restore the stash
+   ⇣ conflict?          # exit 2 — repo pauses as inprogress=REBASING
+mcrepo resolve          # prints the agent prompt; resolve → git add → mcrepo continue
+mcrepo pull --rebase    # re-run to finish any remaining repos
+mcrepo push             # plain push — your commits now sit on top of origin
+```
+
+No repo is ever left half-pulled and undescribed: repos that hit conflicts pause visibly
+(`mcrepo status` shows them), the rest complete, and re-running `pull --rebase` finishes the
+stragglers — the same resume model as `sync` and `merge`.
+
 Behavior details:
 
+- **Plain `pull` stays strictly safe**: fast-forward only, dirty sub-repos are skipped (fetch
+  only). When a branch has genuinely diverged (another device pushed), plain pull names the
+  repos and points to `pull --rebase`.
+- **`--rebase` never rebases onto a stale remote**: after `mcrepo sync` rewrote history, the old
+  `origin/<branch>` still holds pre-rebase commits — rebasing onto it would resurrect them.
+  mcrepo proves this case by **patch-equivalence** (every remote-only commit also exists
+  locally, as-is or rebased) and routes you to `mcrepo push` instead.
+- **Genuinely ambiguous divergence is never auto-resolved**: when the remote both predates your
+  rebase *and* carries content-new commits (e.g. another device pushed onto the stale branch, or
+  your sync had conflict resolutions), rebasing could resurrect old history and force-pushing
+  could delete the new work — mcrepo touches nothing and prints the agent prompt instead.
 - The meta-context auto-stashes on dirty so unrelated edits never block its pull.
+- Uncommitted changes ride along via auto-stash; if restoring them conflicts, the stash is
+  preserved and the repo shows `inprogress=CONFLICTED` (see [Conflicts & Recovery](#conflicts--recovery)).
+- Coordinated commands (`branch`, `commit`, `sync`, `merge`, `pull`) refuse to start while any
+  repo is mid-operation or conflicted — resolve first (`mcrepo resolve`), so a stuck repo can
+  never turn into a half-pulled workspace.
 - `--reset` confirms before discarding uncommitted changes, and **separately per repo** before discarding committed-but-unpushed commits (it lists them first). `--yes` skips both confirmations for automation; without it, non-interactive runs keep such repos untouched.
-- Diverged branches that are provably your own local rebase are reported as "rebased locally" — publish them with `mcrepo push`. Genuinely diverged branches print a paste-ready recovery prompt for a coding agent.
 
 ## Pushing
 
@@ -353,8 +389,9 @@ Behavior details:
 - **Rebased branches are auto-published.** After `mcrepo sync`, a
   coordinated branch diverges from its already-pushed `origin/<branch>` (ahead
   *and* behind) purely because the rebase rewrote its commit hashes. mcrepo
-  detects this case — local `HEAD` already contains the parent `main` *and* the
-  remote branch is stale (predates that merge) — and publishes it with
+  proves this case by **patch-equivalence** — every commit the remote holds
+  also exists locally, as-is or in rebased form, so nothing can be lost — and
+  publishes it with
   `git push --force-with-lease` (shown as `[REBASED -> force-push]` in the plan).
   Because force-with-lease runs only after a fresh fetch, a remote that moved
   since the fetch aborts the push instead of clobbering another machine's work.
@@ -642,7 +679,27 @@ Accepted URL transports: `https`, `ssh`, `git`, `file`, absolute/relative local 
 - **upstream** — the PR target in the fork workflow (origin = your fork, upstream = the original repo)
 - **coordinated commit `#N @batch`** — one logical change committed across several repos with a shared sequence number and batch id
 
-## Upgrading to 0.7.0
+## Upgrading to 0.7.x
+
+Since **0.7.2** (multi-device / origin workflow):
+
+- **Breaking — `pull --rebase` now really rebases**: local commits are replayed on top of
+  genuine remote work (previously it only auto-stashed around a fast-forward attempt and
+  reported diverged repos without integrating). Rebase conflicts pause as
+  `inprogress=REBASING` (resolve → `mcrepo continue` → re-run `pull --rebase`), exit `2`.
+  Provable own-rebase divergence (after `mcrepo sync`) is still routed to `mcrepo push`, never
+  rebased onto the stale remote.
+- **Breaking — stuck-workspace guard**: `branch`, `commit`, `sync`, `merge`, and `pull` refuse
+  to start while any repo is mid-operation or conflicted, pointing to `mcrepo resolve`
+  (leftover mcrepo stashes and `git bisect` sessions do not block). Previously these commands
+  would run over stuck repos and deepen the mess. `push` skips stuck repos instead of
+  auto-committing them (which would have committed conflict markers).
+- **Safety — force-with-lease eligibility is now proven by patch-equivalence**: a diverged
+  branch is auto-force-published only when every remote-only commit has a patch-equivalent
+  local commit. A remote that predates your rebase but carries content-new commits (new work
+  stacked on the stale base, or a conflict-resolved sync) is classified *ambiguous*: never
+  auto-forced, never auto-rebased — you get the agent prompt. Republishing after a sync that
+  had conflicts now goes through that prompt instead of an automatic force.
 
 0.7.0 makes the coordinated lifecycle strictly two-step (**sync → merge**) and makes every
 conflict state visible, resumable, and agent-assisted:
