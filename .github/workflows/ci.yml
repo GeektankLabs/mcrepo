@@ -29,8 +29,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install bats
-        run: npm install -g bats@1.11.0
+      # No global bats install: 'npm install -g' hits EACCES on /usr/local
+      # with current runner images, and tests/run.sh already resolves bats
+      # via its pinned 'npx --yes bats@1.11.0' fallback (no root needed).
       - name: Run suite
         run: tests/run.sh
 
