@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.7.9"
+MCREPO_VERSION="0.8.0"
 # Manifest (mcrepo.yaml) format version. Bump when the manifest schema changes
 # incompatibly; cmd_post_update_migrate migrates older manifests forward.
 MCREPO_SCHEMA_VERSION="1"
@@ -2893,6 +2893,33 @@ cmd_doctor() {
   else
     warn "gh:   NOT installed — clone/push/branch/merge still work; fork/PR/access-check need gh"
   fi
+
+  # Credential-helper check: private HTTPS remotes prompt for username/token on
+  # EVERY fetch unless a git credential helper answers for the host (macOS ships
+  # the keychain helper by default, Linux ships none).
+  local -a auth_hosts=()
+  local _u _h _seen
+  for _u in "${REPO_URLS[@]:-}" "$(git -C . remote get-url origin 2>/dev/null || true)"; do
+    case "$_u" in http://*|https://*) ;; *) continue ;; esac
+    parse_git_url "$_u" >/dev/null 2>&1 || continue
+    _seen=0
+    for _h in "${auth_hosts[@]:-}"; do [ "$_h" = "$GU_HOST" ] && { _seen=1; break; }; done
+    [ "$_seen" -eq 1 ] || auth_hosts+=("$GU_HOST")
+  done
+  for _h in "${auth_hosts[@]:-}"; do
+    [ -n "$_h" ] || continue
+    local helper
+    helper="$(git config --get-urlmatch credential.helper "https://$_h" 2>/dev/null | tail -1 || true)"
+    if [ -n "$helper" ]; then
+      log "auth: credential helper for $_h: $helper"
+      continue
+    fi
+    local fix="git config --global credential.helper store   # or: 'cache --timeout=28800'"
+    if [ "$_h" = "github.com" ] && command -v gh >/dev/null 2>&1; then
+      if gh_ready; then fix="gh auth setup-git"; else fix="gh auth login && gh auth setup-git"; fi
+    fi
+    warn "auth: no credential helper for $_h — private HTTPS repos prompt for credentials on every fetch. Fix: $fix"
+  done
   log ""
 
   if [ "${#REPO_NAMES[@]}" -eq 0 ]; then
@@ -4566,6 +4593,43 @@ confirm_reset_discard_commits() {
   return 1
 }
 
+# Fast-forward the current branch to its upstream WITHOUT a second network
+# round-trip: every caller has just fetched, so the origin/* tracking refs are
+# fresh and a local 'merge --ff-only' is equivalent to 'git pull --ff-only' —
+# but costs zero credential prompts on private HTTPS remotes. Branches that
+# track a non-origin remote fall back to a real pull (the preceding fetch did
+# not cover that remote). Same output and exit semantics as 'git pull
+# --ff-only': non-zero when a fast-forward is not possible.
+_local_ff() {
+  local rd="$1"
+  local upstream_ref
+  upstream_ref="$(git -C "$rd" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)" || upstream_ref=""
+  case "$upstream_ref" in
+    origin/*)
+      git -C "$rd" merge --ff-only "$upstream_ref"
+      ;;
+    *)
+      git -C "$rd" pull --ff-only
+      ;;
+  esac
+}
+
+# One-shot hint after a failed fetch on an HTTPS origin with no credential
+# helper configured: the most likely cause (especially on Linux, which ships
+# no default helper) is an aborted or wrong username/token prompt. Printed at
+# most once per run — the fix is global, not per-repo.
+_MCREPO_AUTH_HINT_SHOWN=0
+_hint_credential_helper() {
+  local rd="$1"
+  [ "$_MCREPO_AUTH_HINT_SHOWN" -eq 0 ] || return 0
+  local url
+  url="$(git -C "$rd" remote get-url origin 2>/dev/null)" || return 0
+  case "$url" in http://*|https://*) ;; *) return 0 ;; esac
+  git -C "$rd" config --get-urlmatch credential.helper "$url" >/dev/null 2>&1 && return 0
+  _MCREPO_AUTH_HINT_SHOWN=1
+  warn "hint: repeated credential prompts? Run 'mcrepo doctor' — a git credential helper fixes this (github.com: 'gh auth setup-git')."
+}
+
 # One repo's pull-integrate step (the 'mcrepo pull' default), shared by
 # sub-repos and the meta-context.
 # The origin-side twin of 'mcrepo rebase': auto-stash dirty work, then either
@@ -4657,7 +4721,7 @@ _pull_one_rebase() {
         fetch_only_repos+=("$rn (no upstream)")
         return 0
       fi
-      if ! run_with_repo_prefix "$rn" git -C "$rd" pull --ff-only; then
+      if ! run_with_repo_prefix "$rn" _local_ff "$rd"; then
         [ "$stashed" -eq 1 ] && { git -C "$rd" stash pop --quiet 2>/dev/null || true; }
         warn "Pull failed for '$rn'"
         failed_repos+=("$rn")
@@ -5052,6 +5116,7 @@ cmd_pull() {
     # Always fetch
     if ! git -C "$rd" fetch origin --prune 2>/dev/null; then
       warn "Fetch failed for '$rn'"
+      _hint_credential_helper "$rd"
       failed_repos+=("$rn")
       continue
     fi
@@ -5071,7 +5136,7 @@ cmd_pull() {
     if [ "$pull_mode" = "reset" ] && [ "$rdirty" = "dirty" ]; then
       git -C "$rd" checkout -- . 2>/dev/null || true
       git -C "$rd" clean -fd 2>/dev/null || true
-      if run_with_repo_prefix "$rn" git -C "$rd" pull --ff-only; then
+      if run_with_repo_prefix "$rn" _local_ff "$rd"; then
         updated_repos+=("$rn")
       else
         # Diverged: hard reset to origin — but committed work needs its own approval
@@ -5086,7 +5151,7 @@ cmd_pull() {
     fi
 
     if [ "$pull_mode" = "reset" ] && [ "$rdirty" = "clean" ]; then
-      if run_with_repo_prefix "$rn" git -C "$rd" pull --ff-only; then
+      if run_with_repo_prefix "$rn" _local_ff "$rd"; then
         updated_repos+=("$rn")
       else
         # Clean but diverged: the reset would silently drop committed work
@@ -5111,8 +5176,8 @@ cmd_pull() {
       continue
     fi
 
-    # Default mode, clean repo: ff-only pull
-    if run_with_repo_prefix "$rn" git -C "$rd" pull --ff-only; then
+    # Default mode, clean repo: ff-only (local — the fetch above already ran)
+    if run_with_repo_prefix "$rn" _local_ff "$rd"; then
       updated_repos+=("$rn")
     else
       case "$(classify_divergence "$rd" "$rb" "$rp")" in
@@ -5129,6 +5194,7 @@ cmd_pull() {
     [ -n "$meta_pull_parent" ] || meta_pull_parent="$(detect_default_branch ".")"
     if ! git -C . fetch origin --prune 2>/dev/null; then
       warn "Fetch failed for (meta-context)"
+      _hint_credential_helper "."
       failed_repos+=("(meta-context)")
     elif [ "$pull_mode" = "rebase" ] && [ -n "$(repo_inprogress_state ".")" ]; then
       # In-flight meta must reach the resume logic before the upstream gate.
@@ -5138,7 +5204,7 @@ cmd_pull() {
     elif [ "$pull_mode" = "reset" ] && [ "$meta_dirty" = "dirty" ]; then
       git -C . checkout -- . 2>/dev/null || true
       git -C . clean -fd 2>/dev/null || true
-      if run_with_repo_prefix "(meta-context)" git -C . pull --ff-only; then
+      if run_with_repo_prefix "(meta-context)" _local_ff .; then
         updated_repos+=("(meta-context)")
       elif ! confirm_reset_discard_commits "." "(meta-context)" "$meta_branch" "$assume_yes"; then
         reset_declined+=("(meta-context)")
@@ -5154,7 +5220,7 @@ cmd_pull() {
       if _mcrepo_stash_push "." "mcrepo: auto-stash before pull"; then
         meta_stashed=1
       fi
-      if run_with_repo_prefix "(meta-context)" git -C . pull --ff-only; then
+      if run_with_repo_prefix "(meta-context)" _local_ff .; then
         if [ "$meta_stashed" -eq 1 ]; then
           if ! git -C . stash pop --quiet 2>/dev/null; then
             _mark_stash_applied "."
@@ -5177,7 +5243,7 @@ cmd_pull() {
         esac
       fi
     else
-      if run_with_repo_prefix "(meta-context)" git -C . pull --ff-only; then
+      if run_with_repo_prefix "(meta-context)" _local_ff .; then
         updated_repos+=("(meta-context)")
       else
         case "$(classify_divergence "." "$meta_branch" "$meta_pull_parent")" in
@@ -7337,14 +7403,8 @@ switch_repo_branch() {
   fi
 
   if git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
-    if ! git -C "$repo_dir" pull --ff-only; then
+    if ! _local_ff "$repo_dir"; then
       warn "Pull failed in '$repo_dir' before switching to '$target_branch'"
-    fi
-  fi
-
-  if git -C "$repo_dir" remote get-url origin >/dev/null 2>&1; then
-    if ! git -C "$repo_dir" fetch origin --prune; then
-      warn "Fetch origin failed in '$repo_dir' before switching to '$target_branch'"
     fi
   fi
 

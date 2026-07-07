@@ -623,6 +623,34 @@ This means lightweight context orchestration, not a central release manager.
 
 You can keep component repositories public/open-source while keeping the `mcrepo` workspace repository private for internal coordination.
 
+## Private Repos & Authentication
+
+Private repos over HTTPS need credentials on every fetch. macOS answers these from the Keychain automatically; **Linux ships no default credential helper**, so without setup git prompts for username/token on every network operation — across a whole workspace that means a prompt storm on each `mcrepo pull`. (`mcrepo pull` itself performs exactly one network round-trip per repo; the prompts come from git, not from mcrepo.)
+
+**Recommended fix — let GitHub CLI answer git's credential requests** (one-time, per machine):
+
+```bash
+gh auth login        # interactive — or: echo "$TOKEN" | gh auth login --with-token
+gh auth setup-git    # registers gh as git's credential helper for github.com
+```
+
+After that, every HTTPS git operation against github.com is authenticated silently with gh's token — all repos readable by that account, including private ones. Verify with:
+
+```bash
+git config --get-urlmatch credential.helper https://github.com
+```
+
+`mcrepo doctor` checks this for every HTTPS host in your manifest and prints the fix when a helper is missing.
+
+**Alternatives** (no gh, non-GitHub hosts, or different security trade-offs):
+
+| Strategy | Command | Trade-off |
+|---|---|---|
+| Store (plaintext) | `git config --global credential.helper store` | token lands in `~/.git-credentials`; enter once, never again |
+| Cache (RAM only) | `git config --global credential.helper 'cache --timeout=28800'` | enter once per session, cached 8h, nothing on disk |
+| Keyring (desktop) | `git config --global credential.helper libsecret` | encrypted via GNOME/KDE Secret Service; needs a desktop session |
+| SSH instead of HTTPS | `git config --global url."git@github.com:".insteadOf "https://github.com/"` + an SSH key | key instead of token; rewrites transparently — no `mcrepo.yaml` change needed |
+
 ## Additional Options
 
 - Skip shell config installation during init (recommended for CI or disposable sandboxes):
