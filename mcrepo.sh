@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.8.2"
+MCREPO_VERSION="0.9.0"
 # Manifest (mcrepo.yaml) format version. Bump when the manifest schema changes
 # incompatibly; cmd_post_update_migrate migrates older manifests forward.
-MCREPO_SCHEMA_VERSION="1"
+MCREPO_SCHEMA_VERSION="2"
 MCREPO_UPDATE_REPO="GeektankLabs/mcrepo"
 MCREPO_UPDATE_BRANCH="main"
 MCREPO_UPDATE_SCRIPT_PATH="mcrepo.sh"
@@ -101,7 +101,7 @@ Usage:  # Show available mcrepo commands
              REMOTE  commit → pull (integrate) → push (publish)
              (pr instead of push for review flows)
 ═══════════════════════════════════════════════════════════════════════════════
-  ./mcrepo.sh branch <branch-name> [--include-read] [--dirty abort|commit|carry|discard]  # STEP 1 — one feature branch across write repos + meta-context (interactive dirty handling; --dirty preselects)
+  ./mcrepo.sh branch <branch-name> [--parent <branch>] [--include-read] [--dirty abort|commit|carry|discard]  # STEP 1 — one feature branch across write repos + meta-context (interactive dirty handling; --dirty preselects; --parent sets/repairs the recorded parent)
   ./mcrepo.sh commit [-m "msg"] [--include-read]     # STEP 2 — coordinated checkpoint across dirty write repos + meta-context (#N @batch, revertable as one unit; repeat freely)
   ./mcrepo.sh rebase [--include-read]                  # STEP 3 — rebase the branch onto each parent (auto-stash); resolve conflicts HERE, before merging
   ./mcrepo.sh merge [-m "subject"] [--include-read]  # STEP 4 — squash the branch back into each repo's parent; requires a rebased branch (run 'rebase' first)
@@ -909,10 +909,10 @@ load_repos() {
   META_PARENT="$(parse_meta_parent || true)"
   META_UPSTREAM="$(parse_meta_upstream || true)"
 
-  # Repair parent stacks on the way in, so every command sees a sane chain even
-  # when the manifest was written by an older mcrepo or edited by hand. The
-  # repaired value reaches disk on the next save_repos.
-  META_PARENT="$(normalize_parent_stack "$META_PARENT" "$GLOBAL_BRANCH")"
+  # Convert pre-0.9 positional stacks on the way in, so every command sees a
+  # branch→parent map regardless of how old the manifest is. Idempotent; the
+  # converted value reaches disk on the next save_repos.
+  META_PARENT="$(parent_map_migrate "$META_PARENT" "$GLOBAL_BRANCH")"
 
   local parsed_url parsed_name parsed_mode parsed_description parsed_parent parsed_local parsed_upstream parsed_remotes
   while IFS=$'\x1f' read -r parsed_url parsed_name parsed_mode parsed_description parsed_parent parsed_local parsed_upstream parsed_remotes; do
@@ -938,7 +938,7 @@ load_repos() {
     REPO_NAMES+=("$parsed_name")
     REPO_MODES+=("$parsed_mode")
     REPO_DESCRIPTIONS+=("$parsed_description")
-    REPO_PARENTS+=("${parsed_parent:+$(normalize_parent_stack "$parsed_parent" "$GLOBAL_BRANCH")}")
+    REPO_PARENTS+=("${parsed_parent:+$(parent_map_migrate "$parsed_parent" "$GLOBAL_BRANCH")}")
     REPO_LOCALS+=("$is_local")
     REPO_UPSTREAMS+=("${parsed_upstream:-}")
     REPO_REMOTES+=("${parsed_remotes:-}")
@@ -1176,46 +1176,40 @@ validate_branch_name() {
   local name="$1"
   case "$name" in
     ''|-*) return 1 ;;
-    # ',' separates the elements of a parent stack in mcrepo.yaml. git itself
+    # ',' separates the entries of the parent map in mcrepo.yaml. git itself
     # allows it in a refname, but such a branch cannot be represented here and
-    # would silently corrupt the chain, so reject it at the chokepoint.
+    # would silently corrupt the map, so reject it at the chokepoint. (':' needs
+    # no guard — git check-ref-format below already rejects it.)
     *,*) return 1 ;;
   esac
   git check-ref-format "refs/heads/$name" >/dev/null 2>&1
 }
 
-# --- Parent-stack hygiene -----------------------------------------------------
+# --- Parent map ---------------------------------------------------------------
 #
-# A parent stack (see REPO_PARENTS) is a strictly nested ancestry chain, so a
-# valid one holds only DISTINCT branch names, none of them the branch it
-# describes. Leaving a branch without merging it violates both rules:
+# REPO_PARENTS[i] / META_PARENT hold a branch→parent map: comma-separated
+# "<branch>:<parent>" entries, e.g. "feature:main,sub:feature". Each entry names
+# a branch and its IMMEDIATE parent; the ancestry tree is reconstructed by
+# chaining entries, so siblings ("a:main,b:main") are representable and nesting
+# needs no stack.
 #
-#   - a repeated element means we came back to that fork level, so everything
-#     pushed after it belongs to an abandoned sibling branch
-#   - an element equal to the active branch would make that branch its own
-#     ancestor, which deadlocks 'merge' with "source is the same as parent"
+# The record belongs to the branch, not to whatever is currently checked out —
+# that is what lets you leave a branch and come back to it with the parent
+# intact. Entries are written on fork, read by rebase/merge/pull/push/pr, and
+# removed only when the branch is merged or deleted. Entries for branches that
+# no longer exist are inert: they can never affect another branch.
 #
-# Collapsing on the first and truncating on the second repairs both, which is
-# why normalization runs on every load instead of only where stacks are written.
+# ':' is a safe key separator because git refnames forbid it, and ',' is safe
+# because validate_branch_name rejects it.
 
-# True when a parent stack contains a branch name.
-parent_stack_contains() {
-  [ -n "${2:-}" ] || return 1
-  case ",${1:-}," in
-    *",$2,"*) return 0 ;;
-  esac
-  return 1
-}
-
-# Echo the part of a parent stack before the first occurrence of a branch name,
-# or the whole stack when the name is not in it.
-parent_stack_truncate() {
-  local stack="${1:-}"
-  local name="${2:-}"
-  local prefix=""
-  local rest="$stack"
+# Echo the recorded parent of a branch, or nothing when it has no entry.
+parent_map_get() {
+  local map="${1:-}"
+  local branch="${2:-}"
+  local rest="$map"
   local entry
 
+  [ -n "$branch" ] || return 0
   while [ -n "$rest" ]; do
     entry="${rest%%,*}"
     if [ "$entry" = "$rest" ]; then
@@ -1223,30 +1217,18 @@ parent_stack_truncate() {
     else
       rest="${rest#*,}"
     fi
-    if [ "$entry" = "$name" ]; then
-      printf '%s' "$prefix"
-      return 0
-    fi
-    if [ -n "$prefix" ]; then
-      prefix="$prefix,$entry"
-    else
-      prefix="$entry"
-    fi
+    case "$entry" in
+      "$branch":*) printf '%s' "${entry#*:}"; return 0 ;;
+    esac
   done
-
-  printf '%s' "$stack"
 }
 
-# Repair a parent stack against the branch it describes.
-#   normalize_parent_stack "main,main,main,vm-archive" "vm-archive"  ->  "main"
-#   normalize_parent_stack "main,feature" "sub"                      ->  "main,feature"
-# An empty active branch (coordination off) collapses repeats but keeps the
-# chain, since there is no branch to measure "your own ancestor" against.
-normalize_parent_stack() {
-  local stack="${1:-}"
-  local active="${2:-}"
+# Echo the map without the entry for a branch (a no-op when it has none).
+parent_map_del() {
+  local map="${1:-}"
+  local branch="${2:-}"
   local result=""
-  local rest="$stack"
+  local rest="$map"
   local entry
 
   while [ -n "$rest" ]; do
@@ -1257,9 +1239,9 @@ normalize_parent_stack() {
       rest="${rest#*,}"
     fi
     [ -n "$entry" ] || continue
-    if parent_stack_contains "$result" "$entry"; then
-      result="$(parent_stack_truncate "$result" "$entry")"
-    fi
+    case "$entry" in
+      "$branch":*) continue ;;
+    esac
     if [ -n "$result" ]; then
       result="$result,$entry"
     else
@@ -1267,28 +1249,110 @@ normalize_parent_stack() {
     fi
   done
 
-  if [ -n "$active" ] && parent_stack_contains "$result" "$active"; then
-    result="$(parent_stack_truncate "$result" "$active")"
-  fi
-
   printf '%s' "$result"
 }
 
-# True when any repo (or the meta-context) still has a parent level above the
-# branch we just landed on. A tip equal to that branch is not a next level — it
-# would send the follow-up 'merge'/'branch --delete' straight into the "source
-# is the same as parent" wall.
+# Echo the map with <branch> recorded as a child of <parent>. Idempotent: an
+# existing entry for the branch is replaced, never duplicated. A branch is never
+# its own parent, so that pairing is refused outright.
+parent_map_set() {
+  local map="${1:-}"
+  local branch="${2:-}"
+  local parent="${3:-}"
+  local result
+
+  if [ -z "$branch" ] || [ -z "$parent" ] || [ "$branch" = "$parent" ]; then
+    printf '%s' "$map"
+    return 0
+  fi
+
+  result="$(parent_map_del "$map" "$branch")"
+  if [ -n "$result" ]; then
+    printf '%s' "$result,$branch:$parent"
+  else
+    printf '%s' "$branch:$parent"
+  fi
+}
+
+# Convert a pre-0.9 value to a map, leaving an already-converted one untouched.
+#
+# The legacy format was a positional stack describing the ACTIVE branch only
+# ("main,feature" = forked off feature, which forked off main), so exactly one
+# fact is recoverable: the parent of the active branch is the rightmost element
+# that is not the active branch itself. Everything else in the stack belonged to
+# branches that were left without merging and is discarded.
+#
+#   parent_map_migrate "main,main,main,vm-archive" "vm-archive" -> "vm-archive:main"
+#   parent_map_migrate "main"                      "feature"    -> "feature:main"
+#   parent_map_migrate "main"                      ""           -> ""
+parent_map_migrate() {
+  local value="${1:-}"
+  local active="${2:-}"
+  local rest entry parent=""
+
+  [ -n "$value" ] || return 0
+  case "$value" in
+    *:*) printf '%s' "$value"; return 0 ;;
+  esac
+
+  # No active branch means there is no key to file the record under.
+  [ -n "$active" ] || return 0
+
+  rest="$value"
+  while [ -n "$rest" ]; do
+    entry="${rest%%,*}"
+    if [ "$entry" = "$rest" ]; then
+      rest=""
+    else
+      rest="${rest#*,}"
+    fi
+    [ -n "$entry" ] || continue
+    [ "$entry" = "$active" ] && continue
+    parent="$entry"
+  done
+
+  [ -n "$parent" ] || return 0
+  printf '%s' "$active:$parent"
+}
+
+# True when <ancestor> is reachable by walking up the recorded parents of
+# <branch>. Used to refuse an inverted record: moving UP the tree (feature ->
+# main) must never offer 'feature' as the parent of 'main', which would send a
+# later merge the wrong way down. The depth cap is a cycle guard.
+parent_map_is_ancestor() {
+  local map="${1:-}"
+  local ancestor="${2:-}"
+  local branch="${3:-}"
+  local cur="$branch"
+  local next
+  local depth=0
+
+  [ -n "$ancestor" ] || return 1
+  [ -n "$branch" ] || return 1
+  while [ "$depth" -lt 64 ]; do
+    next="$(parent_map_get "$map" "$cur")"
+    [ -n "$next" ] || return 1
+    [ "$next" = "$ancestor" ] && return 0
+    cur="$next"
+    depth=$((depth + 1))
+  done
+  return 1
+}
+
+# True when any repo (or the meta-context) still records a parent for the branch
+# we just landed on — i.e. there is another level to merge or delete.
 has_deeper_parent_level() {
   local current="${1:-}"
   local i
+  [ -n "$current" ] || return 1
   if [ "${#REPO_PARENTS[@]}" -gt 0 ]; then
     for i in "${!REPO_PARENTS[@]}"; do
-      if [ -n "${REPO_PARENTS[$i]:-}" ] && [ "${REPO_PARENTS[$i]##*,}" != "$current" ]; then
+      if [ -n "$(parent_map_get "${REPO_PARENTS[$i]:-}" "$current")" ]; then
         return 0
       fi
     done
   fi
-  if [ -n "$META_PARENT" ] && [ "${META_PARENT##*,}" != "$current" ]; then
+  if [ -n "$(parent_map_get "$META_PARENT" "$current")" ]; then
     return 0
   fi
   return 1
@@ -1681,13 +1745,13 @@ Always read the mcrepo.yaml first under "repos" you find the list of all reposit
 
 ## Branch Coordination and Merging
 
-- `mcrepo.yaml` tracks the active global `branch:` and per-repo `parent:` stacks.
-- `parent:` is a comma-separated stack (rightmost = immediate parent, e.g. `main,feature`).
-- The stack is a nested ancestry chain: entries are distinct and never name the active branch. mcrepo repairs violations automatically when it reads the manifest; `mcrepo doctor` reports them.
-- `meta-parent:` tracks the meta-context repo's own parent branch stack.
-- Never modify `branch:`, `parent:`, or `meta-parent:` fields directly — use `mcrepo branch`, `mcrepo rebase`, `mcrepo merge`, and `mcrepo branch --delete` commands.
+- `mcrepo.yaml` tracks the active global `branch:` and per-repo `parent:` records.
+- `parent:` is a branch→parent map: comma-separated `<branch>:<parent>` entries, e.g. `feature:main,sub:feature`. Each entry names a branch and its IMMEDIATE parent; the ancestry tree is read by chaining entries.
+- A record belongs to its branch, not to whatever is checked out, so leaving a branch and coming back to it preserves the parent. Entries are written on fork and removed only when the branch is merged or deleted; entries for other branches are never touched by a switch.
+- `meta-parent:` is the same map for the meta-context repo.
+- Never modify `branch:`, `parent:`, or `meta-parent:` fields directly — use `mcrepo branch`, `mcrepo rebase`, `mcrepo merge`, and `mcrepo branch --delete`. To set or repair a parent, use `mcrepo branch <name> --parent <branch>`.
 - The merge-back flow is strictly two-step: `mcrepo rebase` first (rebases the branch onto its parent; conflicts are resolved here), then `mcrepo merge` (always conflict-free after a clean sync).
-- `mcrepo branch <name>` distinguishes fork (new branch, records parent) from jump (existing branch, no parent change).
+- `mcrepo branch <name>` distinguishes fork (new branch, records the parent) from jump (existing branch, map untouched). Jumping to a branch with no record offers to store the branch you came from — declined by default, and never applied non-interactively.
 - `mcrepo branch --delete` discards the global branch and reverts repos to their parent branches.
 - `mcrepo branch --off` is a fallback that turns off coordination without switching branches.
 - `mcrepo pull` is the origin-side twin of `mcrepo rebase`: auto-stash + rebase local commits onto origin — the standard move when work from another device is on the remote; on conflict: resolve, stage, re-run `mcrepo pull`. Use `mcrepo pull --ff-only` for a conservative pull (fast-forward only, dirty sub-repos skipped). After `mcrepo rebase`, a coordinated branch can't fast-forward because the rebase rewrote its hashes; pull recognizes this and tells you to run `mcrepo push` instead of rebasing onto the stale remote.
@@ -2312,11 +2376,7 @@ apply_global_branch_to_repo_if_configured() {
        ! git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$GLOBAL_BRANCH"; then
       local current_branch
       current_branch="$(repo_branch "$repo_dir")"
-      if [ -n "${REPO_PARENTS[$idx]:-}" ]; then
-        REPO_PARENTS[$idx]="$(normalize_parent_stack "${REPO_PARENTS[$idx]},$current_branch" "$GLOBAL_BRANCH")"
-      else
-        REPO_PARENTS[$idx]="$current_branch"
-      fi
+      REPO_PARENTS[$idx]="$(parent_map_set "${REPO_PARENTS[$idx]:-}" "$GLOBAL_BRANCH" "$current_branch")"
       save_repos
     fi
   fi
@@ -3042,42 +3102,63 @@ cmd_doctor() {
   done
   log ""
 
-  # Parent-chain sanity. load_repos repairs stacks on the way in, so the only
-  # way to see a broken one is to re-read the manifest and compare: a difference
-  # means the file on disk still carries leaked levels from branches that were
-  # left without merging, and will be rewritten by the next command that saves.
-  local -a stale_stacks=()
+  # Parent-map sanity. load_repos converts pre-0.9 stacks on the way in, so a
+  # legacy value can only be seen by re-reading the manifest: a difference means
+  # the file on disk is still in the old format and will be rewritten by the
+  # next command that saves. Separately, report the active branch having no
+  # recorded parent, since 'merge' then silently falls back to the default.
+  local -a legacy_values=()
   # shellcheck disable=SC2034  # raw_mode/raw_desc/raw_local/raw_up/raw_remotes only pad the field list
-  local raw_url raw_name raw_mode raw_desc raw_parent raw_local raw_up raw_remotes fixed_stack
+  local raw_url raw_name raw_mode raw_desc raw_parent raw_local raw_up raw_remotes converted
   while IFS=$'\x1f' read -r raw_url raw_name raw_mode raw_desc raw_parent raw_local raw_up raw_remotes; do
     if [ -z "$raw_name" ] && [ -n "$raw_url" ]; then
       raw_name="$(derive_name_from_url "$raw_url")"
     fi
     [ -n "$raw_name" ] || continue
     [ -n "${raw_parent:-}" ] || continue
-    fixed_stack="$(normalize_parent_stack "$raw_parent" "$GLOBAL_BRANCH")"
-    if [ "$fixed_stack" != "$raw_parent" ]; then
-      stale_stacks+=("$raw_name: '$raw_parent' -> '${fixed_stack:-<none, falls back to the default branch>}'")
+    converted="$(parent_map_migrate "$raw_parent" "$GLOBAL_BRANCH")"
+    if [ "$converted" != "$raw_parent" ]; then
+      legacy_values+=("$raw_name: '$raw_parent' -> '${converted:-<none, falls back to the default branch>}'")
     fi
   done < <(parse_repos_tsv)
 
   local raw_meta_parent
   raw_meta_parent="$(parse_meta_parent || true)"
   if [ -n "$raw_meta_parent" ]; then
-    fixed_stack="$(normalize_parent_stack "$raw_meta_parent" "$GLOBAL_BRANCH")"
-    if [ "$fixed_stack" != "$raw_meta_parent" ]; then
-      stale_stacks+=("(meta-context): '$raw_meta_parent' -> '${fixed_stack:-<none, falls back to the default branch>}'")
+    converted="$(parent_map_migrate "$raw_meta_parent" "$GLOBAL_BRANCH")"
+    if [ "$converted" != "$raw_meta_parent" ]; then
+      legacy_values+=("(meta-context): '$raw_meta_parent' -> '${converted:-<none, falls back to the default branch>}'")
     fi
   fi
 
-  if [ "${#stale_stacks[@]}" -gt 0 ]; then
-    warn "parent: ${#stale_stacks[@]} stale parent chain(s) in $REPOS_FILE — repaired in memory, saved on the next command that writes the manifest:"
+  if [ "${#legacy_values[@]}" -gt 0 ]; then
+    warn "parent: ${#legacy_values[@]} pre-0.9 parent value(s) in $REPOS_FILE — converted in memory, saved on the next command that writes the manifest:"
     local _s
-    for _s in "${stale_stacks[@]}"; do
+    for _s in "${legacy_values[@]}"; do
       warn "  - $_s"
     done
-  else
-    log "parent: parent chains OK"
+  fi
+
+  if [ -n "$GLOBAL_BRANCH" ]; then
+    local -a no_parent=()
+    local _d
+    for i in "${!REPO_NAMES[@]}"; do
+      [ "${REPO_MODES[$i]}" = "write" ] || continue
+      _d="$(get_repo_dir "${REPO_NAMES[$i]}" "${REPO_MODES[$i]}")"
+      [ -d "$_d/.git" ] || continue
+      [ "$(repo_branch "$_d")" = "$GLOBAL_BRANCH" ] || continue
+      if [ -z "$(parent_map_get "${REPO_PARENTS[$i]:-}" "$GLOBAL_BRANCH")" ]; then
+        no_parent+=("${REPO_NAMES[$i]}")
+      fi
+    done
+    if [ "${#no_parent[@]}" -gt 0 ]; then
+      warn "parent: no parent recorded for '$GLOBAL_BRANCH' in: ${no_parent[*]}"
+      warn "parent: 'mcrepo merge' will fall back to each repo's default branch. Set it with 'mcrepo branch $GLOBAL_BRANCH --parent <branch>'."
+    else
+      log "parent: parent records OK (active branch: $GLOBAL_BRANCH)"
+    fi
+  elif [ "${#legacy_values[@]}" -eq 0 ]; then
+    log "parent: parent records OK"
   fi
   log ""
 
@@ -5152,7 +5233,8 @@ cmd_pull() {
     if git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
       has_up=1
     fi
-    local pparent="${REPO_PARENTS[$i]##*,}"
+    local pparent
+    pparent="$(parent_map_get "${REPO_PARENTS[$i]:-}" "$branch")"
     [ -n "$pparent" ] || pparent="$(detect_default_branch "$repo_dir")"
     pull_dirs+=("$repo_dir")
     pull_names+=("${REPO_NAMES[$i]}")
@@ -5349,7 +5431,8 @@ cmd_pull() {
 
   # Meta-context repo
   if [ -n "$meta_dir" ]; then
-    local meta_pull_parent="${META_PARENT##*,}"
+    local meta_pull_parent
+    meta_pull_parent="$(parent_map_get "$META_PARENT" "$meta_branch")"
     [ -n "$meta_pull_parent" ] || meta_pull_parent="$(detect_default_branch ".")"
     if ! git -C . fetch origin --prune 2>/dev/null; then
       warn "Fetch failed for (meta-context)"
@@ -5951,8 +6034,8 @@ cmd_push() {
     [ -d "$repo_dir/.git" ] || continue
     branch="$(repo_branch "$repo_dir")"
     dirty="$(repo_dirty_state "$repo_dir")"
-    # Immediate parent = rightmost of the comma stack; fallback to default branch.
-    parent="${REPO_PARENTS[$i]##*,}"
+    # Recorded parent of the branch this repo is on; fallback to default branch.
+    parent="$(parent_map_get "${REPO_PARENTS[$i]:-}" "$branch")"
     [ -n "$parent" ] || parent="$(detect_default_branch "$repo_dir")"
     push_dirs+=("$repo_dir")
     push_names+=("${REPO_NAMES[$i]}")
@@ -6029,7 +6112,8 @@ cmd_push() {
       meta_behind="$(printf '%s' "$meta_ab" | awk '{print $1+0}')"
       meta_ahead="$(printf '%s' "$meta_ab" | awk '{print $2+0}')"
       if [ "$meta_behind" -gt 0 ]; then
-        local meta_parent="${META_PARENT##*,}"
+        local meta_parent
+        meta_parent="$(parent_map_get "$META_PARENT" "$meta_branch")"
         [ -n "$meta_parent" ] || meta_parent="$(detect_default_branch ".")"
         meta_divclass="$(classify_divergence "." "$meta_branch" "$meta_parent")"
         if [ "$meta_divclass" = "safe-force" ] && [ "$allow_force" -eq 1 ] && [ "$do_fetch" -eq 1 ]; then
@@ -7722,13 +7806,10 @@ cmd_branch() {
       return 0
     fi
     GLOBAL_BRANCH=""
-    # Clear all parent stacks — branch history is no longer meaningful
-    # once coordination is off, since repos manage branches independently.
-    local i
-    for i in "${!REPO_PARENTS[@]}"; do
-      REPO_PARENTS[$i]=""
-    done
-    META_PARENT=""
+    # Parent records are kept: coordination being off does not mean the branches
+    # stopped existing, and each entry belongs to its own branch, so none of them
+    # can affect a repo that is now managed independently. Turning coordination
+    # back on finds the fork points still recorded.
     save_repos
     log "Global branch coordination turned off. Repos keep their current branches."
     warn "Repos remain on their current branches without coordination."
@@ -7751,10 +7832,16 @@ cmd_branch() {
   # Flags may appear before or after the branch name. A leading-dash value is
   # never accepted as a branch name (git forbids them anyway) — this catches
   # typos like '--delte' before they trigger a slow fetch across all repos.
-  local branch_name="" include_read=0 dirty_action_flag=""
+  local branch_name="" include_read=0 dirty_action_flag="" parent_flag=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --include-read) include_read=1 ;;
+      --parent)
+        shift
+        parent_flag="${1:-}"
+        [ -n "$parent_flag" ] || die "--parent needs a branch name."
+        validate_branch_name "$parent_flag" || die "Invalid parent branch name: '$parent_flag'"
+        ;;
       --dirty)
         shift
         dirty_action_flag="${1:-}"
@@ -7774,9 +7861,10 @@ cmd_branch() {
     esac
     shift
   done
-  [ -n "$branch_name" ] || die "Usage: ./mcrepo.sh branch <branch-name> [--include-read] [--dirty abort|commit|carry|discard]"
+  [ -n "$branch_name" ] || die "Usage: ./mcrepo.sh branch <branch-name> [--parent <branch>] [--include-read] [--dirty abort|commit|carry|discard]"
   [ "$branch_name" != "off" ] || die "'mcrepo branch off' was removed. Use 'mcrepo branch --off' to turn off coordination."
   validate_branch_name "$branch_name" || die "Invalid branch name: '$branch_name'"
+  [ "$parent_flag" != "$branch_name" ] || die "--parent cannot be the branch itself: '$branch_name'"
 
   load_repos
   # CONFLICTED is allowed: a re-run finalizes resolved carry conflicts below.
@@ -8103,78 +8191,114 @@ cmd_branch() {
   }
   trap '_branch_switch_exit_trap' EXIT
 
+  # Repos that jumped to a branch with no recorded parent, and the branch each
+  # switched from — offered as a suggestion after the switch loop.
+  local -a missing_idx=()
+  local -a missing_names=()
+  local -a missing_from=()
+
   for idx in "${!target_indexes[@]}"; do
     local ti="${target_indexes[$idx]}"
     repo_dir="${target_dirs[$idx]}"
     local rname="${REPO_NAMES[$ti]}"
-    local parent_for_log=""
+    local from_branch=""
 
-    # Capture the pre-switch branch; the parent stack is pushed after the
-    # switch succeeds (see trap note above).
-    if [ "${target_is_fork[$idx]}" -eq 1 ]; then
-      parent_for_log="$(repo_branch "$repo_dir")"
-    fi
+    # Capture the pre-switch branch: on a fork it IS the parent, on a jump it is
+    # only a suggestion for one (see the repair prompt below). Recorded after
+    # the switch succeeds (see trap note above).
+    from_branch="$(repo_branch "$repo_dir")"
 
     switch_repo_branch "$repo_dir" "$branch_name"
     _BRANCH_SWITCHED_COUNT=$((_BRANCH_SWITCHED_COUNT + 1))
 
-    if [ "${target_is_fork[$idx]}" -eq 1 ]; then
-      # Stack format: "grandparent,parent" — rightmost is immediate parent.
-      # Normalize on push: an OFF-GLOBAL repo can fork off a branch that is
-      # already on its stack, which would otherwise duplicate a level.
-      if [ -n "${REPO_PARENTS[$ti]:-}" ]; then
-        REPO_PARENTS[$ti]="$(normalize_parent_stack "${REPO_PARENTS[$ti]},$parent_for_log" "$branch_name")"
+    if [ -n "$parent_flag" ]; then
+      # Explicit --parent wins over both the fork point and any existing entry.
+      REPO_PARENTS[$ti]="$(parent_map_set "${REPO_PARENTS[$ti]:-}" "$branch_name" "$parent_flag")"
+      if [ "${target_is_fork[$idx]}" -eq 1 ]; then
+        log "  '$rname': created NEW branch '$branch_name' off '$from_branch', parent recorded as '$parent_flag'."
       else
-        REPO_PARENTS[$ti]="$parent_for_log"
+        log "  '$rname': switched to EXISTING branch '$branch_name' (parent set to '$parent_flag')."
       fi
-      log "  '$rname': created NEW branch '$branch_name' off parent '$parent_for_log'."
-    elif [ -n "${REPO_PARENTS[$ti]:-}" ] && [ "$branch_name" = "$GLOBAL_BRANCH" ]; then
-      # Re-activating the branch the chain was recorded against (a re-run, or a
-      # switch back after an interrupted one). The chain already describes this
-      # branch's ancestry — it just never contains the branch itself — so
-      # keeping it is the whole point.
-      log "  '$rname': switched to EXISTING branch '$branch_name' (parent '${REPO_PARENTS[$ti]##*,}' kept)."
-    elif parent_stack_contains "${REPO_PARENTS[$ti]:-}" "$branch_name"; then
-      # Jumping back to a branch the stack still lists as a parent: we have
-      # returned to that fork level, so drop it and everything above it.
-      REPO_PARENTS[$ti]="$(normalize_parent_stack "${REPO_PARENTS[$ti]}" "$branch_name")"
-      log "  '$rname': switched to EXISTING branch '$branch_name' (returned to parent level)."
-    elif [ -n "${REPO_PARENTS[$ti]:-}" ]; then
-      # The stack describes the ancestry of the branch we just left, which says
-      # nothing about this one. Keeping it would merge into the wrong branch.
-      REPO_PARENTS[$ti]=""
-      log "  '$rname': switched to EXISTING branch '$branch_name' (parent chain cleared — merge falls back to the default branch)."
+    elif [ "${target_is_fork[$idx]}" -eq 1 ]; then
+      REPO_PARENTS[$ti]="$(parent_map_set "${REPO_PARENTS[$ti]:-}" "$branch_name" "$from_branch")"
+      log "  '$rname': created NEW branch '$branch_name' off parent '$from_branch'."
     else
-      log "  '$rname': switched to EXISTING branch '$branch_name' (no parent recorded)."
+      # A jump never rewrites the map: an entry belongs to its own branch, so
+      # entries for every other branch stay exactly as they are.
+      local recorded
+      recorded="$(parent_map_get "${REPO_PARENTS[$ti]:-}" "$branch_name")"
+      if [ -n "$recorded" ]; then
+        log "  '$rname': switched to EXISTING branch '$branch_name' (parent '$recorded')."
+      else
+        log "  '$rname': switched to EXISTING branch '$branch_name' (no parent recorded)."
+        # Only offer when moving sideways or down the tree. Moving UP (the
+        # target is already an ancestor of where we came from) would record the
+        # child as its own parent's parent.
+        if [ -n "$from_branch" ] && [ "$from_branch" != "$branch_name" ] && \
+           ! parent_map_is_ancestor "${REPO_PARENTS[$ti]:-}" "$branch_name" "$from_branch"; then
+          missing_idx+=("$ti")
+          missing_names+=("$rname")
+          missing_from+=("$from_branch")
+        fi
+      fi
     fi
   done
 
   # Meta-context repo: fork-vs-jump parent tracking + switch
   if [ "$meta_is_target" -eq 1 ]; then
-    local meta_parent_for_log=""
-    if [ "$meta_is_fork" -eq 1 ]; then
-      meta_parent_for_log="$(repo_branch ".")"
-    fi
+    local meta_from_branch=""
+    meta_from_branch="$(repo_branch ".")"
     switch_repo_branch "." "$branch_name"
     _BRANCH_SWITCHED_COUNT=$((_BRANCH_SWITCHED_COUNT + 1))
 
-    if [ "$meta_is_fork" -eq 1 ]; then
-      if [ -n "$META_PARENT" ]; then
-        META_PARENT="$(normalize_parent_stack "${META_PARENT},$meta_parent_for_log" "$branch_name")"
-      else
-        META_PARENT="$meta_parent_for_log"
-      fi
-      log "  '(meta-context)': created NEW branch '$branch_name' off parent '$meta_parent_for_log'."
-    elif [ -n "$META_PARENT" ] && [ "$branch_name" = "$GLOBAL_BRANCH" ]; then
-      log "  '(meta-context)': switched to EXISTING branch '$branch_name' (parent '${META_PARENT##*,}' kept)."
-    elif parent_stack_contains "$META_PARENT" "$branch_name"; then
-      META_PARENT="$(normalize_parent_stack "$META_PARENT" "$branch_name")"
-      log "  '(meta-context)': switched to EXISTING branch '$branch_name' (returned to parent level)."
-    elif [ -n "$META_PARENT" ]; then
-      META_PARENT=""
-      log "  '(meta-context)': switched to EXISTING branch '$branch_name' (parent chain cleared — merge falls back to the default branch)."
+    if [ -n "$parent_flag" ]; then
+      META_PARENT="$(parent_map_set "$META_PARENT" "$branch_name" "$parent_flag")"
+      log "  '(meta-context)': parent of '$branch_name' recorded as '$parent_flag'."
+    elif [ "$meta_is_fork" -eq 1 ]; then
+      META_PARENT="$(parent_map_set "$META_PARENT" "$branch_name" "$meta_from_branch")"
+      log "  '(meta-context)': created NEW branch '$branch_name' off parent '$meta_from_branch'."
     else
-      log "  '(meta-context)': switched to EXISTING branch '$branch_name' (no parent recorded)."
+      local meta_recorded
+      meta_recorded="$(parent_map_get "$META_PARENT" "$branch_name")"
+      if [ -n "$meta_recorded" ]; then
+        log "  '(meta-context)': switched to EXISTING branch '$branch_name' (parent '$meta_recorded')."
+      else
+        log "  '(meta-context)': switched to EXISTING branch '$branch_name' (no parent recorded)."
+        if [ -n "$meta_from_branch" ] && [ "$meta_from_branch" != "$branch_name" ] && \
+           ! parent_map_is_ancestor "$META_PARENT" "$branch_name" "$meta_from_branch"; then
+          missing_idx+=("meta")
+          missing_names+=("(meta-context)")
+          missing_from+=("$meta_from_branch")
+        fi
+      fi
+    fi
+  fi
+
+  # Offer to fill in a parent for branches that had no entry. The branch we came
+  # from is the parent only if this branch actually forked from it — hopping
+  # between siblings would record the wrong one — so it is never written
+  # silently. Default 'n' also means a non-interactive run records nothing.
+  if [ "${#missing_names[@]}" -gt 0 ]; then
+    local mi
+    log ""
+    log "No parent is recorded for '$branch_name' in: ${missing_names[*]}"
+    log "Parent that would be recorded (the branch each repo switched from):"
+    for mi in "${!missing_names[@]}"; do
+      log "  ${missing_names[$mi]} → ${missing_from[$mi]}"
+    done
+    log "That is a suggestion, not a fact: it only holds if '$branch_name' forked from it."
+    if confirm "Record it as the parent of '$branch_name'?" n; then
+      for mi in "${!missing_names[@]}"; do
+        if [ "${missing_idx[$mi]}" = "meta" ]; then
+          META_PARENT="$(parent_map_set "$META_PARENT" "$branch_name" "${missing_from[$mi]}")"
+        else
+          REPO_PARENTS[${missing_idx[$mi]}]="$(parent_map_set "${REPO_PARENTS[${missing_idx[$mi]}]:-}" "$branch_name" "${missing_from[$mi]}")"
+        fi
+      done
+      log "Recorded. Change it any time with 'mcrepo branch $branch_name --parent <branch>'."
+    else
+      log "Left unrecorded — 'mcrepo merge' falls back to each repo's default branch."
+      log "Set it explicitly with 'mcrepo branch $branch_name --parent <branch>'."
     fi
   fi
 
@@ -8262,9 +8386,7 @@ cmd_branch_delete() {
 
     # Determine parent branch (pop target)
     local parent_branch=""
-    if [ -n "${REPO_PARENTS[$i]:-}" ]; then
-      parent_branch="${REPO_PARENTS[$i]##*,}"
-    fi
+    parent_branch="$(parent_map_get "${REPO_PARENTS[$i]:-}" "$source_branch")"
     if [ -z "$parent_branch" ]; then
       parent_branch="$(detect_default_branch "$repo_dir")"
     fi
@@ -8295,9 +8417,7 @@ cmd_branch_delete() {
   if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     local meta_actual
     meta_actual="$(repo_branch ".")"
-    if [ -n "$META_PARENT" ]; then
-      meta_parent_branch="${META_PARENT##*,}"
-    fi
+    meta_parent_branch="$(parent_map_get "$META_PARENT" "$source_branch")"
     if [ -z "$meta_parent_branch" ]; then
       meta_parent_branch="$(detect_default_branch ".")"
     fi
@@ -8374,13 +8494,8 @@ cmd_branch_delete() {
     fi
     log "  Switched to '$target'."
 
-    # Pop parent stack one level
-    local current_parent="${REPO_PARENTS[$ri]:-}"
-    if [[ "$current_parent" == *,* ]]; then
-      REPO_PARENTS[$ri]="${current_parent%,*}"
-    else
-      REPO_PARENTS[$ri]=""
-    fi
+    # The branch is gone, so drop its record (and only its record).
+    REPO_PARENTS[$ri]="$(parent_map_del "${REPO_PARENTS[$ri]:-}" "$source_branch")"
   done
 
   # Meta-context repo
@@ -8405,12 +8520,8 @@ cmd_branch_delete() {
     fi
     log "  Switched to '$meta_parent_branch'."
 
-    # Pop META_PARENT one level
-    if [[ "$META_PARENT" == *,* ]]; then
-      META_PARENT="${META_PARENT%,*}"
-    else
-      META_PARENT=""
-    fi
+    # The branch is gone, so drop its record (and only its record).
+    META_PARENT="$(parent_map_del "$META_PARENT" "$source_branch")"
   fi
 
   # Phase 3: Update GLOBAL_BRANCH
@@ -8619,9 +8730,7 @@ cmd_merge() {
 
     # Read immediate parent (last element of comma-separated stack)
     local parent_branch=""
-    if [ -n "${REPO_PARENTS[$i]:-}" ]; then
-      parent_branch="${REPO_PARENTS[$i]##*,}"
-    fi
+    parent_branch="$(parent_map_get "${REPO_PARENTS[$i]:-}" "$source_branch")"
 
     # Fallback: detect default branch
     if [ -z "$parent_branch" ]; then
@@ -8671,9 +8780,7 @@ cmd_merge() {
   local meta_parent_branch=""
   local meta_included=0
   if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    if [ -n "$META_PARENT" ]; then
-      meta_parent_branch="${META_PARENT##*,}"
-    fi
+    meta_parent_branch="$(parent_map_get "$META_PARENT" "$source_branch")"
     if [ -z "$meta_parent_branch" ]; then
       meta_parent_branch="$(detect_default_branch ".")"
     fi
@@ -8899,7 +9006,7 @@ cmd_merge() {
   local -a merged_names=()
   local -a failed_names=()
   local -a failed_entries=()
-  local exec_i rid current_parent
+  local exec_i rid
   for exec_i in "${!exec_names[@]}"; do
     repo_name="${exec_names[$exec_i]}"
     repo_dir="${exec_dirs[$exec_i]}"
@@ -8915,20 +9022,12 @@ cmd_merge() {
     if _merge_execute_one "$repo_dir" "$repo_name" "$target" "$source_branch" "$do_squash" "$commit_message"; then
       merged_names+=("$repo_name")
       _MERGE_DONE_COUNT=$((_MERGE_DONE_COUNT + 1))
-      # Pop this repo's parent stack now: "main,feature" → "main", "main" → "".
+      # The fork is done, so its record is spent. Only this branch's entry is
+      # dropped — entries for other branches describe forks that still exist.
       if [ "$rid" = "meta" ]; then
-        if [[ "$META_PARENT" == *,* ]]; then
-          META_PARENT="${META_PARENT%,*}"
-        else
-          META_PARENT=""
-        fi
+        META_PARENT="$(parent_map_del "$META_PARENT" "$source_branch")"
       else
-        current_parent="${REPO_PARENTS[$rid]:-}"
-        if [[ "$current_parent" == *,* ]]; then
-          REPO_PARENTS[$rid]="${current_parent%,*}"
-        else
-          REPO_PARENTS[$rid]=""
-        fi
+        REPO_PARENTS[$rid]="$(parent_map_del "${REPO_PARENTS[$rid]:-}" "$source_branch")"
       fi
     else
       failed_names+=("$repo_name")
@@ -9174,7 +9273,7 @@ cmd_pr() {
       # Make sure the upstream remote + its refs are available for base detection.
       ensure_upstream_remote "$repo_dir" "$upstream_url"
       git -C "$repo_dir" fetch upstream --quiet 2>/dev/null || true
-      base="${REPO_PARENTS[$i]##*,}"
+      base="$(parent_map_get "${REPO_PARENTS[$i]:-}" "$source_branch")"
       if [ -z "$base" ] || ! git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/upstream/$base"; then
         base="$(detect_default_branch_remote "$repo_dir" upstream)"
       fi
@@ -9185,7 +9284,7 @@ cmd_pr() {
         warn "Skipping '$repo_name': origin is not a GitHub remote."
         skipped_other+=("$repo_name"); continue
       fi
-      base="${REPO_PARENTS[$i]##*,}"
+      base="$(parent_map_get "${REPO_PARENTS[$i]:-}" "$source_branch")"
       [ -n "$base" ] || base="$(detect_default_branch "$repo_dir")"
       head="$source_branch"
       cmp_remote="origin"
@@ -9240,13 +9339,13 @@ cmd_pr() {
         parse_git_url "$meta_origin" >/dev/null; meta_head="$GU_OWNER:$source_branch"
         ensure_upstream_remote "." "$META_UPSTREAM"
         git -C . fetch upstream --quiet 2>/dev/null || true
-        meta_base="${META_PARENT##*,}"
+        meta_base="$(parent_map_get "$META_PARENT" "$source_branch")"
         if [ -z "$meta_base" ] || ! git -C . show-ref --verify --quiet "refs/remotes/upstream/$meta_base"; then
           meta_base="$(detect_default_branch_remote "." upstream)"
         fi
         meta_cmp_remote="upstream"
       else
-        meta_base="${META_PARENT##*,}"
+        meta_base="$(parent_map_get "$META_PARENT" "$source_branch")"
         [ -n "$meta_base" ] || meta_base="$(detect_default_branch ".")"
       fi
 
@@ -9463,9 +9562,7 @@ _rebase_run() {
     [ -d "$repo_dir/.git" ] || continue
 
     local parent_branch=""
-    if [ -n "${REPO_PARENTS[$i]:-}" ]; then
-      parent_branch="${REPO_PARENTS[$i]##*,}"
-    fi
+    parent_branch="$(parent_map_get "${REPO_PARENTS[$i]:-}" "$source_branch")"
     if [ -z "$parent_branch" ]; then
       parent_branch="$(detect_default_branch "$repo_dir")"
     fi
@@ -9512,9 +9609,7 @@ _rebase_run() {
   # Meta-context pre-flight: joins the same target arrays as the Nth repo.
   local meta_parent_branch=""
   if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    if [ -n "$META_PARENT" ]; then
-      meta_parent_branch="${META_PARENT##*,}"
-    fi
+    meta_parent_branch="$(parent_map_get "$META_PARENT" "$source_branch")"
     if [ -z "$meta_parent_branch" ]; then
       meta_parent_branch="$(detect_default_branch ".")"
     fi

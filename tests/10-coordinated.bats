@@ -23,8 +23,8 @@ coordinated_workspace() {
   [ "$(repo_branch beta)" = "feature-x" ]
   [ "$(git -C "$SANDBOX" rev-parse --abbrev-ref HEAD)" = "feature-x" ]
   grep -q 'branch: feature-x' mcrepo.yaml
-  grep -q 'parent: main' mcrepo.yaml
-  grep -q 'meta-parent: main' mcrepo.yaml
+  grep -q 'parent: feature-x:main' mcrepo.yaml
+  grep -q 'meta-parent: feature-x:main' mcrepo.yaml
 }
 
 @test "commit creates coordinated commits across dirty write repos" {

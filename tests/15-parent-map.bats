@@ -1,8 +1,8 @@
 #!/usr/bin/env bats
-# Parent-stack hygiene: the 'parent:' chain is a strictly nested ancestry, so
-# branch JUMPS must not leave abandoned levels behind. A leaked level used to
-# deadlock 'merge' with "source is the same as parent" and could not be undone
-# by rebase, merge, or branch --delete.
+# The parent map: 'parent:' holds "<branch>:<parent>" entries, so a record
+# belongs to its branch rather than to whatever is checked out. Leaving a branch
+# and coming back must preserve it — the flat stack this replaced could not,
+# which is what made merges deadlock and hand-repairs evaporate.
 
 load helpers
 
@@ -25,51 +25,36 @@ commit_meta_state() {
   git -C "$SANDBOX" diff --cached --quiet || git -C "$SANDBOX" commit -qm "${1:-mcrepo state}"
 }
 
-@test "jumping back to a parent branch drops the abandoned level" {
+@test "the parent record survives leaving a branch and coming back" {
   coordinated_workspace
   bash -c 'printf "y\n" | "$0" branch feature' "$SANDBOX/mcrepo.sh" >/dev/null
   commit_meta_state "state on feature"
-  bash -c 'printf "y\n" | "$0" branch sub' "$SANDBOX/mcrepo.sh" >/dev/null
-  commit_meta_state "state on sub"
-  grep -q 'parent: main,feature' mcrepo.yaml
+  grep -q 'parent: feature:main' mcrepo.yaml
 
-  # 'feature' already exists, so this is a jump — nothing was ever popped before.
+  # Leave for main ...
+  bash -c 'printf "y\n" | "$0" branch main' "$SANDBOX/mcrepo.sh" >/dev/null
+  commit_meta_state "state on main"
+  grep -q 'parent: feature:main' mcrepo.yaml
+  grep -q 'meta-parent: feature:main' mcrepo.yaml
+
+  # ... and come back. The record is untouched, no prompt needed.
   run bash -c 'printf "y\n" | "$0" branch feature' "$SANDBOX/mcrepo.sh"
   [ "$status" -eq 0 ]
-  assert_contains "$output" "returned to parent level"
-  grep -q 'branch: feature' mcrepo.yaml
-  grep -q '^    parent: main$' mcrepo.yaml
-  grep -q '^meta-parent: main$' mcrepo.yaml
-  ! grep -q 'main,feature' mcrepo.yaml
+  assert_contains "$output" "parent 'main'"
+  assert_not_contains "$output" "No parent is recorded"
+  grep -q 'parent: feature:main' mcrepo.yaml
+  # That the preserved record actually drives the merge target is proven by
+  # "branch --parent sets the record outright and it sticks" below.
 }
 
-@test "a branch jumped back to still merges into its real parent" {
+@test "nested forks build a tree and merge back one level at a time" {
   coordinated_workspace
   bash -c 'printf "y\n" | "$0" branch feature' "$SANDBOX/mcrepo.sh" >/dev/null
   commit_meta_state "state on feature"
   bash -c 'printf "y\n" | "$0" branch sub' "$SANDBOX/mcrepo.sh" >/dev/null
-  commit_meta_state "state on sub"
-  bash -c 'printf "y\n" | "$0" branch feature' "$SANDBOX/mcrepo.sh" >/dev/null
-  commit_meta_state "state back on feature"
-
-  dirty_repo alpha
-  mcrepo commit -m "work on feature" >/dev/null
-  run bash -c 'printf "n\n" | "$0" merge -m "feat: feature"' "$SANDBOX/mcrepo.sh"
-  [ "$status" -eq 0 ]
-  assert_not_contains "$output" "is the same as parent"
-  [ "$(repo_branch alpha)" = "main" ]
-  [ "$(repo_branch beta)" = "main" ]
-  [ "$(repo_subject alpha)" = "feat: feature" ]
-}
-
-@test "nested branches still merge back one level at a time" {
-  coordinated_workspace
-  bash -c 'printf "y\n" | "$0" branch feature' "$SANDBOX/mcrepo.sh" >/dev/null
-  commit_meta_state "state on feature"
-  bash -c 'printf "y\n" | "$0" branch sub' "$SANDBOX/mcrepo.sh" >/dev/null
-  # Normalization must NOT flatten a legitimate nested chain.
-  grep -q 'parent: main,feature' mcrepo.yaml
-  grep -q 'meta-parent: main,feature' mcrepo.yaml
+  # Both levels coexist as separate entries — no stack inside one value.
+  grep -q 'parent: feature:main,sub:feature' mcrepo.yaml
+  grep -q 'meta-parent: feature:main,sub:feature' mcrepo.yaml
   commit_meta_state "state on sub"
 
   dirty_repo alpha
@@ -77,91 +62,129 @@ commit_meta_state() {
   run bash -c 'printf "n\n" | "$0" merge -m "feat: sub"' "$SANDBOX/mcrepo.sh"
   [ "$status" -eq 0 ]
   [ "$(repo_branch alpha)" = "feature" ]
-  grep -q 'branch: feature' mcrepo.yaml
-  grep -q '^    parent: main$' mcrepo.yaml
+  # Only sub's entry is consumed; feature's remains.
+  grep -q 'parent: feature:main' mcrepo.yaml
+  ! grep -q 'sub:feature' mcrepo.yaml
   assert_contains "$output" "next parent level"
   commit_meta_state "state after first merge"
 
   run bash -c 'printf "n\n" | "$0" merge -m "feat: feature"' "$SANDBOX/mcrepo.sh"
   [ "$status" -eq 0 ]
   [ "$(repo_branch alpha)" = "main" ]
-  [ "$(repo_subject alpha)" = "feat: feature" ]
+  ! grep -q '^    parent:' mcrepo.yaml
   assert_not_contains "$output" "next parent level"
 }
 
-@test "re-running branch on the active branch keeps the recorded parent" {
+@test "sibling forks are recorded separately instead of piling up" {
+  coordinated_workspace
+  bash -c 'printf "y\n" | "$0" branch feature-a' "$SANDBOX/mcrepo.sh" >/dev/null
+  commit_meta_state "a"
+  bash -c 'printf "y\n" | "$0" branch main' "$SANDBOX/mcrepo.sh" >/dev/null
+  commit_meta_state "back to main"
+  bash -c 'printf "y\n" | "$0" branch feature-b' "$SANDBOX/mcrepo.sh" >/dev/null
+
+  # The flat stack wrote 'main,main' here and could not tell the two apart.
+  grep -q 'parent: feature-a:main,feature-b:main' mcrepo.yaml
+  ! grep -q 'main,main' mcrepo.yaml
+}
+
+@test "a jump into a branch with no record offers the branch you came from" {
+  coordinated_workspace
+  # A branch mcrepo did not create => no entry anywhere.
+  git -C "$SANDBOX/alpha" branch outside main
+  git -C "$SANDBOX/beta" branch outside main
+  git -C "$SANDBOX" branch outside main
+
+  # No TTY, so confirm takes its default — which is 'n'. The offer is shown,
+  # nothing is written: an unattended run must never guess a parent.
+  run mcrepo branch outside
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "No parent is recorded"
+  assert_contains "$output" "alpha → main"
+  assert_contains "$output" "Left unrecorded"
+  ! grep -q 'outside:' mcrepo.yaml
+}
+
+@test "accepting the offer records the branch you came from" {
+  coordinated_workspace
+  git -C "$SANDBOX/alpha" branch outside main
+  git -C "$SANDBOX/beta" branch outside main
+  git -C "$SANDBOX" branch outside main
+
+  MCREPO_ASSUME_YES=1 run mcrepo branch outside
+  [ "$status" -eq 0 ]
+  grep -q 'parent: outside:main' mcrepo.yaml
+  grep -q 'meta-parent: outside:main' mcrepo.yaml
+}
+
+@test "moving up the tree never offers the child as its parent's parent" {
   coordinated_workspace
   bash -c 'printf "y\n" | "$0" branch feature' "$SANDBOX/mcrepo.sh" >/dev/null
-  commit_meta_state "state on feature"
-  grep -q '^    parent: main$' mcrepo.yaml
+  commit_meta_state "on feature"
 
-  # Re-activating the branch the chain was recorded against is NOT a jump to an
-  # unrelated branch: 'feature' is never IN its own chain, so a naive
-  # "not in the chain => clear it" rule would destroy the correct parent.
-  run bash -c 'printf "y\n" | "$0" branch feature' "$SANDBOX/mcrepo.sh"
+  # Jumping feature -> main: main has no record, but recording 'feature' as
+  # main's parent would invert the tree, so it must not even be offered.
+  MCREPO_ASSUME_YES=1 run mcrepo branch main
   [ "$status" -eq 0 ]
-  assert_contains "$output" "parent 'main' kept"
-  assert_not_contains "$output" "parent chain cleared"
-  grep -q '^    parent: main$' mcrepo.yaml
-  grep -q '^meta-parent: main$' mcrepo.yaml
+  assert_not_contains "$output" "No parent is recorded"
+  ! grep -q 'main:feature' mcrepo.yaml
+  grep -q 'parent: feature:main' mcrepo.yaml
+}
 
-  # ... and the branch still merges into its real parent afterwards.
+@test "branch --parent sets the record outright and it sticks" {
+  coordinated_workspace
+  bash -c 'printf "y\n" | "$0" branch feature' "$SANDBOX/mcrepo.sh" >/dev/null
+  commit_meta_state "on feature"
+  git -C "$SANDBOX/alpha" branch base main
+  git -C "$SANDBOX/beta" branch base main
+  git -C "$SANDBOX" branch base main
+
+  run mcrepo branch feature --parent base
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "parent set to 'base'"
+  grep -q 'parent: feature:base' mcrepo.yaml
+  ! grep -q 'feature:main' mcrepo.yaml
+  commit_meta_state "reparented"
+
+  # Survives a round-trip, and merge honours it.
+  bash -c 'printf "y\n" | "$0" branch main' "$SANDBOX/mcrepo.sh" >/dev/null
+  commit_meta_state "on main"
+  grep -q 'parent: feature:base' mcrepo.yaml
+  bash -c 'printf "y\n" | "$0" branch feature' "$SANDBOX/mcrepo.sh" >/dev/null
+  commit_meta_state "back on feature"
+
   dirty_repo alpha
   mcrepo commit -m "work" >/dev/null
-  run bash -c 'printf "n\n" | "$0" merge -m "feat: kept"' "$SANDBOX/mcrepo.sh"
+  run bash -c 'printf "n\n" | "$0" merge -m "feat: onto base"' "$SANDBOX/mcrepo.sh"
   [ "$status" -eq 0 ]
-  [ "$(repo_branch alpha)" = "main" ]
+  [ "$(repo_branch alpha)" = "base" ]
 }
 
-@test "jumping to a branch outside the recorded chain clears the stale parent" {
-  coordinated_workspace
-  bash -c 'printf "y\n" | "$0" branch feature' "$SANDBOX/mcrepo.sh" >/dev/null
-  commit_meta_state "state on feature"
-  # An unrelated branch that already exists everywhere => a jump, not a fork.
-  git -C "$SANDBOX/alpha" branch other main
-  git -C "$SANDBOX/beta" branch other main
-  git -C "$SANDBOX" branch other main
-
-  run bash -c 'printf "y\n" | "$0" branch other' "$SANDBOX/mcrepo.sh"
-  [ "$status" -eq 0 ]
-  assert_contains "$output" "parent chain cleared"
-  ! grep -q '^    parent:' mcrepo.yaml
-  ! grep -q '^meta-parent:' mcrepo.yaml
-}
-
-@test "doctor reports a corrupt parent chain without rewriting the manifest" {
+@test "a pre-0.9 parent stack is converted on the next command" {
   coordinated_workspace
   bash -c 'printf "y\n" | "$0" branch vm-archive' "$SANDBOX/mcrepo.sh" >/dev/null
 
   # Seed exactly what repeated fork/jump cycles used to write.
   awk '{ sub(/^[ ]*parent: .*/, "    parent: main,main,main,vm-archive")
          sub(/^meta-parent: .*/, "meta-parent: main,main,main,vm-archive")
+         sub(/^schema: .*/, "schema: 1")
          print }' mcrepo.yaml >mcrepo.yaml.seed
   mv mcrepo.yaml.seed mcrepo.yaml
 
   run mcrepo doctor
   [ "$status" -eq 0 ]
-  assert_contains "$output" "stale parent chain"
-  # doctor is read-only: the manifest is untouched
+  assert_contains "$output" "pre-0.9 parent value"
+  # doctor is read-only
   grep -q 'parent: main,main,main,vm-archive' mcrepo.yaml
-}
-
-@test "a corrupt parent chain is repaired by the next command that saves" {
-  coordinated_workspace
-  bash -c 'printf "y\n" | "$0" branch vm-archive' "$SANDBOX/mcrepo.sh" >/dev/null
-  awk '{ sub(/^[ ]*parent: .*/, "    parent: main,main,main,vm-archive")
-         sub(/^meta-parent: .*/, "meta-parent: main,main,main,vm-archive")
-         print }' mcrepo.yaml >mcrepo.yaml.seed
-  mv mcrepo.yaml.seed mcrepo.yaml
 
   run mcrepo write alpha
   [ "$status" -eq 0 ]
-  ! grep -q 'main,main,main' mcrepo.yaml
-  grep -q '^    parent: main$' mcrepo.yaml
-  grep -q '^meta-parent: main$' mcrepo.yaml
+  grep -q 'parent: vm-archive:main' mcrepo.yaml
+  grep -q 'meta-parent: vm-archive:main' mcrepo.yaml
+  ! grep -q 'main,main' mcrepo.yaml
 
-  # ... and the branch is mergeable again instead of being its own parent.
-  commit_meta_state "state on vm-archive"
+  # ... and the branch is mergeable, into main rather than into itself.
+  commit_meta_state "converted"
   dirty_repo alpha
   mcrepo commit -m "archive work" >/dev/null
   run bash -c 'printf "n\n" | "$0" merge -m "feat: vm-archive"' "$SANDBOX/mcrepo.sh"
@@ -170,16 +193,29 @@ commit_meta_state() {
   [ "$(repo_branch alpha)" = "main" ]
 }
 
-@test "rebase does not claim success when there is no parent to rebase onto" {
+@test "a healthy pre-0.9 single-level stack keeps its meaning" {
   coordinated_workspace
-  # Coordinating on the default branch itself: no chain is recorded, so the
-  # parent falls back to the detected default — which is the source branch.
-  # That is not "in sync", it is "nothing to rebase onto", and saying ✓ here is
-  # what hid the broken state while 'merge' kept failing.
-  bash -c 'printf "y\n" | "$0" branch main' "$SANDBOX/mcrepo.sh" >/dev/null
-  commit_meta_state "state on main"
+  bash -c 'printf "y\n" | "$0" branch feature' "$SANDBOX/mcrepo.sh" >/dev/null
+  awk '{ sub(/^[ ]*parent: .*/, "    parent: main")
+         sub(/^meta-parent: .*/, "meta-parent: main")
+         sub(/^schema: .*/, "schema: 1")
+         print }' mcrepo.yaml >mcrepo.yaml.seed
+  mv mcrepo.yaml.seed mcrepo.yaml
 
-  run mcrepo rebase
-  assert_not_contains "$output" "already in sync"
-  assert_contains "$output" "Nothing to rebase for"
+  run mcrepo write alpha
+  [ "$status" -eq 0 ]
+  grep -q 'parent: feature:main' mcrepo.yaml
+  grep -q 'meta-parent: feature:main' mcrepo.yaml
+}
+
+@test "branch --off keeps the parent records" {
+  coordinated_workspace
+  bash -c 'printf "y\n" | "$0" branch feature' "$SANDBOX/mcrepo.sh" >/dev/null
+  grep -q 'parent: feature:main' mcrepo.yaml
+
+  run mcrepo branch --off
+  [ "$status" -eq 0 ]
+  ! grep -q '^branch:' mcrepo.yaml
+  # The branches still exist, so their fork points are still worth knowing.
+  grep -q 'parent: feature:main' mcrepo.yaml
 }

@@ -51,7 +51,7 @@ inventory() {
 
 @test "manifest gets a schema stamp and older manifests load fine" {
   mcrepo init --no-shell-install >/dev/null
-  grep -q '^schema: 1$' mcrepo.yaml
+  grep -q '^schema: 2$' mcrepo.yaml
   # simulate a 0.5.x manifest without schema line
   grep -v '^schema:' mcrepo.yaml >mcrepo.yaml.old && mv mcrepo.yaml.old mcrepo.yaml
   run mcrepo list
@@ -61,7 +61,7 @@ inventory() {
 @test "manifest from a newer schema is rejected with an update hint" {
   mcrepo init --no-shell-install >/dev/null
   python3 - <<'PYEOF'
-text = open("mcrepo.yaml").read().replace("schema: 1", "schema: 99")
+text = open("mcrepo.yaml").read().replace("schema: 2", "schema: 99")
 open("mcrepo.yaml", "w").write(text)
 PYEOF
   run mcrepo list

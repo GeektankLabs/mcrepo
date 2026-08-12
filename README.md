@@ -200,7 +200,7 @@ This is the counterpart to `mcrepo merge`. While `merge` saves work into the par
 - Aborts if any repo has uncommitted changes
 - Switches each repo back to its immediate parent branch
 - Deletes the feature branch locally
-- Pops the parent stack one level (nested branches supported)
+- Removes that branch's parent record (nested branches supported)
 
 ### Rebasing onto the Parent
 
@@ -262,9 +262,9 @@ Behavior details:
   `PARTIAL`, and the run exits `2` with a paste-ready recovery prompt. Fix the cause and re-run
   `mcrepo merge` — already-merged repos are skipped automatically.
 - Merges are local only (no push). Review and push per-repo when ready.
-- Nested branches are supported: `main → feature → sub-feature`. Each `merge` pops one level.
+- Nested branches are supported: `main → feature → sub-feature`. Each `merge` consumes one branch's record and leaves the rest of the tree intact.
 - After a squash merge, the source branch's tip is no longer reachable from the parent, so the post-merge cleanup uses **force-delete** (`git branch -D`) with an explicit confirmation defaulting to **No**. The `--no-squash` path keeps the previous safe-delete (`git branch -d`) prompt.
-- The merge auto-commits the updated `mcrepo.yaml` in the meta-context (subject: `mcrepo: post-merge state — '<source>' merged into '<target>'`) so the popped parent stack and updated global branch land in git history immediately. Run `mcrepo push` afterward to publish the merge along with this state commit. Only `mcrepo.yaml` is staged — unrelated dirty files in the meta-context are left alone.
+- The merge auto-commits the updated `mcrepo.yaml` in the meta-context (subject: `mcrepo: post-merge state — '<source>' merged into '<target>'`) so the updated parent records and global branch land in git history immediately. Run `mcrepo push` afterward to publish the merge along with this state commit. Only `mcrepo.yaml` is staged — unrelated dirty files in the meta-context are left alone.
 - When no parent is recorded, mcrepo falls back to detecting the default branch (via `origin/HEAD`, remote query, or heuristic).
 
 ## Conflicts & Recovery
@@ -698,18 +698,18 @@ git config --get-urlmatch credential.helper https://github.com
 `mcrepo.yaml` is machine-owned: mcrepo rewrites it on every change (comments are not preserved). Schema:
 
 ```yaml
-schema: 1                     # manifest format version (checked on load)
+schema: 2                     # manifest format version (checked on load)
 organization: my-org          # optional: GitHub org for 'init <organization>' sync
 locations: backup mirror      # optional: declared named remote locations (space-separated)
 branch: feature-x             # optional: the active global (coordinated) branch
-meta-parent: main             # parent-branch stack of the meta-context (comma-separated, rightmost = immediate parent)
+meta-parent: feature-x:main   # branch→parent map for the meta-context (comma-separated "<branch>:<parent>" entries)
 meta-upstream: <url>          # optional: PR target for the meta-context itself
 repos:
   - url: https://github.com/acme/service-a.git   # origin (absent for local incubators)
     name: service-a
     mode: read                # read | write | sleep
     description: "..."        # one-line functional description (agent-maintained)
-    parent: main              # parent-branch stack (recorded by 'mcrepo branch')
+    parent: feature-x:main    # branch→parent map (recorded by 'mcrepo branch')
     upstream: <url>           # optional: PR target for the fork workflow
     remotes: backup=<url>     # optional: URLs for named locations (comma-separated name=url)
     local: true               # local incubator repo (no external remote yet)
@@ -739,7 +739,7 @@ Accepted URL transports: `https`, `ssh`, `git`, `file`, absolute/relative local 
 - **sub-repo** — an independent git repository managed inside the workspace
 - **mode** — per-repo intent signal: `read` (context only), `write` (active changes), `sleep` (clone removed, entry kept)
 - **global branch** — one coordinated branch name across target repos, set by `mcrepo branch <name>`
-- **parent (stack)** — the branch a feature branch forked from; stacked (comma-separated) so nested branches merge back level by level. Entries are distinct and never the active branch; mcrepo repairs the chain on read and on every branch switch
+- **parent (map)** — which branch each branch forked from, stored as `<branch>:<parent>` entries so the record belongs to the branch. It survives leaving a branch and coming back, and is removed only when that branch is merged or deleted
 - **local incubator** — a repo created by `mcrepo new` that lives committed inside the meta-context until `mcrepo publish` graduates it to its own remote
 - **upstream** — the PR target in the fork workflow (origin = your fork, upstream = the original repo)
 - **coordinated commit `#N @batch`** — one logical change committed across several repos with a shared sequence number and batch id
