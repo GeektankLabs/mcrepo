@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.8.1"
+MCREPO_VERSION="0.8.2"
 # Manifest (mcrepo.yaml) format version. Bump when the manifest schema changes
 # incompatibly; cmd_post_update_migrate migrates older manifests forward.
 MCREPO_SCHEMA_VERSION="1"
@@ -8128,6 +8128,12 @@ cmd_branch() {
         REPO_PARENTS[$ti]="$parent_for_log"
       fi
       log "  '$rname': created NEW branch '$branch_name' off parent '$parent_for_log'."
+    elif [ -n "${REPO_PARENTS[$ti]:-}" ] && [ "$branch_name" = "$GLOBAL_BRANCH" ]; then
+      # Re-activating the branch the chain was recorded against (a re-run, or a
+      # switch back after an interrupted one). The chain already describes this
+      # branch's ancestry — it just never contains the branch itself — so
+      # keeping it is the whole point.
+      log "  '$rname': switched to EXISTING branch '$branch_name' (parent '${REPO_PARENTS[$ti]##*,}' kept)."
     elif parent_stack_contains "${REPO_PARENTS[$ti]:-}" "$branch_name"; then
       # Jumping back to a branch the stack still lists as a parent: we have
       # returned to that fork level, so drop it and everything above it.
@@ -8159,6 +8165,8 @@ cmd_branch() {
         META_PARENT="$meta_parent_for_log"
       fi
       log "  '(meta-context)': created NEW branch '$branch_name' off parent '$meta_parent_for_log'."
+    elif [ -n "$META_PARENT" ] && [ "$branch_name" = "$GLOBAL_BRANCH" ]; then
+      log "  '(meta-context)': switched to EXISTING branch '$branch_name' (parent '${META_PARENT##*,}' kept)."
     elif parent_stack_contains "$META_PARENT" "$branch_name"; then
       META_PARENT="$(normalize_parent_stack "$META_PARENT" "$branch_name")"
       log "  '(meta-context)': switched to EXISTING branch '$branch_name' (returned to parent level)."

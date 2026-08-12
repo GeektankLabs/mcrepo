@@ -89,6 +89,30 @@ commit_meta_state() {
   assert_not_contains "$output" "next parent level"
 }
 
+@test "re-running branch on the active branch keeps the recorded parent" {
+  coordinated_workspace
+  bash -c 'printf "y\n" | "$0" branch feature' "$SANDBOX/mcrepo.sh" >/dev/null
+  commit_meta_state "state on feature"
+  grep -q '^    parent: main$' mcrepo.yaml
+
+  # Re-activating the branch the chain was recorded against is NOT a jump to an
+  # unrelated branch: 'feature' is never IN its own chain, so a naive
+  # "not in the chain => clear it" rule would destroy the correct parent.
+  run bash -c 'printf "y\n" | "$0" branch feature' "$SANDBOX/mcrepo.sh"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "parent 'main' kept"
+  assert_not_contains "$output" "parent chain cleared"
+  grep -q '^    parent: main$' mcrepo.yaml
+  grep -q '^meta-parent: main$' mcrepo.yaml
+
+  # ... and the branch still merges into its real parent afterwards.
+  dirty_repo alpha
+  mcrepo commit -m "work" >/dev/null
+  run bash -c 'printf "n\n" | "$0" merge -m "feat: kept"' "$SANDBOX/mcrepo.sh"
+  [ "$status" -eq 0 ]
+  [ "$(repo_branch alpha)" = "main" ]
+}
+
 @test "jumping to a branch outside the recorded chain clears the stale parent" {
   coordinated_workspace
   bash -c 'printf "y\n" | "$0" branch feature' "$SANDBOX/mcrepo.sh" >/dev/null
