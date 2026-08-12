@@ -164,7 +164,7 @@ mcrepo branch <feature-branch-name>
 
 Behavior details:
 
-- When `<name>` already exists locally or on origin, mcrepo treats this as a **branch jump** — no parent is recorded. When `<name>` is new, it's a **fork** — the current branch is recorded as parent.
+- When `<name>` already exists locally or on origin, mcrepo treats this as a **branch jump** — no new parent is recorded, and the parent stack is reconciled (see below). When `<name>` is new, it's a **fork** — the current branch is recorded as parent.
 - If forking, mcrepo shows a confirmation prompt listing which repos will fork vs jump.
 - If any target repo has uncommitted changes, mcrepo offers interactive options:
   - **Abort** — stop and handle manually
@@ -176,6 +176,7 @@ Behavior details:
 - If `<name>` exists on `origin` but not locally, mcrepo creates a local tracking branch from `origin/<name>`.
 - After updating target repos, mcrepo switches the meta-context repo to the same branch as the final step.
 - Each repo's previous branch is automatically recorded as its parent branch in `mcrepo.yaml`, enabling `mcrepo merge` later (only on fork, not on jump).
+- The parent stack is a nested ancestry chain, so its entries are always distinct and never name the active branch. Jumping back to a branch the stack still lists as a parent drops that level and everything above it — those levels belong to branches you left without merging. Jumping to a branch outside the chain clears it, and `mcrepo merge` falls back to the detected default branch. Manifests that already carry leaked levels are repaired the next time mcrepo reads them; `mcrepo doctor` reports what it repaired.
 
 This keeps feature work aligned and makes later per-repo commits and pull requests easier to coordinate.
 
@@ -738,7 +739,7 @@ Accepted URL transports: `https`, `ssh`, `git`, `file`, absolute/relative local 
 - **sub-repo** — an independent git repository managed inside the workspace
 - **mode** — per-repo intent signal: `read` (context only), `write` (active changes), `sleep` (clone removed, entry kept)
 - **global branch** — one coordinated branch name across target repos, set by `mcrepo branch <name>`
-- **parent (stack)** — the branch a feature branch forked from; stacked (comma-separated) so nested branches merge back level by level
+- **parent (stack)** — the branch a feature branch forked from; stacked (comma-separated) so nested branches merge back level by level. Entries are distinct and never the active branch; mcrepo repairs the chain on read and on every branch switch
 - **local incubator** — a repo created by `mcrepo new` that lives committed inside the meta-context until `mcrepo publish` graduates it to its own remote
 - **upstream** — the PR target in the fork workflow (origin = your fork, upstream = the original repo)
 - **coordinated commit `#N @batch`** — one logical change committed across several repos with a shared sequence number and batch id
