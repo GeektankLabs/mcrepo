@@ -283,3 +283,63 @@ make_markerless_conflict() {
   assert_not_contains "$output" "Deprecation"
   assert_contains "$output" "Rebase"
 }
+
+@test "the rebase agent prompt carries progress, conflict kind, and the operation id" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  mcrepo branch feat-ctx >/dev/null 2>&1
+  printf 'feature line\n' >alpha/README.md
+  git -C alpha add -A
+  git -C alpha commit -qm "feature work"
+  advance_remote alpha "parent moved"
+
+  run mcrepo rebase
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "Coordinated rebase 'rebase-"
+  assert_contains "$output" "commit 1 of 1"
+  assert_contains "$output" "both-modified"
+  assert_contains "$output" "README.md"
+  assert_contains "$output" "feature work"
+}
+
+@test "a conflicted mcrepo.sh does not strand the rebase: an intact launcher is offered" {
+  init_workspace_with_repos alpha
+  git_manage_workspace
+  mcrepo write alpha >/dev/null
+  # Put the tool itself into history the way a real workspace carries it.
+  git add -A
+  git commit -qm "workspace with mcrepo.sh"
+  git init -q --bare "$REMOTES_DIR/meta.git"
+  git remote add origin "file://$REMOTES_DIR/meta.git"
+  git push -q -u origin main
+
+  mcrepo branch feat-tool >/dev/null 2>&1
+  # The feature branch carries an older tool version...
+  sed -i.bak 's/^MCREPO_VERSION=.*/MCREPO_VERSION="0.5.6"/' mcrepo.sh && rm -f mcrepo.sh.bak
+  git add -A
+  git commit -qm "feature carries an old mcrepo.sh"
+
+  # ...while main moved to a different one: a real conflict inside the script.
+  git checkout -q main
+  sed -i.bak 's/^MCREPO_VERSION=.*/MCREPO_VERSION="0.8.0"/' mcrepo.sh && rm -f mcrepo.sh.bak
+  git add -A
+  git commit -qm "main carries another mcrepo.sh"
+  git push -q origin main
+  git checkout -q feat-tool
+
+  run mcrepo rebase
+  [ "$status" -eq 2 ]
+  # The hint has to come from THIS run: ./mcrepo.sh now holds conflict markers,
+  # so re-running it is a bash syntax error and no later run could ever say so.
+  assert_contains "$output" "conflict markers"
+  snap="$(printf '%s\n' "$output" | sed -n 's/.*bash \(.*mcrepo-[^ ]*\.sh\) rebase.*/\1/p' | head -1)"
+  [ -n "$snap" ]
+
+  run bash -n ./mcrepo.sh
+  [ "$status" -ne 0 ]
+  # The offered launcher must actually be runnable.
+  run bash -n "$snap"
+  [ "$status" -eq 0 ]
+  run bash "$snap" version
+  [ "$status" -eq 0 ]
+}

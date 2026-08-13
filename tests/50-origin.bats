@@ -159,6 +159,44 @@ setup() {
   [ "$(git -C alpha rev-list --count feat-pa)" = "$count_before" ]
 }
 
+@test "conflict-resolved rebase is publishable: resolution mutates patch ids, push must still go out" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  mcrepo branch feat-cr >/dev/null 2>&1
+  # The feature commit touches the SAME line advance_remote rewrites, so the
+  # rebase must stop and the resolution necessarily changes the commit's patch id.
+  printf 'feature line\n' >alpha/README.md
+  git -C alpha add -A
+  git -C alpha commit -qm "feature work"
+  git -C alpha push -q -u origin feat-cr
+  remote_before="$(git -C alpha rev-parse origin/feat-cr)"
+  advance_remote alpha "parent moved"
+
+  run mcrepo rebase
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "Rebase conflicts"
+
+  # Agent-style fix: edit + git add only, then re-run rebase.
+  printf 'parent moved\nfeature line\n' >alpha/README.md
+  git -C alpha add README.md
+  run mcrepo rebase
+  [ "$status" -eq 0 ]
+
+  # The rebase is done and origin/feat-cr is untouched since it began, so this
+  # is provably our own rewrite — even though patch equivalence cannot show it.
+  [ "$(git -C alpha rev-parse origin/feat-cr)" = "$remote_before" ]
+  run git -C alpha rev-list --left-only --cherry-pick --count 'origin/feat-cr...HEAD'
+  [ "$output" != "0" ]
+
+  run mcrepo push
+  [ "$status" -eq 0 ]
+  git -C alpha fetch -q origin
+  [ "$(git -C alpha rev-parse origin/feat-cr)" = "$(git -C alpha rev-parse HEAD)" ]
+  run git -C alpha log --format=%s origin/feat-cr
+  assert_contains "$output" "feature work"
+  assert_contains "$output" "remote advance alpha"
+}
+
 @test "push skips mid-operation/conflicted repos instead of committing conflict markers" {
   init_workspace_with_repos alpha
   mcrepo write alpha >/dev/null

@@ -219,12 +219,27 @@ Behavior details:
   other PRs; falls back to local `<parent>` when no origin is configured). Auto-stashes
   uncommitted work, including untracked files.
 - On a rebase conflict, `rebase` keeps going through the remaining repos, prints per-repo context
-  (including the conflicted files) plus a paste-ready prompt for a local coding agent, and exits
-  `2`. After the files are resolved and staged, **re-run `mcrepo rebase`** — it finishes the
-  paused rebases and restores auto-stashed changes — see [Conflicts & Recovery](#conflicts--recovery).
+  plus a paste-ready prompt for a local coding agent, and exits `2`. The report names the
+  operation id, how far the rebase got (`commit 12 of 44`, with the commit being replayed), the
+  **kind** of each collision (`both-modified`, `deleted-by-us`, …), and the version on each side
+  when `mcrepo.sh` or `mcrepo.yaml` is involved. After the files are resolved and staged,
+  **re-run `mcrepo rebase`** — it finishes the paused rebases and restores auto-stashed changes —
+  see [Conflicts & Recovery](#conflicts--recovery).
+- **Generated-artifact collisions are resolved automatically** (by removing the file) when the
+  path both matches a known generated shape (`+-tests/artifacts/`, `__pycache__/`, `*.pyc`,
+  `+-tests/.runtime/`) *and* the repo's own `.gitignore` covers it. Machine output carries no
+  reviewable intent, so it should not cost a stop-and-re-run cycle. A repo that deliberately
+  versions such evidence has no matching ignore rule and keeps being asked. Disable with
+  `MCREPO_NO_AUTO_CLEAN=1`.
+- `rebase` refuses to rewrite a branch whose `origin/<branch>` holds commits the local branch
+  lacks: replaying would strand them and the later force-publish would delete them. Run
+  `mcrepo pull` first.
 - Rebasing rewrites local history, so an already-pushed branch will diverge from its remote.
-  mcrepo flags those branches at the end and tells you to run `mcrepo push` — which auto
-  force-with-leases them (see [Pushing](#pushing)); you do **not** need to force-push by hand.
+  mcrepo **records** what it rewrote (the remote tip it started from, the tip it produced) in
+  local git refs under `refs/mcrepo/prov/`, so the later push can prove the divergence is yours
+  even when conflict resolution changed the commits beyond recognition. It flags those branches
+  at the end and tells you to run `mcrepo push` — which force-with-leases them
+  (see [Pushing](#pushing)); you do **not** need to force-push by hand.
 - Without `--include-read`, read-mode repos sitting on the branch are listed with a hint instead
   of being silently stranded.
 - `mcrepo merge --rebase` still works as a deprecated alias and prints a deprecation warning.
@@ -323,6 +338,7 @@ Commit related changes across all dirty write repos (and the meta-context) as on
 ```bash
 mcrepo commit -m "message"          # coordinated commit across dirty write repos + meta-context
 mcrepo commit --include-read -m ".."# also include read-mode repos
+mcrepo commit --include-artifacts -m ".." # also commit generated artifacts (off by default)
 mcrepo commit --revert              # peel the newest coordinated commit off HEAD (reset --hard HEAD~1)
 mcrepo commit --reset               # discard uncommitted changes across all target repos
 ```
@@ -330,6 +346,13 @@ mcrepo commit --reset               # discard uncommitted changes across all tar
 Behavior details:
 
 - Each coordinated commit gets a subject `mcrepo commit #N @<batch-id>: <message>` so the group can be recognized later.
+- **Generated artifacts are left out.** Paths matching `+-tests/artifacts/`, `+-tests/.runtime/`,
+  `__pycache__/` or `*.pyc` are not staged; the skipped paths are always listed by name, never
+  dropped silently, and the files stay untouched on disk. The reason is downstream: once machine
+  output is in history, every rebase that crosses those commits replays it as conflicts that carry
+  no reviewable decision. Pass `--include-artifacts` when you deliberately version test evidence.
+  `mcrepo doctor` reports artifacts that are *already* tracked (a `.gitignore` rule does not
+  untrack them) and prints the `git rm -r --cached` needed to stop the bleeding.
 - `--revert` only peels repos whose HEAD carries the same `#N` **on the same branch and with the same batch id** — repos on other branches or with mismatched batch ids are skipped (override with `--force`). It refuses without `--force` when the commit is already pushed.
 - `--revert`/`--reset` are destructive; non-interactive runs require `--force`.
 
@@ -414,29 +437,50 @@ mcrepo push -m "message"    # also commit dirty write-mode repos before pushing
 mcrepo push --include-read  # also push read-mode repos (coordinated --include-read work)
 mcrepo push --no-fetch      # skip the safety fetch (faster, less safe)
 mcrepo push --no-force      # disable auto force-with-lease for rebased branches
+mcrepo push --approve-rebased alpha,bi-homepage   # reviewed override for an unprovable rewrite
 ```
 
 Behavior details:
 
 - Before pushing, mcrepo fetches `origin` for every push target (write-mode
   sub-repos plus meta-context). It then computes both **ahead** and **behind**
-  per repo.
+  per repo. A **failed** fetch disables force-publishing for that repo — a
+  stale remote-tracking ref must never authorize a rewrite.
 - **Rebased branches are auto-published.** After `mcrepo rebase`, a
   coordinated branch diverges from its already-pushed `origin/<branch>` (ahead
   *and* behind) purely because the rebase rewrote its commit hashes. mcrepo
-  proves this case by **patch-equivalence** — every commit the remote holds
-  also exists locally, as-is or in rebased form, so nothing can be lost — and
-  publishes it with
-  `git push --force-with-lease` (shown as `[REBASED -> force-push]` in the plan).
-  Because force-with-lease runs only after a fresh fetch, a remote that moved
-  since the fetch aborts the push instead of clobbering another machine's work.
-  Pass `--no-force` (or `--no-fetch`) to opt out.
+  establishes this in two ways, in this order:
+  1. **The rebase record** (`recorded-safe-rebase`) — mcrepo performed the
+     rewrite, so it wrote down the remote tip it started from and the tip it
+     produced. If the remote is still exactly where it was, and HEAD still
+     descends from the produced tip, the rewrite is provably yours. This is the
+     only evidence that survives conflict resolution.
+  2. **Patch-equivalence** (`safe-force`) — every commit the remote holds also
+     exists locally, as-is or in rebased form. Used when there is no record,
+     for example when the rebase happened on another device.
+  Either way it publishes with an **explicit** lease
+  (`--force-with-lease=refs/heads/<branch>:<observed-tip>`, shown as
+  `[REBASED -> force-push]` in the plan). Pinning the tip matters: a bare
+  `--force-with-lease` is re-read from the remote-tracking ref at push time, so
+  a background fetch — an editor's autofetch, a second mcrepo run — would
+  quietly renew the lease. With the tip pinned, anything landing on the remote
+  after the classification rejects the push. Pass `--no-force` (or
+  `--no-fetch`) to opt out. mcrepo never uses a plain `--force`.
 - If a target is behind in a way that is **not** a provable rebase (the remote
   already contains work mcrepo can't attribute to your rebase), `push` aborts
-  before any commit or push happens, suggests `mcrepo pull` / `mcrepo pull
-  --rebase`, and prints a paste-ready prompt you can hand to a local coding
-  agent to resolve the divergence. This avoids partial-success runs where the
-  first repos succeed and the rest get rejected mid-run.
+  before any commit or push happens, suggests `mcrepo pull`, and prints a
+  paste-ready prompt you can hand to a local coding agent to resolve the
+  divergence. This avoids partial-success runs where the first repos succeed
+  and the rest get rejected mid-run. Note `--no-fetch` is **not** a way past
+  this: it only skips the local check and also disables force-publishing, so
+  the remote rejects the push instead.
+- **`--approve-rebased <names>`** is the reviewed override for that case — the
+  usual reason is a rebase performed on another device, so no record exists on
+  this machine. It prints the remote tip, how many commits there would be
+  dropped, and your local tip, then publishes under a lease pinned to that
+  exact remote tip. It never degrades to a plain `--force`, and it applies only
+  to the named repos on this one run. Names are comma-separated; the workspace
+  itself is `(meta-context)`.
 - Failures from `git push` (auth, branch protection, hooks, non-fast-forward)
   are now printed verbatim above the summary so the cause is visible.
 - Without `-m` and in non-interactive context, dirty repos are skipped (not

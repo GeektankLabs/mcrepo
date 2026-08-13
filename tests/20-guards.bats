@@ -180,3 +180,283 @@ EOF
   [ "$status" -eq 0 ]
   ! grep -q "dirty" alpha/README.md
 }
+
+# --- Rebase provenance safety -------------------------------------------
+#
+# Provenance lets a conflict-resolved rebase be force-published. These guard
+# the boundary: it must never authorize a push once the remote has moved, and
+# it must not survive a rewrite mcrepo did not perform.
+
+@test "provenance never force-publishes over work pushed after the rebase" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  mcrepo branch feat-prov >/dev/null 2>&1
+  printf 'feature line\n' >alpha/README.md
+  git -C alpha add -A
+  git -C alpha commit -qm "feature work"
+  git -C alpha push -q -u origin feat-prov
+  advance_remote alpha "parent moved"
+
+  run mcrepo rebase
+  [ "$status" -eq 2 ]
+  printf 'parent moved\nfeature line\n' >alpha/README.md
+  git -C alpha add README.md
+  run mcrepo rebase
+  [ "$status" -eq 0 ]
+
+  # Another device publishes onto the now-stale remote branch AFTER the rebase.
+  b_clone="$BATS_TEST_TMPDIR/device-b-prov"
+  git clone -q -b feat-prov "$REMOTES_DIR/alpha.git" "$b_clone"
+  printf 'device B work\n' >"$b_clone/b.txt"
+  git -C "$b_clone" add -A
+  git -C "$b_clone" commit -qm "device B new work"
+  git -C "$b_clone" push -q origin feat-prov
+  b_tip="$(git -C "$b_clone" rev-parse HEAD)"
+
+  # The record no longer matches the remote, so it proves nothing.
+  run mcrepo push
+  [ "$status" -ne 0 ]
+  git -C alpha fetch -q origin
+  [ "$(git -C alpha rev-parse origin/feat-prov)" = "$b_tip" ]
+  run git -C alpha log --format=%s origin/feat-prov
+  assert_contains "$output" "device B new work"
+}
+
+@test "a rewrite mcrepo did not perform invalidates the record" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  mcrepo branch feat-inv >/dev/null 2>&1
+  printf 'feature line\n' >alpha/README.md
+  git -C alpha add -A
+  git -C alpha commit -qm "feature work"
+  git -C alpha push -q -u origin feat-inv
+  advance_remote alpha "parent moved"
+
+  run mcrepo rebase
+  [ "$status" -eq 2 ]
+  printf 'parent moved\nfeature line\n' >alpha/README.md
+  git -C alpha add README.md
+  run mcrepo rebase
+  [ "$status" -eq 0 ]
+
+  # The user rewrites history again by hand: HEAD no longer descends from the
+  # tip the rebase produced, so the record must stop authorizing a force-push.
+  git -C alpha reset -q --hard HEAD~1
+  printf 'hand written\n' >alpha/hand.txt
+  git -C alpha add -A
+  git -C alpha commit -qm "hand-rolled rewrite"
+
+  run mcrepo push
+  [ "$status" -ne 0 ]
+  assert_not_contains "$output" "force-push]"
+}
+
+@test "rebase refuses to strand commits the remote has and the branch lacks" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  mcrepo branch feat-unpulled >/dev/null 2>&1
+  printf 'feature line\n' >alpha/f.txt
+  git -C alpha add -A
+  git -C alpha commit -qm "feature work"
+  git -C alpha push -q -u origin feat-unpulled
+
+  # Another device adds work to the shared feature branch; we never pulled it.
+  b_clone="$BATS_TEST_TMPDIR/device-b-unpulled"
+  git clone -q -b feat-unpulled "$REMOTES_DIR/alpha.git" "$b_clone"
+  printf 'device B work\n' >"$b_clone/b.txt"
+  git -C "$b_clone" add -A
+  git -C "$b_clone" commit -qm "device B new work"
+  git -C "$b_clone" push -q origin feat-unpulled
+  b_tip="$(git -C "$b_clone" rev-parse HEAD)"
+  advance_remote alpha "parent moved"
+
+  run mcrepo rebase
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "mcrepo pull"
+  git -C alpha fetch -q origin
+  [ "$(git -C alpha rev-parse origin/feat-unpulled)" = "$b_tip" ]
+}
+
+@test "force-publishing always carries an explicit lease and never a plain --force" {
+  # Invariant over the source itself: a bare '--force' (or '-f') push would
+  # silently discard whatever is on the remote.
+  ! grep -nE 'git [^|]*push[^|]*--force([^-=]|$)' "$SANDBOX/mcrepo.sh"
+  ! grep -nE 'git [^|]*push +-f( |$)' "$SANDBOX/mcrepo.sh"
+  grep -q 'force-with-lease=' "$SANDBOX/mcrepo.sh"
+}
+
+# --- Workspace hygiene ---------------------------------------------------
+
+@test "coordinated commit leaves generated artifacts out and names them" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  mkdir -p "alpha/+-tests/artifacts/run-1" alpha/pkg/__pycache__
+  printf 'report\n' >"alpha/+-tests/artifacts/run-1/report.json"
+  printf 'bytes\n' >alpha/pkg/__pycache__/mod.cpython-311.pyc
+  printf 'real source\n' >alpha/src.txt
+
+  run mcrepo commit -m "real work"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "leaving out"
+  assert_contains "$output" "artifacts/run-1/report.json"
+
+  run git -C alpha ls-files
+  assert_contains "$output" "src.txt"
+  assert_not_contains "$output" "artifacts/run-1/report.json"
+  assert_not_contains "$output" "mod.cpython-311.pyc"
+  # The files themselves must survive on disk — this is a staging policy,
+  # not a delete.
+  [ -f "alpha/+-tests/artifacts/run-1/report.json" ]
+}
+
+@test "--include-artifacts commits the generated paths on purpose" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  mkdir -p "alpha/+-tests/artifacts/run-1"
+  printf 'evidence\n' >"alpha/+-tests/artifacts/run-1/report.json"
+
+  run mcrepo commit -m "release evidence" --include-artifacts
+  [ "$status" -eq 0 ]
+  assert_not_contains "$output" "leaving out"
+  run git -C alpha ls-files
+  assert_contains "$output" "artifacts/run-1/report.json"
+}
+
+@test "ordinary source changes are untouched by the artifact guard" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  printf 'plain change\n' >>alpha/README.md
+  printf 'new file\n' >alpha/added.txt
+
+  run mcrepo commit -m "normal work"
+  [ "$status" -eq 0 ]
+  assert_not_contains "$output" "leaving out"
+  run git -C alpha ls-files
+  assert_contains "$output" "added.txt"
+}
+
+@test "doctor reports tracked generated artifacts and stays quiet when clean" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  run mcrepo doctor
+  assert_contains "$output" "no generated artifacts tracked"
+
+  # Force them into history the way a pre-guard workspace would have.
+  mkdir -p "alpha/+-tests/artifacts/run-1"
+  printf 'report\n' >"alpha/+-tests/artifacts/run-1/report.json"
+  git -C alpha add -A -f
+  git -C alpha commit -qm "legacy artifact commit"
+
+  run mcrepo doctor
+  assert_contains "$output" "tracks 1 generated file"
+  assert_contains "$output" "rm -r --cached"
+}
+
+@test "rebase auto-resolves generated-artifact conflicts without a stop" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  # Ignore rule must exist in the repo — that is the second half of the proof.
+  printf '+-tests/artifacts/\n' >alpha/.gitignore
+  mkdir -p "alpha/+-tests/artifacts/run-1"
+  printf 'from main\n' >"alpha/+-tests/artifacts/run-1/report.json"
+  git -C alpha add -A -f
+  git -C alpha commit -qm "baseline artifact on main"
+  git -C alpha push -q origin main
+
+  mcrepo branch feat-art >/dev/null 2>&1
+  printf 'from feature\n' >"alpha/+-tests/artifacts/run-1/report.json"
+  git -C alpha add -A -f
+  git -C alpha commit -qm "feature rewrites the artifact"
+
+  # main rewrites the SAME artifact line: a real conflict with no decision in it.
+  seed="$BATS_TEST_TMPDIR/seed-alpha"
+  git -C "$seed" pull -q --no-rebase "$REMOTES_DIR/alpha.git" main
+  printf 'from main again\n' >"$seed/+-tests/artifacts/run-1/report.json"
+  git -C "$seed" add -A -f
+  git -C "$seed" commit -qm "main rewrites the artifact"
+  git -C "$seed" push -q "$REMOTES_DIR/alpha.git" main
+
+  run mcrepo rebase
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "auto-resolved"
+  assert_contains "$output" "✓ Rebase complete"
+  [ -z "$(git -C alpha ls-files -u)" ]
+}
+
+@test "auto-clean never touches a conflict the workspace does not call generated" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  # Same path shape, but NO ignore rule: this repo versions its evidence.
+  mkdir -p "alpha/+-tests/artifacts/run-1"
+  printf 'from main\n' >"alpha/+-tests/artifacts/run-1/report.json"
+  git -C alpha add -A -f
+  git -C alpha commit -qm "baseline artifact on main"
+  git -C alpha push -q origin main
+
+  mcrepo branch feat-keep >/dev/null 2>&1
+  printf 'from feature\n' >"alpha/+-tests/artifacts/run-1/report.json"
+  git -C alpha add -A -f
+  git -C alpha commit -qm "feature rewrites the artifact"
+
+  seed="$BATS_TEST_TMPDIR/seed-alpha"
+  git -C "$seed" pull -q --no-rebase "$REMOTES_DIR/alpha.git" main
+  printf 'from main again\n' >"$seed/+-tests/artifacts/run-1/report.json"
+  git -C "$seed" add -A -f
+  git -C "$seed" commit -qm "main rewrites the artifact"
+  git -C "$seed" push -q "$REMOTES_DIR/alpha.git" main
+
+  run mcrepo rebase
+  [ "$status" -eq 2 ]
+  assert_not_contains "$output" "auto-resolved"
+  assert_contains "$output" "Rebase conflicts"
+  [ -n "$(git -C alpha ls-files -u)" ]
+}
+
+@test "--approve-rebased publishes an unprovable rewrite, but only under a pinned lease" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  mcrepo branch feat-appr >/dev/null 2>&1
+  printf 'feature work\n' >alpha/f.txt
+  git -C alpha add -A
+  git -C alpha commit -qm "feature work"
+  git -C alpha push -q -u origin feat-appr
+  advance_remote alpha "parent moved"
+  run mcrepo rebase
+  [ "$status" -eq 0 ]
+
+  # Device B stacks work on the stale remote, so nothing can prove safety.
+  b_clone="$BATS_TEST_TMPDIR/device-b-appr"
+  git clone -q -b feat-appr "$REMOTES_DIR/alpha.git" "$b_clone"
+  printf 'device B\n' >"$b_clone/b.txt"
+  git -C "$b_clone" add -A
+  git -C "$b_clone" commit -qm "device B new work"
+  git -C "$b_clone" push -q origin feat-appr
+
+  # Unapproved: refused, and the refusal advertises the override.
+  run mcrepo push
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "--approve-rebased"
+
+  # Approved: published, and the report states what is being dropped.
+  local_tip="$(git -C alpha rev-parse HEAD)"
+  run mcrepo push --approve-rebased alpha
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "approved for force-publishing"
+  assert_contains "$output" "will be dropped"
+  git -C alpha fetch -q origin
+  [ "$(git -C alpha rev-parse origin/feat-appr)" = "$local_tip" ]
+}
+
+@test "--approve-rebased refuses to combine with flags that would weaken it" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  run mcrepo push --approve-rebased alpha --no-force
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "contradict"
+  run mcrepo push --approve-rebased alpha --no-fetch
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "fresh fetch"
+  run mcrepo push --approve-rebased
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "requires repo names"
+}
