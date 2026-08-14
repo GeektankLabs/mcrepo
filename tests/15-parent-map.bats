@@ -219,3 +219,46 @@ commit_meta_state() {
   # The branches still exist, so their fork points are still worth knowing.
   grep -q 'parent: feature:main' mcrepo.yaml
 }
+
+# --- parent map merging across machines ----------------------------------
+#
+# Two machines record parents for different branches in the same 'parent:'
+# line. Merged textually that is a conflict; merged by key both survive.
+
+@test "parent_map_keys lists only real map entries" {
+  source_mcrepo_lib
+  [ "$(parent_map_keys "")" = "" ]
+  [ "$(parent_map_keys "a:b")" = "a" ]
+  [ "$(parent_map_keys "a:b,c:d" | tr '\n' ' ')" = "a c " ]
+  # A pre-0.9 positional value carries no keys, so it cannot inject junk.
+  [ "$(parent_map_keys "main,main")" = "" ]
+}
+
+@test "parent_map_merge3 merges branch->parent records key by key" {
+  source_mcrepo_lib
+
+  # Untouched on both sides.
+  [ "$(parent_map_merge3 "a:b" "a:b" "a:b" "" "p")" = "a:b" ]
+  # Added only by us / only by them: both survive.
+  [ "$(parent_map_merge3 "" "a:b" "" "" "p")" = "a:b" ]
+  [ "$(parent_map_merge3 "" "" "a:b" "" "p")" = "a:b" ]
+  # Unrelated additions on each side are unioned, not collided.
+  run parent_map_merge3 "" "x:main" "y:main" "" "p"
+  assert_contains "$output" "x:main"
+  assert_contains "$output" "y:main"
+  # We deleted it, they left it alone -> stays deleted.
+  [ "$(parent_map_merge3 "a:b" "" "a:b" "" "p")" = "" ]
+  # Both deleted it.
+  [ "$(parent_map_merge3 "a:b" "" "" "" "p")" = "" ]
+  # Both changed it: origin wins for an ordinary key...
+  [ "$(parent_map_merge3 "a:b" "a:ours" "a:theirs" "" "p")" = "a:theirs" ]
+  # ...but the active branch is machine-local, so ours wins there.
+  [ "$(parent_map_merge3 "a:b" "a:ours" "a:theirs" "a" "p")" = "a:ours" ]
+}
+
+@test "a both-changed parent record on a non-active branch is reported" {
+  source_mcrepo_lib
+  MANIFEST_MERGE_WARNINGS=0
+  run parent_map_merge3 "a:b" "a:ours" "a:theirs" "other" "parent of 'alpha'"
+  assert_contains "$output" "a:theirs"
+}

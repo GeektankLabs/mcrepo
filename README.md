@@ -387,6 +387,20 @@ stragglers — the same resume model as `rebase` and `merge`.
 
 Behavior details:
 
+- **`mcrepo.yaml` never conflicts.** The manifest is machine-owned — mcrepo rewrites it
+  canonically on every coordinated command, and `branch:`/`parent:`/`meta-parent:` change with
+  each of them. Two machines therefore edit the *same lines* without either of them touching
+  code, which is not something git's textual merge can settle. So `pull` takes the manifest out
+  of the operation before it starts (parking your version in the object database, never in the
+  stash), lets the pull run, then merges it back **field by field** against the pre-pull `HEAD`:
+  `branch:` is what is checked out *here*, so a local value always wins; `parent:` maps merge
+  key by key, so one machine recording `feature-x:main` and another recording `other:main` both
+  survive; every other field is a normal three-way merge, and a field genuinely changed on both
+  sides keeps origin's value and says so by name. A local manifest that says nothing the
+  committed one does not — the formatting drift `mcrepo update` used to leave behind — is
+  discarded outright, so a machine that only consumes code stays clean. If the pull pauses on a
+  conflict, your manifest stays parked and the re-run applies it. Opt out with
+  `MCREPO_NO_MANIFEST_MERGE=1`.
 - **`--ff-only` is the conservative mode**: fast-forward only, dirty sub-repos are skipped
   (fetch only), nothing is ever stashed or rebased. When a branch has genuinely diverged
   (another device pushed), it names the repos and points back to plain `pull`.
@@ -739,7 +753,7 @@ git config --get-urlmatch credential.helper https://github.com
 
 ## mcrepo.yaml Reference
 
-`mcrepo.yaml` is machine-owned: mcrepo rewrites it on every change (comments are not preserved). Schema:
+`mcrepo.yaml` is machine-owned: mcrepo rewrites it on every change (comments are not preserved). The rewrite only lands when the canonical form actually differs, so commands that change nothing leave the file — and your working tree — untouched. Because it is also a shared, committed file, `mcrepo pull` reconciles it field by field instead of merging it textually ([details](#pulling)). Schema:
 
 ```yaml
 schema: 2                     # manifest format version (checked on load)
@@ -770,6 +784,7 @@ Accepted URL transports: `https`, `ssh`, `git`, `file`, absolute/relative local 
 - `MCREPO_NO_SHELL_INSTALL=1` — behave like `init --no-shell-install`
 - `MCREPO_SKIP_VSCODE=1` — skip VS Code extension install and window reloads (CI/tests)
 - `MCREPO_ASSUME_YES=1` — answer every confirmation prompt with yes (CI escape hatch)
+- `MCREPO_NO_MANIFEST_MERGE=1` — do not reconcile `mcrepo.yaml` during `pull`; auto-stash it like any other file (pre-0.9.2 behavior)
 
 ## Exit Codes
 

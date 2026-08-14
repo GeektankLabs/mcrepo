@@ -316,3 +316,218 @@ setup() {
   run mcrepo pull
   [ "$status" -eq 0 ]
 }
+
+# --- mcrepo.yaml reconciliation across machines ---------------------------
+#
+# The manifest is committed and shared, but mcrepo rewrites it canonically on
+# every coordinated command, so two machines edit the SAME lines without either
+# of them touching code. Letting git merge that textually produced conflicts in
+# mcrepo's own state file. pull now takes it out of the stash entirely and
+# merges it field by field.
+
+# A workspace whose meta-context has an origin, plus one sub-repo.
+meta_workspace() {
+  init_workspace_with_repos alpha beta
+  git_manage_workspace
+  make_meta_remote
+}
+
+@test "a dirty mcrepo.yaml never reaches the stash and never conflicts on pull" {
+  meta_workspace
+  # Local machine records coordination state -> manifest is dirty, exactly the
+  # 'branch:'/'parent:' churn that collided with origin before.
+  mcrepo branch vm-archive >/dev/null 2>&1
+  git checkout -q main
+  [ -n "$(git status --porcelain -- mcrepo.yaml)" ]
+  # Other machine edits a description and pushes it to main.
+  device_b_meta sed -i.bak 's|description: ""|description: "from device B"|' mcrepo.yaml
+
+  run mcrepo pull
+  [ "$status" -eq 0 ]
+  assert_not_contains "$output" "Stash conflicts"
+  assert_not_contains "$output" "restoring auto-stashed changes conflicted"
+
+  run cat mcrepo.yaml
+  assert_not_contains "$output" "<<<<<<<"
+  assert_contains "$output" "from device B"
+
+  run git stash list
+  [ -z "$output" ]
+}
+
+@test "pull --ff-only also keeps mcrepo.yaml out of the auto-stash" {
+  meta_workspace
+  mcrepo branch feature-x >/dev/null 2>&1
+  git checkout -q main
+  device_b_meta sed -i.bak 's|description: ""|description: "ff-only device B"|' mcrepo.yaml
+
+  run mcrepo pull --ff-only
+  [ "$status" -eq 0 ]
+  assert_not_contains "$output" "Stash conflicts"
+  run cat mcrepo.yaml
+  assert_not_contains "$output" "<<<<<<<"
+  assert_contains "$output" "ff-only device B"
+}
+
+@test "parent maps merge key by key instead of colliding textually" {
+  meta_workspace
+  # Local records feature-x's parent...
+  mcrepo branch feature-x >/dev/null 2>&1
+  git checkout -q main
+  # ...device B records a different branch's parent in the same lines.
+  device_b_meta sed -i.bak 's|^repos:|meta-parent: other:main\nrepos:|' mcrepo.yaml
+
+  run mcrepo pull
+  [ "$status" -eq 0 ]
+  run cat mcrepo.yaml
+  assert_contains "$output" "feature-x:main"
+  assert_contains "$output" "other:main"
+  # The pre-0.9 positional corruption must never reappear.
+  assert_not_contains "$output" "main,main"
+}
+
+@test "a repo added on another device arrives; a local-only addition survives" {
+  meta_workspace
+  local gamma_url
+  gamma_url="$(make_remote gamma)"
+  device_b_meta sed -i.bak "s|^repos:|repos:\n  - url: $gamma_url\n    name: gamma\n    mode: read\n    description: \"\"\n    localpath: ./gamma|" mcrepo.yaml
+
+  local delta_url
+  delta_url="$(make_remote delta)"
+  mcrepo add "$delta_url" delta >/dev/null
+
+  run mcrepo pull
+  [ "$status" -eq 0 ]
+  run cat mcrepo.yaml
+  assert_contains "$output" "name: gamma"
+  assert_contains "$output" "name: delta"
+  assert_contains "$output" "name: alpha"
+}
+
+@test "a repo removed on another device is removed locally too" {
+  meta_workspace
+  mcrepo branch feature-x >/dev/null 2>&1
+  git checkout -q main
+  device_b_meta "$SANDBOX/mcrepo.sh" remove beta --force --keep-files
+
+  run mcrepo pull
+  [ "$status" -eq 0 ]
+  run cat mcrepo.yaml
+  assert_not_contains "$output" "name: beta"
+  assert_contains "$output" "name: alpha"
+}
+
+@test "a field changed on both sides keeps origin's value and names the field" {
+  meta_workspace
+  sed -i.bak 's|description: ""|description: "local text"|' mcrepo.yaml && rm -f mcrepo.yaml.bak
+  device_b_meta sed -i.bak 's|description: ""|description: "origin text"|' mcrepo.yaml
+
+  run mcrepo pull
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "description of"
+  assert_contains "$output" "keeping origin's"
+  run cat mcrepo.yaml
+  assert_contains "$output" "origin text"
+  assert_not_contains "$output" "local text"
+}
+
+@test "manifest drift left by 'mcrepo update' leaves the meta-context clean after pull" {
+  meta_workspace
+  # Reproduce exactly what the old cmd_post_update_migrate left behind: a
+  # canonical rewrite of a manifest that carries no extra information.
+  sed -i.bak '/^schema:/d' mcrepo.yaml && rm -f mcrepo.yaml.bak
+  git add -A && git commit -qm "manifest without schema stamp" && git push -q origin main
+  MCREPO_SUPPRESS_VERSION_BANNER=1 "$SANDBOX/mcrepo.sh" --post-update-migrate 0.9.0 0.9.2 >/dev/null 2>&1 || true
+  [ -n "$(git status --porcelain -- mcrepo.yaml)" ]
+
+  device_b_meta sh -c 'printf "device B note\n" > notes.txt'
+
+  run mcrepo pull
+  [ "$status" -eq 0 ]
+  assert_not_contains "$output" "Stash conflicts"
+  # Nothing left to commit: the local dirt said nothing origin did not.
+  run git status --porcelain -- mcrepo.yaml
+  [ -z "$output" ]
+  [ -f notes.txt ]
+}
+
+@test "an unrelated dirty file is still carried by the auto-stash" {
+  meta_workspace
+  printf 'work in progress\n' >scratch.txt
+  sed -i.bak 's|description: ""|description: "local text"|' mcrepo.yaml && rm -f mcrepo.yaml.bak
+  device_b_meta sh -c 'printf "device B note\n" > notes.txt'
+
+  run mcrepo pull
+  [ "$status" -eq 0 ]
+  [ -f notes.txt ]
+  run cat scratch.txt
+  assert_contains "$output" "work in progress"
+  run cat mcrepo.yaml
+  assert_contains "$output" "local text"
+}
+
+@test "a rebase conflict parks mcrepo.yaml; resolving and re-running applies it" {
+  meta_workspace
+  mcrepo branch feature-x >/dev/null 2>&1
+  git checkout -q main
+  printf 'device A line\n' >conflict.txt
+  # Commit ONLY the conflict source: mcrepo.yaml must stay dirty so the pull has
+  # something to park while the rebase is paused.
+  git add conflict.txt && git commit -qm "device A conflict source"
+  [ -n "$(git status --porcelain -- mcrepo.yaml)" ]
+  device_b_meta sh -c 'printf "device B line\n" > conflict.txt'
+
+  run mcrepo pull
+  [ "$status" -eq 2 ]
+  # The manifest is parked in the object database, not smeared with markers.
+  run git rev-parse -q --verify refs/mcrepo/manifest-ours
+  [ "$status" -eq 0 ]
+  run cat mcrepo.yaml
+  assert_not_contains "$output" "<<<<<<<"
+
+  printf 'resolved\n' >conflict.txt
+  git add conflict.txt
+  run mcrepo pull
+  [ "$status" -eq 0 ]
+  run git rev-parse -q --verify refs/mcrepo/manifest-ours
+  [ "$status" -ne 0 ]
+  run cat mcrepo.yaml
+  assert_contains "$output" "feature-x:main"
+}
+
+@test "pull --reset discards local manifest state and leaves no parking ref" {
+  meta_workspace
+  sed -i.bak 's|description: ""|description: "local text"|' mcrepo.yaml && rm -f mcrepo.yaml.bak
+  device_b_meta sed -i.bak 's|description: ""|description: "origin text"|' mcrepo.yaml
+
+  run mcrepo pull --reset --yes
+  [ "$status" -eq 0 ]
+  run cat mcrepo.yaml
+  assert_contains "$output" "origin text"
+  assert_not_contains "$output" "local text"
+  run git rev-parse -q --verify refs/mcrepo/manifest-ours
+  [ "$status" -ne 0 ]
+}
+
+@test "a manifest from a newer schema parks instead of being downgraded" {
+  meta_workspace
+  sed -i.bak 's|description: ""|description: "local text"|' mcrepo.yaml && rm -f mcrepo.yaml.bak
+  device_b_meta sed -i.bak 's|^schema: .*|schema: 99|' mcrepo.yaml
+
+  run mcrepo pull
+  assert_contains "$output" "newer manifest schema"
+  run git rev-parse -q --verify refs/mcrepo/manifest-ours
+  [ "$status" -eq 0 ]
+  run cat mcrepo.yaml
+  assert_contains "$output" "schema: 99"
+}
+
+@test "MCREPO_NO_MANIFEST_MERGE=1 restores the old stash behaviour" {
+  meta_workspace
+  sed -i.bak 's|description: ""|description: "local text"|' mcrepo.yaml && rm -f mcrepo.yaml.bak
+  device_b_meta sed -i.bak 's|description: ""|description: "origin text"|' mcrepo.yaml
+
+  MCREPO_NO_MANIFEST_MERGE=1 run mcrepo pull
+  run git rev-parse -q --verify refs/mcrepo/manifest-ours
+  [ "$status" -ne 0 ]
+}

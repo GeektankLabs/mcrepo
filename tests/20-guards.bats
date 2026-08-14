@@ -460,3 +460,30 @@ EOF
   [ "$status" -ne 0 ]
   assert_contains "$output" "requires repo names"
 }
+
+@test "save_repos/load_repos round-trip through an explicit file path" {
+  init_workspace_with_repos alpha
+  source_mcrepo_lib
+  desc='He said "hi" and C:\path\stuff'
+  load_repos
+  REPO_DESCRIPTIONS[0]="$desc"
+  save_repos "$BATS_TEST_TMPDIR/out.yaml"
+  [ -f "$BATS_TEST_TMPDIR/out.yaml" ]
+  load_repos "$BATS_TEST_TMPDIR/out.yaml"
+  [ "${REPO_DESCRIPTIONS[0]}" = "$desc" ]
+  [ "${REPO_NAMES[0]}" = "alpha" ]
+  # Reading a file that does not exist fails instead of silently using defaults.
+  run load_repos "$BATS_TEST_TMPDIR/missing.yaml"
+  [ "$status" -ne 0 ]
+}
+
+@test "save_repos leaves the manifest untouched when nothing changed" {
+  init_workspace_with_repos alpha
+  local before after
+  before="$(git hash-object mcrepo.yaml 2>/dev/null || md5 -q mcrepo.yaml)"
+  # A mode switch that changes nothing still does a full load+save round-trip.
+  mcrepo read alpha >/dev/null
+  mcrepo read alpha >/dev/null
+  after="$(git hash-object mcrepo.yaml 2>/dev/null || md5 -q mcrepo.yaml)"
+  [ "$before" = "$after" ]
+}

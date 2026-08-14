@@ -69,6 +69,35 @@ git_manage_workspace() {
   git commit -qm "workspace initial commit"
 }
 
+# Give the meta-context itself a bare origin and push the current state to it.
+# Call after git_manage_workspace + whatever repos the test needs.
+make_meta_remote() {
+  git init -q --bare "$REMOTES_DIR/meta.git"
+  git add -A
+  git commit -qm "workspace state before meta remote" >/dev/null 2>&1 || true
+  git remote add origin "file://$REMOTES_DIR/meta.git"
+  git push -q -u origin main
+}
+
+# Act as the SECOND machine: clone the meta origin once, run a callback inside
+# that clone, then commit and push. Used to produce manifest edits that arrive
+# via 'mcrepo pull' without the local sandbox ever seeing them.
+device_b_meta() {
+  local clone="$BATS_TEST_TMPDIR/device-b-meta"
+  [ -d "$clone" ] || git clone -q "$REMOTES_DIR/meta.git" "$clone"
+  ( cd "$clone" && "$@" && rm -f ./*.bak && git add -A && \
+    git commit -qm "device B manifest change" && git push -q origin main )
+}
+
+# Source mcrepo.sh's function definitions without running main(), for unit
+# tests of individual helpers. The script ends with 'main "$@"' + exit guard.
+source_mcrepo_lib() {
+  local lib="$BATS_TEST_TMPDIR/mcrepo-lib.sh"
+  sed '/^main "\$@"$/,$d' "$SANDBOX/mcrepo.sh" >"$lib"
+  # shellcheck disable=SC1090  # generated path, resolved at runtime
+  . "$lib"
+}
+
 # Advance a repo's remote main by committing new README.md content via the
 # seed clone. Overwrites line 1, so a differing local edit to README.md
 # produces a REAL merge/rebase conflict.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.9.1"
+MCREPO_VERSION="0.9.2"
 # Manifest (mcrepo.yaml) format version. Bump when the manifest schema changes
 # incompatibly; cmd_post_update_migrate migrates older manifests forward.
 MCREPO_SCHEMA_VERSION="2"
@@ -590,7 +590,11 @@ ensure_repos_file_exists() {
   fi
 }
 
+# All manifest parsers take an optional file argument and default to $REPOS_FILE.
+# The argument exists so 'mcrepo pull' can read three versions of the manifest at
+# once (ours / base / theirs) when reconciling it — see _manifest_reconcile.
 parse_repos_tsv() {
+  local file="${1:-$REPOS_FILE}"
   awk -v SEP=$'\x1f' '
     function trim(s) {
       gsub(/^[ \t]+|[ \t]+$/, "", s)
@@ -697,10 +701,11 @@ parse_repos_tsv() {
     END {
       emit()
     }
-  ' "$REPOS_FILE"
+  ' "$file"
 }
 
 parse_organization() {
+  local file="${1:-$REPOS_FILE}"
   awk '
     function trim(s) {
       gsub(/^[ \t]+|[ \t]+$/, "", s)
@@ -721,10 +726,11 @@ parse_organization() {
         exit
       }
     }
-  ' "$REPOS_FILE"
+  ' "$file"
 }
 
 parse_locations() {
+  local file="${1:-$REPOS_FILE}"
   awk '
     function trim(s) {
       gsub(/^[ \t]+|[ \t]+$/, "", s)
@@ -745,10 +751,11 @@ parse_locations() {
         exit
       }
     }
-  ' "$REPOS_FILE"
+  ' "$file"
 }
 
 parse_branch() {
+  local file="${1:-$REPOS_FILE}"
   awk '
     function trim(s) {
       gsub(/^[ \t]+|[ \t]+$/, "", s)
@@ -769,11 +776,12 @@ parse_branch() {
         exit
       }
     }
-  ' "$REPOS_FILE"
+  ' "$file"
 }
 
 # Parse the top-level 'schema:' field from mcrepo.yaml (manifest format version).
 parse_schema_version() {
+  local file="${1:-$REPOS_FILE}"
   awk '
     {
       line = $0
@@ -784,12 +792,13 @@ parse_schema_version() {
         exit
       }
     }
-  ' "$REPOS_FILE"
+  ' "$file"
 }
 
 # Parse the top-level 'meta-parent:' field from mcrepo.yaml.
 # Returns the comma-separated parent branch stack for the meta-context repo.
 parse_meta_parent() {
+  local file="${1:-$REPOS_FILE}"
   awk '
     function trim(s) {
       gsub(/^[ \t]+|[ \t]+$/, "", s)
@@ -810,10 +819,11 @@ parse_meta_parent() {
         exit
       }
     }
-  ' "$REPOS_FILE"
+  ' "$file"
 }
 
 parse_meta_upstream() {
+  local file="${1:-$REPOS_FILE}"
   awk '
     function trim(s) {
       gsub(/^[ \t]+|[ \t]+$/, "", s)
@@ -834,7 +844,7 @@ parse_meta_upstream() {
         exit
       }
     }
-  ' "$REPOS_FILE"
+  ' "$file"
 }
 
 REPO_URLS=()
@@ -874,8 +884,16 @@ is_repo_local() {
   esac
 }
 
+# Load a manifest into the REPO_* arrays and the scalar globals.
+# With no argument this reads (and auto-creates) $REPOS_FILE and always succeeds —
+# 40+ call sites rely on that under 'set -e'. With an explicit file it reads that
+# file instead and returns 1 when it does not exist.
 load_repos() {
-  ensure_repos_file_exists
+  local file="${1:-$REPOS_FILE}"
+  if [ "$#" -eq 0 ] || [ "$file" = "$REPOS_FILE" ]; then
+    ensure_repos_file_exists
+  fi
+  [ -f "$file" ] || return 1
   REPO_URLS=()
   REPO_NAMES=()
   REPO_MODES=()
@@ -891,23 +909,23 @@ load_repos() {
   META_UPSTREAM=""
 
   local manifest_schema
-  manifest_schema="$(parse_schema_version || true)"
+  manifest_schema="$(parse_schema_version "$file" || true)"
   if [ -n "$manifest_schema" ] && [ "$manifest_schema" != "$MCREPO_SCHEMA_VERSION" ]; then
     case "$manifest_schema" in
-      *[!0-9]*) warn "Ignoring unparsable schema value in $REPOS_FILE: '$manifest_schema'" ;;
+      *[!0-9]*) warn "Ignoring unparsable schema value in $file: '$manifest_schema'" ;;
       *)
         if [ "$manifest_schema" -gt "$MCREPO_SCHEMA_VERSION" ]; then
-          die "$REPOS_FILE uses manifest schema $manifest_schema, but this mcrepo only understands schema $MCREPO_SCHEMA_VERSION. Run 'mcrepo update' first."
+          die "$file uses manifest schema $manifest_schema, but this mcrepo only understands schema $MCREPO_SCHEMA_VERSION. Run 'mcrepo update' first."
         fi
         ;;
     esac
   fi
 
-  ORGANIZATION="$(parse_organization || true)"
-  LOCATIONS="$(parse_locations || true)"
-  GLOBAL_BRANCH="$(parse_branch || true)"
-  META_PARENT="$(parse_meta_parent || true)"
-  META_UPSTREAM="$(parse_meta_upstream || true)"
+  ORGANIZATION="$(parse_organization "$file" || true)"
+  LOCATIONS="$(parse_locations "$file" || true)"
+  GLOBAL_BRANCH="$(parse_branch "$file" || true)"
+  META_PARENT="$(parse_meta_parent "$file" || true)"
+  META_UPSTREAM="$(parse_meta_upstream "$file" || true)"
 
   # Convert pre-0.9 positional stacks on the way in, so every command sees a
   # branch→parent map regardless of how old the manifest is. Idempotent; the
@@ -942,14 +960,16 @@ load_repos() {
     REPO_LOCALS+=("$is_local")
     REPO_UPSTREAMS+=("${parsed_upstream:-}")
     REPO_REMOTES+=("${parsed_remotes:-}")
-  done < <(parse_repos_tsv)
+  done < <(parse_repos_tsv "$file")
 }
 
+# Write the in-memory manifest state to $REPOS_FILE, or to an explicit path.
 save_repos() {
   # Write to a same-directory temp file and rename into place: save_repos also
   # runs from EXIT traps during aborted coordinated operations, and a torn
   # write here would corrupt the workspace's single source of truth.
-  local tmp_file="$REPOS_FILE.tmp.$$"
+  local out_file="${1:-$REPOS_FILE}"
+  local tmp_file="$out_file.tmp.$$"
   {
     printf 'schema: %s\n' "$MCREPO_SCHEMA_VERSION"
     if [ -n "$ORGANIZATION" ]; then
@@ -998,7 +1018,15 @@ save_repos() {
       done
     fi
   } >"$tmp_file"
-  mv -f "$tmp_file" "$REPOS_FILE"
+  # Only touch the real file when the canonical form actually differs. save_repos
+  # rewrites the whole manifest, so an unconditional rename turned every no-op
+  # command into a working-tree modification — which then had to be stashed on the
+  # next 'mcrepo pull' and conflicted against the other machine's manifest edits.
+  if [ -f "$out_file" ] && cmp -s "$tmp_file" "$out_file"; then
+    rm -f "$tmp_file"
+    return 0
+  fi
+  mv -f "$tmp_file" "$out_file"
 }
 
 sync_organization_repos() {
@@ -1325,6 +1353,72 @@ parent_map_migrate() {
   printf '%s' "$active:$parent"
 }
 
+# Echo the branch keys of a map, one per line, in map order. A legacy positional
+# value ("main,main") has no "<branch>:<parent>" entries and so yields nothing,
+# which keeps it from injecting junk keys into parent_map_merge3.
+parent_map_keys() {
+  local rest="${1:-}"
+  local entry
+
+  while [ -n "$rest" ]; do
+    entry="${rest%%,*}"
+    if [ "$entry" = "$rest" ]; then
+      rest=""
+    else
+      rest="${rest#*,}"
+    fi
+    case "$entry" in
+      *:*) printf '%s\n' "${entry%%:*}" ;;
+    esac
+  done
+}
+
+# Three-way merge of two parent maps against their common base, key by key.
+#
+# The map is branch->parent state that mcrepo rewrites on every 'branch' and
+# 'merge', so two machines routinely hold different maps. Merging TEXTUALLY (what
+# git does) turns two unrelated recordings into a conflict and can even splice
+# them into a corrupt value; merging by key lets machine A's "feature-x:main" and
+# machine B's "other:main" both survive.
+#
+# Absent is modelled as the empty string, so add, change and remove are one rule.
+# <prefer> names the one key whose value is machine-local — the branch this
+# working copy is coordinating — where a genuine both-changed collision silently
+# keeps ours. Every other collision keeps theirs and warns.
+parent_map_merge3() {
+  local base="${1:-}" ours="${2:-}" theirs="${3:-}" prefer="${4:-}" label="${5:-parent}"
+  local result="" seen="" key b o t winner
+
+  for key in $(parent_map_keys "$theirs"; parent_map_keys "$ours"); do
+    case ",$seen," in
+      *",$key,"*) continue ;;
+    esac
+    seen="$seen,$key"
+
+    b="$(parent_map_get "$base" "$key")"
+    o="$(parent_map_get "$ours" "$key")"
+    t="$(parent_map_get "$theirs" "$key")"
+
+    if [ "$o" = "$t" ]; then
+      winner="$o"
+    elif [ "$o" = "$b" ]; then
+      winner="$t"
+    elif [ "$t" = "$b" ]; then
+      winner="$o"
+    elif [ -n "$prefer" ] && [ "$key" = "$prefer" ]; then
+      winner="$o"
+    else
+      winner="$t"
+      _manifest_warn "$label for '$key' recorded as '$o' here and '$t' on origin — keeping origin's"
+    fi
+
+    [ -n "$winner" ] || continue
+    result="$(parent_map_set "$result" "$key" "$winner")"
+  done
+
+  printf '%s' "$result"
+}
+
 # True when <ancestor> is reachable by walking up the recorded parents of
 # <branch>. Used to refuse an inverted record: moving UP the tree (feature ->
 # main) must never offer 'feature' as the parent of 'main', which would send a
@@ -1366,6 +1460,232 @@ has_deeper_parent_level() {
     return 0
   fi
   return 1
+}
+
+# ---------------------------------------------------------------------------
+# Manifest reconciliation
+#
+# mcrepo.yaml is machine-owned: save_repos rewrites the whole file canonically,
+# and 'branch'/'parent'/'meta-parent' change on every coordinated command. It is
+# also committed and shared, so two machines produce edits to the SAME lines
+# without either of them touching code. Letting git merge that textually — via
+# the auto-stash in 'mcrepo pull' or a rebase — produced conflicts in mcrepo's
+# own state file that the user could not meaningfully resolve by hand.
+#
+# Instead the manifest is taken out of the pull entirely and merged field by
+# field afterwards, using the pre-pull HEAD as the merge base.
+# ---------------------------------------------------------------------------
+
+# Set by the reconciler; read by cmd_pull's summary.
+MANIFEST_MERGE_WARNINGS=0
+MANIFEST_MERGE_NOTE=""
+# Set when the two sides have no common ancestor, which makes every differing
+# field look like a collision. Downgrades those to a silent theirs-wins.
+_MANIFEST_NO_BASE=0
+
+_manifest_warn() {
+  MANIFEST_MERGE_WARNINGS=$((MANIFEST_MERGE_WARNINGS + 1))
+  warn "  $REPOS_FILE: $*"
+}
+
+# Three-way merge of one scalar field. Echoes the winner.
+_3way() {
+  local base="${1:-}" ours="${2:-}" theirs="${3:-}" label="${4:-field}"
+
+  if [ "$ours" = "$theirs" ]; then printf '%s' "$ours"; return 0; fi
+  if [ "$ours" = "$base" ];   then printf '%s' "$theirs"; return 0; fi
+  if [ "$theirs" = "$base" ]; then printf '%s' "$ours"; return 0; fi
+  if [ "$_MANIFEST_NO_BASE" -eq 0 ]; then
+    _manifest_warn "$label changed on both sides ('$ours' here, '$theirs' on origin) — keeping origin's"
+  fi
+  printf '%s' "$theirs"
+}
+
+# Load one side of the merge into MF_SIDE_NAMES / MF_SIDE_RECS. Callers copy
+# those into their own fixed pair of arrays immediately after calling.
+MF_SIDE_NAMES=()
+MF_SIDE_RECS=()
+_manifest_side_load() {
+  local file="${1:-}"
+  local rec nm
+  MF_SIDE_NAMES=()
+  MF_SIDE_RECS=()
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  while IFS= read -r rec; do
+    nm="$(printf '%s' "$rec" | cut -d"$(printf '\037')" -f2)"
+    [ -n "$nm" ] || continue
+    MF_SIDE_NAMES+=("$nm")
+    MF_SIDE_RECS+=("$rec")
+  done < <(parse_repos_tsv "$file")
+}
+
+# Field <n> of a parse_repos_tsv record:
+# 1 url  2 name  3 mode  4 description  5 parent  6 local  7 upstream  8 remotes
+_mf_field() {
+  printf '%s' "$1" | cut -d"$(printf '\037')" -f"$2"
+}
+
+# Echo the 0-based index of <needle> in the remaining arguments, or return 1.
+_mf_index_in() {
+  local needle="$1"
+  shift
+  local i=0 x
+  for x in "$@"; do
+    if [ "$x" = "$needle" ]; then
+      printf '%s' "$i"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# _manifest_reconcile <base_file|""> <ours_file> <theirs_file> <out_file>
+#   rc 0  reconciled and written
+#   rc 2  theirs is unchanged from base, ours restored verbatim (nothing merged)
+#   rc 3  theirs uses a newer manifest schema — caller must not write
+#
+# NOTE: a real reconciliation round-trips through parse_repos_tsv, which knows
+# only the eight documented fields, so comments and unknown keys are dropped —
+# the same canonicalization save_repos always performs. The rc 2 fast path keeps
+# that from happening on ordinary pulls.
+_manifest_reconcile() {
+  local base_file="${1:-}" ours_file="$2" theirs_file="$3" out_file="$4"
+  local their_schema i idx rec nm
+
+  their_schema="$(parse_schema_version "$theirs_file" 2>/dev/null || true)"
+  case "$their_schema" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ "$their_schema" -gt "$MCREPO_SCHEMA_VERSION" ]; then
+        return 3
+      fi
+      ;;
+  esac
+
+  # The pull did not move the manifest: keep the local file exactly as it is.
+  if [ -n "$base_file" ] && [ -f "$base_file" ] && cmp -s "$base_file" "$theirs_file"; then
+    cp -f "$ours_file" "$out_file"
+    return 2
+  fi
+
+  _MANIFEST_NO_BASE=0
+  if [ -z "$base_file" ] || [ ! -f "$base_file" ]; then
+    _MANIFEST_NO_BASE=1
+    _manifest_warn "no common ancestor — merged by union, origin wins on differing fields"
+  fi
+
+  local -a base_names=() base_recs=() theirs_names=() theirs_recs=()
+  _manifest_side_load "$base_file"
+  base_names=(${MF_SIDE_NAMES[@]+"${MF_SIDE_NAMES[@]}"})
+  base_recs=(${MF_SIDE_RECS[@]+"${MF_SIDE_RECS[@]}"})
+  _manifest_side_load "$theirs_file"
+  theirs_names=(${MF_SIDE_NAMES[@]+"${MF_SIDE_NAMES[@]}"})
+  theirs_recs=(${MF_SIDE_RECS[@]+"${MF_SIDE_RECS[@]}"})
+
+  local b_org b_loc b_meta_parent b_meta_up t_org t_loc t_meta_parent t_meta_up
+  b_org=""; b_loc=""; b_meta_parent=""; b_meta_up=""
+  if [ "$_MANIFEST_NO_BASE" -eq 0 ]; then
+    b_org="$(parse_organization "$base_file" || true)"
+    b_loc="$(parse_locations "$base_file" || true)"
+    b_meta_parent="$(parse_meta_parent "$base_file" || true)"
+    b_meta_up="$(parse_meta_upstream "$base_file" || true)"
+  fi
+  t_org="$(parse_organization "$theirs_file" || true)"
+  t_loc="$(parse_locations "$theirs_file" || true)"
+  t_meta_parent="$(parse_meta_parent "$theirs_file" || true)"
+  t_meta_up="$(parse_meta_upstream "$theirs_file" || true)"
+
+  # Ours becomes the mutation target: the REPO_* arrays and scalars now hold it.
+  load_repos "$ours_file" || return 1
+
+  # 'branch:' is what is checked out HERE. It stays in the shared manifest and
+  # still seeds fresh clones, but a local value always beats origin's — the two
+  # machines are simply on different branches, which is not a conflict.
+  ORGANIZATION="$(_3way "$b_org" "$ORGANIZATION" "$t_org" "organization")"
+  LOCATIONS="$(_3way "$b_loc" "$LOCATIONS" "$t_loc" "locations")"
+  META_UPSTREAM="$(_3way "$b_meta_up" "$META_UPSTREAM" "$t_meta_up" "meta-upstream")"
+  META_PARENT="$(parent_map_merge3 "$b_meta_parent" "$META_PARENT" "$t_meta_parent" "$GLOBAL_BRANCH" "meta-parent")"
+
+  local -a new_urls=() new_names=() new_modes=() new_descs=()
+  local -a new_parents=() new_locals=() new_upstreams=() new_remotes=()
+  local o_idx b_idx t_rec b_rec o_url o_mode o_desc o_parent o_local o_up o_rem
+
+  # Theirs first, then ours-only, so the written file stays diff-minimal
+  # against origin and later pulls have less to reconcile.
+  if [ "${#theirs_names[@]}" -gt 0 ]; then
+    for i in "${!theirs_names[@]}"; do
+      nm="${theirs_names[$i]}"
+      t_rec="${theirs_recs[$i]}"
+      if ! o_idx="$(_mf_index_in "$nm" ${REPO_NAMES[@]+"${REPO_NAMES[@]}"})"; then
+        # Present on origin, absent here. Only a drop if WE removed it, which
+        # requires it to have been in the base.
+        if [ "$_MANIFEST_NO_BASE" -eq 0 ] && _mf_index_in "$nm" ${base_names[@]+"${base_names[@]}"} >/dev/null; then
+          continue
+        fi
+        new_urls+=("$(_mf_field "$t_rec" 1)")
+        new_names+=("$nm")
+        new_modes+=("$(_mf_field "$t_rec" 3)")
+        new_descs+=("$(_mf_field "$t_rec" 4)")
+        new_parents+=("$(_mf_field "$t_rec" 5)")
+        new_locals+=("$(_mf_field "$t_rec" 6)")
+        new_upstreams+=("$(_mf_field "$t_rec" 7)")
+        new_remotes+=("$(_mf_field "$t_rec" 8)")
+        continue
+      fi
+      b_rec=""
+      if b_idx="$(_mf_index_in "$nm" ${base_names[@]+"${base_names[@]}"})"; then
+        b_rec="${base_recs[$b_idx]}"
+      fi
+      o_url="${REPO_URLS[$o_idx]:-}"
+      o_mode="${REPO_MODES[$o_idx]:-}"
+      o_desc="${REPO_DESCRIPTIONS[$o_idx]:-}"
+      o_parent="${REPO_PARENTS[$o_idx]:-}"
+      o_local="${REPO_LOCALS[$o_idx]:-}"
+      o_up="${REPO_UPSTREAMS[$o_idx]:-}"
+      o_rem="${REPO_REMOTES[$o_idx]:-}"
+      new_urls+=("$(_3way "$(_mf_field "$b_rec" 1)" "$o_url" "$(_mf_field "$t_rec" 1)" "url of '$nm'")")
+      new_names+=("$nm")
+      new_modes+=("$(_3way "$(_mf_field "$b_rec" 3)" "$o_mode" "$(_mf_field "$t_rec" 3)" "mode of '$nm'")")
+      new_descs+=("$(_3way "$(_mf_field "$b_rec" 4)" "$o_desc" "$(_mf_field "$t_rec" 4)" "description of '$nm'")")
+      new_parents+=("$(parent_map_merge3 "$(_mf_field "$b_rec" 5)" "$o_parent" "$(_mf_field "$t_rec" 5)" "$GLOBAL_BRANCH" "parent of '$nm'")")
+      new_locals+=("$(_3way "$(_mf_field "$b_rec" 6)" "$o_local" "$(_mf_field "$t_rec" 6)" "local of '$nm'")")
+      new_upstreams+=("$(_3way "$(_mf_field "$b_rec" 7)" "$o_up" "$(_mf_field "$t_rec" 7)" "upstream of '$nm'")")
+      new_remotes+=("$(_3way "$(_mf_field "$b_rec" 8)" "$o_rem" "$(_mf_field "$t_rec" 8)" "remotes of '$nm'")")
+    done
+  fi
+
+  # Ours-only entries: keep a local addition ('mcrepo add' not yet pushed),
+  # drop one that origin deliberately removed.
+  if [ "${#REPO_NAMES[@]}" -gt 0 ]; then
+    for i in "${!REPO_NAMES[@]}"; do
+      nm="${REPO_NAMES[$i]}"
+      _mf_index_in "$nm" ${theirs_names[@]+"${theirs_names[@]}"} >/dev/null && continue
+      if [ "$_MANIFEST_NO_BASE" -eq 0 ] && _mf_index_in "$nm" ${base_names[@]+"${base_names[@]}"} >/dev/null; then
+        continue
+      fi
+      new_urls+=("${REPO_URLS[$i]:-}")
+      new_names+=("$nm")
+      new_modes+=("${REPO_MODES[$i]:-}")
+      new_descs+=("${REPO_DESCRIPTIONS[$i]:-}")
+      new_parents+=("${REPO_PARENTS[$i]:-}")
+      new_locals+=("${REPO_LOCALS[$i]:-}")
+      new_upstreams+=("${REPO_UPSTREAMS[$i]:-}")
+      new_remotes+=("${REPO_REMOTES[$i]:-}")
+    done
+  fi
+
+  REPO_URLS=(${new_urls[@]+"${new_urls[@]}"})
+  REPO_NAMES=(${new_names[@]+"${new_names[@]}"})
+  REPO_MODES=(${new_modes[@]+"${new_modes[@]}"})
+  REPO_DESCRIPTIONS=(${new_descs[@]+"${new_descs[@]}"})
+  REPO_PARENTS=(${new_parents[@]+"${new_parents[@]}"})
+  REPO_LOCALS=(${new_locals[@]+"${new_locals[@]}"})
+  REPO_UPSTREAMS=(${new_upstreams[@]+"${new_upstreams[@]}"})
+  REPO_REMOTES=(${new_remotes[@]+"${new_remotes[@]}"})
+
+  save_repos "$out_file"
+  return 0
 }
 
 clone_repo_if_needed() {
@@ -3172,6 +3492,33 @@ cmd_doctor() {
   fi
   log ""
 
+  # Manifest hygiene. mcrepo.yaml is shared across machines but rewritten
+  # canonically by save_repos, so a machine that only consumes code can still
+  # end up with a permanently modified manifest — which then collides with the
+  # other machine's manifest edits on every pull.
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if _manifest_pending .; then
+      warn "$REPOS_FILE: a local manifest version is parked from an interrupted pull."
+      warn "  Re-run 'mcrepo pull' to merge it back in."
+    elif [ -n "$(git -C . status --porcelain -- "$REPOS_FILE" 2>/dev/null)" ]; then
+      local _mf_head
+      _mf_head="$(mktemp)"
+      if git -C . show "HEAD:$REPOS_FILE" >"$_mf_head" 2>/dev/null && \
+         _manifest_same_semantics "$REPOS_FILE" "$_mf_head"; then
+        warn "$REPOS_FILE: locally modified, but it says nothing the committed version does not."
+        warn "  Formatting drift only (usually left by 'mcrepo update' on a machine that does not edit it)."
+        warn "  Discard it with 'git checkout -- $REPOS_FILE'. 'mcrepo pull' also drops it automatically."
+      else
+        log "$REPOS_FILE: locally modified — share it with 'mcrepo commit'."
+      fi
+      rm -f "$_mf_head"
+      load_repos
+    else
+      log "$REPOS_FILE: clean"
+    fi
+  fi
+  log ""
+
   # Workspace hygiene: generated artifacts that are already TRACKED. A
   # .gitignore entry does not untrack them, so they keep being replayed as
   # conflicts by every rebase that crosses their commits. Report only — the
@@ -3203,6 +3550,24 @@ EOF
   done
   if [ "$_hyg_total" -eq 0 ]; then
     log "hygiene: no generated artifacts tracked"
+  fi
+
+  # Leftover mcrepo auto-stashes. An interrupted pull/rebase can park one and
+  # never finalize it; it then sits there indefinitely holding changes the user
+  # has usually long forgotten. Report only — 'mcrepo continue' finalizes them.
+  local _sc _stash_total=0
+  for _hi in "${!hyg_dirs[@]}"; do
+    _sc="$(repo_mcrepo_stash_count "${hyg_dirs[$_hi]}")"
+    [ "${_sc:-0}" -gt 0 ] || continue
+    [ -n "$(repo_inprogress_state "${hyg_dirs[$_hi]}")" ] && continue
+    warn "stash: ${hyg_labels[$_hi]} holds $_sc leftover mcrepo stash(es) with no operation in progress:"
+    git -C "${hyg_dirs[$_hi]}" stash list 2>/dev/null | grep 'mcrepo:' | sed 's/^/         /' >&2 || true
+    _stash_total=$((_stash_total + _sc))
+  done
+  if [ "$_stash_total" -gt 0 ]; then
+    warn "stash: finalize them with 'mcrepo continue' (pops or drops each), or discard with 'git stash drop'."
+  else
+    log "stash: no leftover mcrepo stashes"
   fi
   log ""
 
@@ -4025,6 +4390,217 @@ _mcrepo_stash_push() {
   git -C "$dir" stash push --quiet --include-untracked -m "$msg" 2>/dev/null || true
   after="$(git -C "$dir" rev-parse -q --verify refs/stash 2>/dev/null || true)"
   [ "$after" != "$before" ]
+}
+
+# --- Manifest parking ----------------------------------------------------
+#
+# While a pull runs, a locally modified mcrepo.yaml is parked in the object
+# database rather than in the working tree or the stash: a temp file would be
+# swept up by the meta-context's 'git add -A', and the stash is exactly what we
+# are trying to keep it out of. Same idiom as the rebase provenance refs above.
+#
+#   refs/mcrepo/manifest-ours   the working-copy manifest, taken out of the pull
+#   refs/mcrepo/manifest-base   HEAD:mcrepo.yaml at the moment it was taken out
+#
+# Flat names (not manifest/ours) so a future refs/mcrepo/manifest cannot become
+# a git directory/file conflict. Local-only: never fetched, never pushed.
+_manifest_ref() { printf 'refs/mcrepo/manifest-%s' "$1"; }
+
+_manifest_ref_set() {
+  local dir="$1" slot="$2" file="$3" blob
+  blob="$(git -C "$dir" hash-object -w --stdin <"$file" 2>/dev/null || true)"
+  [ -n "$blob" ] || return 1
+  git -C "$dir" update-ref "$(_manifest_ref "$slot")" "$blob" 2>/dev/null || return 1
+  return 0
+}
+
+_manifest_ref_dump() {
+  local dir="$1" slot="$2" file="$3" ref
+  ref="$(git -C "$dir" rev-parse -q --verify "$(_manifest_ref "$slot")" 2>/dev/null || true)"
+  [ -n "$ref" ] || return 1
+  git -C "$dir" cat-file blob "$ref" >"$file" 2>/dev/null || return 1
+  return 0
+}
+
+_manifest_pending() {
+  git -C "${1:-.}" rev-parse -q --verify "$(_manifest_ref ours)" >/dev/null 2>&1
+}
+
+_manifest_clear() {
+  local dir="${1:-.}"
+  git -C "$dir" update-ref -d "$(_manifest_ref ours)" 2>/dev/null || true
+  git -C "$dir" update-ref -d "$(_manifest_ref base)" 2>/dev/null || true
+  return 0
+}
+
+# True when the manifest is opted out of reconciliation.
+_manifest_merge_disabled() {
+  is_truthy "${MCREPO_NO_MANIFEST_MERGE:-0}"
+}
+
+# True when two manifests carry the same information, differing only in the
+# canonical formatting save_repos applies (schema stamp, key order, derived
+# localpath, quoting, comments). This is precisely the drift 'mcrepo update'
+# used to leave behind on a machine that never edits the manifest.
+_manifest_same_semantics() {
+  local a="$1" b="$2" tmp_a tmp_b rc=1
+  [ -f "$a" ] && [ -f "$b" ] || return 1
+  tmp_a="$(mktemp)" || return 1
+  tmp_b="$(mktemp)" || { rm -f "$tmp_a"; return 1; }
+  if load_repos "$a" 2>/dev/null && save_repos "$tmp_a" 2>/dev/null && \
+     load_repos "$b" 2>/dev/null && save_repos "$tmp_b" 2>/dev/null && \
+     cmp -s "$tmp_a" "$tmp_b"; then
+    rc=0
+  fi
+  rm -f "$tmp_a" "$tmp_b"
+  return $rc
+}
+
+# Take mcrepo.yaml out of the pull: park the working copy plus the pre-pull HEAD
+# version as blobs, then restore the file from HEAD so neither the auto-stash nor
+# git's textual merge ever sees it. _manifest_settle puts the merged result back.
+#
+# rc 0 = the working tree changed (caller must recompute its dirty state)
+# rc 1 = nothing to do
+_manifest_capture() {
+  local dir="${1:-.}"
+  local head_file ours_file rebuilt rc
+
+  _manifest_merge_disabled && return 1
+  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+  [ -n "$(git -C "$dir" status --porcelain -- "$REPOS_FILE" 2>/dev/null)" ] || return 1
+
+  head_file="$(mktemp)" || return 1
+  ours_file="$(mktemp)" || { rm -f "$head_file"; return 1; }
+  cp -f "$dir/$REPOS_FILE" "$ours_file" 2>/dev/null || : >"$ours_file"
+
+  if ! git -C "$dir" show "HEAD:$REPOS_FILE" >"$head_file" 2>/dev/null; then
+    rm -f "$head_file"
+    head_file=""
+  fi
+
+  # Pure normalization drift (the reported bug): our copy says nothing the
+  # committed one does not. Drop it outright — no parking, no merge, no diff.
+  if [ -n "$head_file" ] && ! _manifest_pending "$dir" && \
+     _manifest_same_semantics "$ours_file" "$head_file"; then
+    git -C "$dir" checkout HEAD -- "$REPOS_FILE" 2>/dev/null || true
+    rm -f "$head_file" "$ours_file"
+    # $REPOS_FILE is relative, so only the meta-context (cwd) can be resynced.
+    [ "$dir" = "." ] && load_repos
+    return 0
+  fi
+
+  if _manifest_pending "$dir"; then
+    # An earlier run parked and never settled. Fold the current working copy in
+    # rather than clobbering what is already parked.
+    local parked_ours parked_base base_arg
+    parked_ours="$(mktemp)"; parked_base="$(mktemp)"; rebuilt="$(mktemp)"
+    base_arg=""
+    _manifest_ref_dump "$dir" base "$parked_base" && base_arg="$parked_base"
+    if _manifest_ref_dump "$dir" ours "$parked_ours"; then
+      rc=0
+      _manifest_reconcile "$base_arg" "$parked_ours" "$ours_file" "$rebuilt" || rc=$?
+      if [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then
+        cp -f "$rebuilt" "$ours_file"
+      fi
+    fi
+    rm -f "$parked_ours" "$parked_base" "$rebuilt"
+  fi
+
+  _manifest_ref_set "$dir" ours "$ours_file" || {
+    rm -f "$head_file" "$ours_file"
+    return 1
+  }
+  if [ -n "$head_file" ]; then
+    _manifest_ref_set "$dir" base "$head_file" || true
+  else
+    # No committed version to merge against — settle will union instead.
+    git -C "$dir" update-ref -d "$(_manifest_ref base)" 2>/dev/null || true
+  fi
+
+  # Safe to discard from the working tree: the content is already in the object
+  # database. The rm branch covers an untracked manifest, which 'stash push
+  # --include-untracked' would otherwise swallow and then fail to pop back.
+  if ! git -C "$dir" checkout HEAD -- "$REPOS_FILE" 2>/dev/null; then
+    rm -f "$dir/$REPOS_FILE"
+  fi
+
+  rm -f "$head_file" "$ours_file"
+  [ "$dir" = "." ] && load_repos
+  return 0
+}
+
+# Put the parked manifest back, reconciled against whatever the pull brought in.
+_manifest_settle() {
+  local dir="${1:-.}"
+  local ours_file base_file theirs_file out_file base_arg rc
+
+  _manifest_pending "$dir" || return 0
+
+  # Never write into a paused rebase or over unmerged index entries: that is
+  # exactly what blocks 'git rebase --continue'. Stay parked; the next
+  # 'mcrepo pull' picks it up once the conflict is resolved.
+  if [ -n "$(repo_inprogress_state "$dir")" ] || \
+     [ -n "$(git -C "$dir" ls-files -u 2>/dev/null)" ]; then
+    MANIFEST_MERGE_NOTE="reconcile deferred until the conflict is resolved"
+    return 0
+  fi
+
+  ours_file="$(mktemp)"; base_file="$(mktemp)"
+  theirs_file="$(mktemp)"; out_file="$(mktemp)"
+
+  if ! _manifest_ref_dump "$dir" ours "$ours_file"; then
+    rm -f "$ours_file" "$base_file" "$theirs_file" "$out_file"
+    _manifest_clear "$dir"
+    return 0
+  fi
+  base_arg=""
+  _manifest_ref_dump "$dir" base "$base_file" && base_arg="$base_file"
+
+  if ! git -C "$dir" show "HEAD:$REPOS_FILE" >"$theirs_file" 2>/dev/null; then
+    cp -f "$dir/$REPOS_FILE" "$theirs_file" 2>/dev/null || : >"$theirs_file"
+  fi
+
+  MANIFEST_MERGE_WARNINGS=0
+  # Must not be a bare call: a non-zero rc is a RESULT here, not a failure, and
+  # 'set -e' would abort the whole pull before rc is even read.
+  rc=0
+  _manifest_reconcile "$base_arg" "$ours_file" "$theirs_file" "$out_file" || rc=$?
+
+  case "$rc" in
+    3)
+      warn "$REPOS_FILE on origin uses a newer manifest schema. Run 'mcrepo update', then re-run 'mcrepo pull' to merge your local manifest state (parked safely)."
+      MANIFEST_MERGE_NOTE="parked — origin needs a newer mcrepo"
+      rm -f "$ours_file" "$base_file" "$theirs_file" "$out_file"
+      return 0
+      ;;
+    2) MANIFEST_MERGE_NOTE="restored unchanged" ;;
+    0)
+      if [ "$MANIFEST_MERGE_WARNINGS" -gt 0 ]; then
+        MANIFEST_MERGE_NOTE="reconciled ($MANIFEST_MERGE_WARNINGS field(s) kept from origin)"
+      else
+        MANIFEST_MERGE_NOTE="reconciled"
+      fi
+      ;;
+    *)
+      warn "Could not reconcile $REPOS_FILE; leaving origin's version in place (yours is parked)."
+      MANIFEST_MERGE_NOTE="parked — reconcile failed"
+      rm -f "$ours_file" "$base_file" "$theirs_file" "$out_file"
+      return 0
+      ;;
+  esac
+
+  cp -f "$out_file" "$dir/$REPOS_FILE"
+  _manifest_clear "$dir"
+  rm -f "$ours_file" "$base_file" "$theirs_file" "$out_file"
+
+  # The arrays still hold the pre-capture state; resync from what we just wrote.
+  [ "$dir" = "." ] && load_repos
+
+  if [ -n "$(git -C "$dir" status --porcelain -- "$REPOS_FILE" 2>/dev/null)" ]; then
+    MANIFEST_MERGE_NOTE="$MANIFEST_MERGE_NOTE — still differs from origin, share it with 'mcrepo commit'"
+  fi
+  return 0
 }
 
 # --- Rebase provenance --------------------------------------------------
@@ -4972,6 +5548,48 @@ EOF
   return 0
 }
 
+# Same idea for mcrepo.yaml, one level up: when BOTH machines committed manifest
+# changes the collision arrives as an unmerged index entry rather than a stash
+# pop, so taking it out of the pull cannot help. Resolve it from the index
+# stages with the same field-level merge instead of leaving conflict markers in
+# mcrepo's own state file, which no user can meaningfully hand-edit.
+#
+# Stage 1 = base, 2 = ours, 3 = theirs — but during a REBASE the sides are
+# swapped: git replays our commits onto the upstream, so stage 2 is the new
+# upstream and stage 3 is the commit being replayed. Same inversion that
+# _conflict_version_lines already spells out.
+_manifest_resolve_conflict() {
+  local dir="$1" name="$2"
+  local base_f ours_f theirs_f out_f base_arg rc
+
+  _manifest_merge_disabled && return 0
+  git -C "$dir" ls-files -u -- "$REPOS_FILE" 2>/dev/null | grep -q . || return 0
+
+  base_f="$(mktemp)"; ours_f="$(mktemp)"
+  theirs_f="$(mktemp)"; out_f="$(mktemp)"
+
+  base_arg=""
+  git -C "$dir" show ":1:$REPOS_FILE" >"$base_f" 2>/dev/null && base_arg="$base_f"
+  if [ "$(repo_inprogress_state "$dir")" = "REBASING" ]; then
+    git -C "$dir" show ":3:$REPOS_FILE" >"$ours_f" 2>/dev/null || : >"$ours_f"
+    git -C "$dir" show ":2:$REPOS_FILE" >"$theirs_f" 2>/dev/null || : >"$theirs_f"
+  else
+    git -C "$dir" show ":2:$REPOS_FILE" >"$ours_f" 2>/dev/null || : >"$ours_f"
+    git -C "$dir" show ":3:$REPOS_FILE" >"$theirs_f" 2>/dev/null || : >"$theirs_f"
+  fi
+
+  rc=0
+  _manifest_reconcile "$base_arg" "$ours_f" "$theirs_f" "$out_f" || rc=$?
+  if [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then
+    cp -f "$out_f" "$dir/$REPOS_FILE"
+    git -C "$dir" add -- "$REPOS_FILE" 2>/dev/null || true
+    warn "  $name: auto-resolved the $REPOS_FILE conflict by merging it field by field."
+    [ "$dir" = "." ] && load_repos
+  fi
+  rm -f "$base_f" "$ours_f" "$theirs_f" "$out_f"
+  return 0
+}
+
 _resume_inflight_rebase() {
   local dir="$1" name="$2"
   local state guard=0
@@ -4985,6 +5603,7 @@ _resume_inflight_rebase() {
       fi
       while [ "$(repo_inprogress_state "$dir")" = "REBASING" ]; do
         _auto_clean_generated_conflicts "$dir" "$name"
+        _manifest_resolve_conflict "$dir" "$name"
         if [ -n "$(git -C "$dir" ls-files -u 2>/dev/null)" ]; then
           return 2
         fi
@@ -5021,6 +5640,7 @@ _resume_inflight_rebase() {
       return 1
       ;;
     CONFLICTED)
+      _manifest_resolve_conflict "$dir" "$name"
       if [ -n "$(git -C "$dir" ls-files -u 2>/dev/null)" ]; then
         # Still unresolved (stash-pop or squash conflict).
         if [ "$(repo_mcrepo_stash_count "$dir")" -gt 0 ]; then
@@ -5585,6 +6205,14 @@ cmd_pull() {
   fi
 
   load_repos
+
+  # An earlier pull parked mcrepo.yaml and never settled (crash, or a conflict
+  # that has since been resolved). The content lives in the object database, so
+  # put it back before anything else reads the manifest.
+  if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1 && _manifest_pending .; then
+    _manifest_settle .
+  fi
+
   if [ "$pull_mode" = "rebase" ]; then
     # Re-run is the resume path: pull may proceed over its own paused
     # rebases/conflicts and finishes them; foreign states still block.
@@ -5813,6 +6441,17 @@ cmd_pull() {
     local meta_pull_parent
     meta_pull_parent="$(parent_map_get "$META_PARENT" "$meta_branch")"
     [ -n "$meta_pull_parent" ] || meta_pull_parent="$(detect_default_branch ".")"
+
+    # mcrepo.yaml is mcrepo's own coordination state, not user content: take it
+    # out of the pull here and merge it field by field afterwards, so it never
+    # enters the auto-stash and can never produce a textual conflict. With it
+    # gone the meta-context is often clean, dropping the stash round trip too.
+    if [ "$pull_mode" = "reset" ]; then
+      _manifest_clear .
+    elif _manifest_capture .; then
+      meta_dirty="$(repo_dirty_state ".")"
+    fi
+
     if ! git -C . fetch origin --prune 2>/dev/null; then
       warn "Fetch failed for (meta-context)"
       _hint_credential_helper "."
@@ -5874,6 +6513,12 @@ cmd_pull() {
         esac
       fi
     fi
+
+    # Put the parked manifest back, reconciled against what the pull brought in.
+    # Covers every outcome above: when the pull did not move mcrepo.yaml the
+    # reconciler degenerates to restoring our copy verbatim, and when the repo
+    # is left mid-conflict it stays parked for the re-run.
+    _manifest_settle .
   fi
 
   # --- Phase 5: Summary ---
@@ -5892,6 +6537,9 @@ cmd_pull() {
   fi
   if [ "${#stash_conflict_repos[@]}" -gt 0 ]; then
     warn "  Stash conflicts:  ${stash_conflict_repos[*]}"
+  fi
+  if [ -n "$MANIFEST_MERGE_NOTE" ]; then
+    log "  $REPOS_FILE:     $MANIFEST_MERGE_NOTE"
   fi
   if [ "${#diverged_rebased[@]}" -gt 0 ]; then
     local dr
@@ -10437,9 +11085,24 @@ cmd_post_update_migrate() {
   local schema_before
   schema_before="$(parse_schema_version || true)"
   load_repos
-  save_repos
-  if [ "${schema_before:-0}" != "$MCREPO_SCHEMA_VERSION" ]; then
-    log "Migrated $REPOS_FILE to manifest schema $MCREPO_SCHEMA_VERSION."
+  # Round-trip into a temp file first and only install it when the canonical form
+  # really differs. This used to rewrite the manifest unconditionally and print
+  # nothing unless the schema number changed, so 'mcrepo update' silently left
+  # mcrepo.yaml modified on machines that never edit it — which then collided
+  # with the other machine's manifest changes on the next 'mcrepo pull'.
+  local migrated_file
+  migrated_file="$REPOS_FILE.migrate.$$"
+  save_repos "$migrated_file"
+  if cmp -s "$migrated_file" "$REPOS_FILE"; then
+    rm -f "$migrated_file"
+  else
+    mv -f "$migrated_file" "$REPOS_FILE"
+    if [ "${schema_before:-0}" != "$MCREPO_SCHEMA_VERSION" ]; then
+      log "Migrated $REPOS_FILE to manifest schema ${schema_before:-none} -> $MCREPO_SCHEMA_VERSION."
+    else
+      log "Normalized $REPOS_FILE to this mcrepo's canonical manifest format."
+    fi
+    log "Share it with 'mcrepo commit', or take origin's version with 'git checkout -- $REPOS_FILE'."
   fi
 
   # 0.7.0: backfill the conflict-resolution skill into existing workspaces
