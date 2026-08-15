@@ -31,7 +31,7 @@ command** until it reports done.
 | Step | Command | What it does |
 |---|---|---|
 | Work + commit | `mcrepo commit -m "…"` | same coordinated checkpoints as above |
-| Pull (integrate) | `mcrepo pull` | auto-stash + rebase your local commits on top of what other devices pushed — on conflict, re-run after the fix ([details](#pulling)) |
+| Pull (integrate) | `mcrepo pull` | rebase your local commits on top of what other devices pushed; asks what to do with uncommitted changes (`--dirty discard` takes origin's state) — on conflict, re-run after the fix ([details](#pulling)) |
 | Push (publish) | `mcrepo push` | plain push after a pull; force-with-lease only when provably safe ([details](#pushing)) |
 
 Around the loops:
@@ -387,6 +387,19 @@ stragglers — the same resume model as `rebase` and `merge`.
 
 Behavior details:
 
+- **Uncommitted changes are your call.** When a repo is dirty, `pull` shows exactly which files
+  and asks what to do — `[a]` abort, `[r]` carry (stash, pull, restore), `[d]` discard and take
+  origin's state — with `[R]`/`[D]` to apply the same answer to every remaining dirty repo. Answer
+  up front with `--dirty abort|carry|discard`; that is also the non-interactive form, and
+  `--dirty discard` is the "just give me the latest, fresh" button for a machine that only consumes
+  code. With no answer and no terminal, `pull` carries, exactly as it always has — existing scripts
+  are unaffected. Note the difference from `--reset`: `--dirty discard` throws away *uncommitted*
+  changes and then pulls normally, while `--reset` additionally offers to drop local *commits*.
+- **A stash pop that conflicts says what conflicted.** The file and the kind of collision
+  (`both-modified`, `deleted-by-them`, …) are printed on the first run, and carried into the agent
+  prompt — previously only the repo name was reported, which left nothing to act on. Generated
+  artifacts that collide this way are auto-resolved on the same terms as during a rebase (the path
+  must match the generated-paths list **and** be covered by the repo's own `.gitignore`).
 - **`mcrepo.yaml` never conflicts.** The manifest is machine-owned — mcrepo rewrites it
   canonically on every coordinated command, and `branch:`/`parent:`/`meta-parent:` change with
   each of them. Two machines therefore edit the *same lines* without either of them touching
@@ -785,6 +798,7 @@ Accepted URL transports: `https`, `ssh`, `git`, `file`, absolute/relative local 
 - `MCREPO_SKIP_VSCODE=1` — skip VS Code extension install and window reloads (CI/tests)
 - `MCREPO_ASSUME_YES=1` — answer every confirmation prompt with yes (CI escape hatch)
 - `MCREPO_NO_MANIFEST_MERGE=1` — do not reconcile `mcrepo.yaml` during `pull`; auto-stash it like any other file (pre-0.9.2 behavior)
+- `MCREPO_NO_AUTO_CLEAN=1` — do not auto-resolve generated-artifact conflicts during `rebase`/`pull`
 
 ## Exit Codes
 

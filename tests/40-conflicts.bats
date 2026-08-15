@@ -134,8 +134,15 @@ make_markerless_conflict() {
   advance_remote alpha "remote moved"
   run mcrepo pull
   [ "$status" -eq 2 ]
-  assert_contains "$output" "Stash pop conflict"
+  assert_contains "$output" "restoring auto-stashed changes conflicted"
+  # The first run must name the conflicting file and its kind — it used to name
+  # only the repo, which left nothing to act on without a manual 'git status'.
+  assert_contains "$output" "both-modified"
+  assert_contains "$output" "README.md"
+  assert_contains "$output" "Stash preserved"
   assert_contains "$output" "Paste the prompt"
+  # ...and the agent prompt carries the same list.
+  assert_contains "$output" "conflicted files (kind and path)"
 
   # Agent-style fix: edit + git add only, then re-run pull.
   printf 'both kept\n' >alpha/README.md

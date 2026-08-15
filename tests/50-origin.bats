@@ -531,3 +531,158 @@ meta_workspace() {
   run git rev-parse -q --verify refs/mcrepo/manifest-ours
   [ "$status" -ne 0 ]
 }
+
+# --- dirty-repo handling on pull -----------------------------------------
+#
+# A machine that only consumes code still gets dirty repos: running a build
+# writes into tracked paths. Pull used to stash unconditionally and stop dead
+# when the pop conflicted, naming no files. Now it asks, and always offers
+# "discard and take origin's state".
+
+# alpha with a tracked build artifact that origin also advances, so a carry
+# provokes a real stash-pop conflict on a tracked path.
+colliding_artifact_workspace() {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  local seed="$BATS_TEST_TMPDIR/seed-alpha"
+  mkdir -p "$seed/dist"
+  printf 'v1\n' >"$seed/dist/bundle.tar.gz"
+  git -C "$seed" add -A
+  git -C "$seed" commit -qm "seed bundle"
+  git -C "$seed" push -q "$REMOTES_DIR/alpha.git" main
+  git -C alpha pull -q --ff-only
+  # origin ships a new bundle...
+  printf 'v2-from-origin\n' >"$seed/dist/bundle.tar.gz"
+  git -C "$seed" add -A
+  git -C "$seed" commit -qm "new bundle"
+  git -C "$seed" push -q "$REMOTES_DIR/alpha.git" main
+  # ...while this machine built its own at the same tracked path.
+  printf 'v2-local-build\n' >alpha/dist/bundle.tar.gz
+}
+
+@test "a stash-pop conflict names the conflicting file on the FIRST run" {
+  colliding_artifact_workspace
+  run mcrepo pull
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "restoring auto-stashed changes conflicted"
+  assert_contains "$output" "both-modified"
+  assert_contains "$output" "dist/bundle.tar.gz"
+  # ...and the agent prompt carries it too, instead of naming only the repo.
+  assert_contains "$output" "conflicted files (kind and path)"
+}
+
+@test "pull --dirty discard takes origin's state and never conflicts" {
+  colliding_artifact_workspace
+  run mcrepo pull --dirty discard
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "Discarded local:  alpha"
+  assert_not_contains "$output" "Stash conflicts"
+  run cat alpha/dist/bundle.tar.gz
+  assert_contains "$output" "v2-from-origin"
+  [ -z "$(git -C alpha stash list)" ]
+  [ -z "$(git -C alpha status --porcelain)" ]
+}
+
+@test "pull --dirty carry is the pre-0.9.3 behaviour" {
+  colliding_artifact_workspace
+  run mcrepo pull --dirty carry
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "Stash conflicts"
+  # Stash preserved as backup, exactly as before.
+  run git -C alpha stash list
+  assert_contains "$output" "mcrepo:"
+}
+
+@test "pull with no flag and no TTY still carries (unchanged default)" {
+  colliding_artifact_workspace
+  run mcrepo pull
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "Stash conflicts"
+  run git -C alpha stash list
+  assert_contains "$output" "mcrepo:"
+}
+
+@test "pull --dirty abort changes nothing and restores the parked manifest" {
+  meta_workspace
+  mcrepo branch feature-x >/dev/null 2>&1
+  git checkout -q main
+  dirty_repo alpha
+  advance_remote alpha "origin moved"
+
+  run mcrepo pull --dirty abort
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "uncommitted changes"
+  assert_contains "$output" "--dirty discard"
+  # Nothing touched: still dirty, still behind, nothing stashed.
+  [ -n "$(git -C alpha status --porcelain)" ]
+  [ -z "$(git -C alpha stash list)" ]
+  # The manifest parked in Phase 1 must be back in the working tree.
+  run git rev-parse -q --verify refs/mcrepo/manifest-ours
+  [ "$status" -ne 0 ]
+  run cat mcrepo.yaml
+  assert_contains "$output" "feature-x"
+}
+
+@test "pull --ff-only --dirty discard updates a repo it would otherwise skip" {
+  colliding_artifact_workspace
+  run mcrepo pull --ff-only --dirty discard
+  [ "$status" -eq 0 ]
+  assert_not_contains "$output" "fetch only (dirty)"
+  run cat alpha/dist/bundle.tar.gz
+  assert_contains "$output" "v2-from-origin"
+}
+
+@test "a meta-context dirty only in mcrepo.yaml is never prompted about" {
+  meta_workspace
+  mcrepo branch feature-x >/dev/null 2>&1
+  git checkout -q main
+  [ -n "$(git status --porcelain -- mcrepo.yaml)" ]
+  device_b_meta sed -i.bak 's|description: ""|description: "device B"|' mcrepo.yaml
+
+  # --dirty abort would stop the pull if the meta-context still counted as
+  # dirty; the manifest is taken out before the dirty state is measured.
+  run mcrepo pull --dirty abort
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "(meta-context)       branch=main                 state=clean"
+  run cat mcrepo.yaml
+  assert_contains "$output" "device B"
+  assert_contains "$output" "feature-x"
+}
+
+@test "a gitignored generated file conflicting through a stash pop is auto-cleaned" {
+  init_workspace_with_repos alpha
+  mcrepo write alpha >/dev/null
+  local seed="$BATS_TEST_TMPDIR/seed-alpha"
+  printf '__pycache__/\n' >"$seed/.gitignore"
+  mkdir -p "$seed/__pycache__"
+  printf 'v1\n' >"$seed/__pycache__/x.pyc"
+  git -C "$seed" add -A -f
+  git -C "$seed" commit -qm "seed tracked bytecode"
+  git -C "$seed" push -q "$REMOTES_DIR/alpha.git" main
+  git -C alpha pull -q --ff-only
+  printf 'v2-origin\n' >"$seed/__pycache__/x.pyc"
+  git -C "$seed" add -A -f
+  git -C "$seed" commit -qm "origin bytecode"
+  git -C "$seed" push -q "$REMOTES_DIR/alpha.git" main
+  printf 'v2-local\n' >alpha/__pycache__/x.pyc
+
+  run mcrepo pull
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "auto-resolved"
+  assert_contains "$output" "__pycache__/x.pyc"
+  assert_not_contains "$output" "Stash conflicts"
+}
+
+@test "a manifest that stays different from origin says which fields differ" {
+  meta_workspace
+  # A real semantic difference that reconciliation legitimately keeps: this
+  # machine sleeps a repo the other one does not.
+  mcrepo sleep beta >/dev/null
+  device_b_meta sh -c 'printf "device B note\n" > notes.txt'
+
+  run mcrepo pull
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "differs from origin in:"
+  assert_contains "$output" "mode of 'beta'"
+  assert_contains "$output" "sleep"
+}

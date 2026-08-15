@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCREPO_VERSION="0.9.2"
+MCREPO_VERSION="0.9.3"
 # Manifest (mcrepo.yaml) format version. Bump when the manifest schema changes
 # incompatibly; cmd_post_update_migrate migrates older manifests forward.
 MCREPO_SCHEMA_VERSION="2"
@@ -110,6 +110,7 @@ Usage:  # Show available mcrepo commands
   ./mcrepo.sh pull <location>                        # integrate from a named location (rebase local commits on top; stale mirrors route to push)
   ./mcrepo.sh pull                                   # anytime — integrate from origin: auto-stash + rebase local commits onto remote work (multi-device); on conflict: resolve, then re-run
   ./mcrepo.sh pull --ff-only                         # anytime — conservative pull: fast-forward only, dirty repos skipped (fetch only); never stashes or rebases
+  ./mcrepo.sh pull --dirty abort|carry|discard        # answer the uncommitted-changes prompt up front; 'discard' = throw local changes away and take origin's state
   ./mcrepo.sh pr [-m "title"] [--draft] [--no-push] [--target origin|upstream]  # instead of push — coordinated GitHub PRs per repo; fork->upstream when upstream set; cross-linked
   ./mcrepo.sh branch                                 # List coordinated branches across write repos (alias: 'branch list')
   ./mcrepo.sh branch --delete                        # Discard the global branch, switch repos back to parent branches
@@ -1819,7 +1820,7 @@ _mcrepo_complete() {
       COMPREPLY=( $(compgen -W "-m --draft --no-push --target" -- "$cur") )
       ;;
     pull)
-      COMPREPLY=( $(compgen -W "--ff-only --reset --yes" -- "$cur") )
+      COMPREPLY=( $(compgen -W "--ff-only --reset --yes --dirty" -- "$cur") )
       ;;
     remote)
       if [ "$COMP_CWORD" -eq 2 ]; then
@@ -1938,7 +1939,7 @@ _mcrepo_complete() {
       compadd -- -m --draft --no-push --target
       ;;
     pull)
-      compadd -- --ff-only --reset --yes
+      compadd -- --ff-only --reset --yes --dirty
       ;;
     remote)
       if (( CURRENT == 3 )); then
@@ -2031,6 +2032,7 @@ It provides workspace governance across repos, shared documentation, tests, and 
 - On conflict, every coordinated command prints a paste-ready prompt for a coding agent and pauses; after the files are resolved and staged, RE-RUN the same command — it finishes automatically.
 - `mcrepo pull` is the origin-side twin of `mcrepo rebase`: it auto-stashes uncommitted changes, rebases local commits onto origin (multi-device work integrates cleanly), then pops the stash. Conflicts pause as `inprogress=REBASING` — resolve, stage, then re-run `mcrepo pull`. Safe for dirty repos.
 - `mcrepo pull --ff-only` is the conservative pull: fast-forward only, dirty sub-repos are skipped (fetch only); never stashes or rebases.
+- `mcrepo pull` asks what to do about uncommitted changes (abort / carry / discard) when run interactively; `--dirty abort|carry|discard` answers up front and is the non-interactive form. Without either it carries, as before.
 - `mcrepo pull --reset` discards all local changes and resets to origin state. Destructive — requires interactive confirmation.
 - `mcrepo push` pushes all write-mode repos with committed changes to origin.
 - `mcrepo push -m "message"` commits uncommitted changes in all dirty write-mode repos with the given message, then pushes.
@@ -4592,14 +4594,24 @@ _manifest_settle() {
 
   cp -f "$out_file" "$dir/$REPOS_FILE"
   _manifest_clear "$dir"
-  rm -f "$ours_file" "$base_file" "$theirs_file" "$out_file"
 
   # The arrays still hold the pre-capture state; resync from what we just wrote.
   [ "$dir" = "." ] && load_repos
 
   if [ -n "$(git -C "$dir" status --porcelain -- "$REPOS_FILE" 2>/dev/null)" ]; then
     MANIFEST_MERGE_NOTE="$MANIFEST_MERGE_NOTE — still differs from origin, share it with 'mcrepo commit'"
+    # Say WHAT differs. A manifest that stays different every pull is otherwise
+    # a standing mystery: the note repeats forever with nothing to act on.
+    if git -C "$dir" show "HEAD:$REPOS_FILE" >"$theirs_file" 2>/dev/null; then
+      local _mdiff
+      _mdiff="$(_manifest_describe_diff "$dir/$REPOS_FILE" "$theirs_file" || true)"
+      if [ -n "$_mdiff" ]; then
+        warn "  $REPOS_FILE differs from origin in:"
+        printf '%s\n' "$_mdiff" | sed 's/^/      /' >&2
+      fi
+    fi
   fi
+  rm -f "$ours_file" "$base_file" "$theirs_file" "$out_file"
   return 0
 }
 
@@ -5640,6 +5652,9 @@ _resume_inflight_rebase() {
       return 1
       ;;
     CONFLICTED)
+      # A stash-pop or squash conflict lands here. Both auto-resolution policies
+      # apply just as they do inside the REBASING loop above.
+      _auto_clean_generated_conflicts "$dir" "$name"
       _manifest_resolve_conflict "$dir" "$name"
       if [ -n "$(git -C "$dir" ls-files -u 2>/dev/null)" ]; then
         # Still unresolved (stash-pop or squash conflict).
@@ -5697,6 +5712,122 @@ _conflicted_files_typed() {
         printf "%-16s %s\n", kind, f
       }
     }' | sort -k2
+}
+
+# Shared handling for a conflicted 'git stash pop'.
+#
+# A conflicted pop APPLIES the stash content (with markers) but keeps the entry
+# as a backup, so recovery is "resolve + stage + re-run" — which the user can
+# only do if they are told WHICH files broke. This used to be the one conflict
+# path in the script that named nothing, and it silenced git as well, so a pull
+# that stopped here left no way to act on it short of running 'git status' by
+# hand. It also never got the auto-clean pass the rebase loop has always had.
+#
+# rc 0 = fully auto-resolved (nothing unmerged left, stale stash dropped) and
+#        the caller may continue as if the pop had succeeded
+# rc 1 = the conflict stands; caller records it and stops the repo
+_settle_stash_pop_conflict() {
+  local dir="$1" name="$2"
+  _mark_stash_applied "$dir"
+  # Same two policies the REBASING loop applies, which this path never reached:
+  # generated artifacts carry no reviewable intent, and mcrepo.yaml is merged
+  # field by field rather than left with markers in mcrepo's own state file.
+  _auto_clean_generated_conflicts "$dir" "$name"
+  _manifest_resolve_conflict "$dir" "$name"
+  if [ -z "$(git -C "$dir" ls-files -u 2>/dev/null)" ]; then
+    git -C "$dir" stash drop >/dev/null 2>&1 || true
+    _clear_stash_applied "$dir"
+    return 0
+  fi
+  warn "  $name: restoring auto-stashed changes conflicted:"
+  _conflicted_files_typed "$dir" | sed 's/^/      /' >&2
+  return 1
+}
+
+# Show what is actually dirty in a repo, capped so a build-output explosion
+# cannot bury the prompt that follows it.
+_dirty_files_preview() {
+  local dir="$1" total
+  total="$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+  git -C "$dir" status --porcelain 2>/dev/null | head -10 | sed 's/^/      /' >&2
+  if [ "${total:-0}" -gt 10 ]; then
+    warn "      ... and $((total - 10)) more"
+  fi
+}
+
+# Name the fields in which two manifests disagree, one per line. Used to explain
+# a manifest that stays different from origin after a pull instead of just
+# announcing that it does — a lingering divergence is otherwise undiagnosable
+# without diffing the file by hand.
+_manifest_describe_diff() {
+  local ours="$1" theirs="$2" limit="${3:-6}"
+  local -a lines=()
+  local i nm o_rec t_rec f fname
+  local -a o_names=() o_recs=() t_names=() t_recs=()
+
+  [ -f "$ours" ] && [ -f "$theirs" ] || return 0
+
+  local o_branch t_branch
+  o_branch="$(parse_branch "$ours" || true)"
+  t_branch="$(parse_branch "$theirs" || true)"
+  [ "$o_branch" != "$t_branch" ] && lines+=("branch: '$o_branch' here, '$t_branch' on origin")
+
+  _manifest_side_load "$ours"
+  o_names=(${MF_SIDE_NAMES[@]+"${MF_SIDE_NAMES[@]}"})
+  o_recs=(${MF_SIDE_RECS[@]+"${MF_SIDE_RECS[@]}"})
+  _manifest_side_load "$theirs"
+  t_names=(${MF_SIDE_NAMES[@]+"${MF_SIDE_NAMES[@]}"})
+  t_recs=(${MF_SIDE_RECS[@]+"${MF_SIDE_RECS[@]}"})
+
+  local ti
+  if [ "${#o_names[@]}" -gt 0 ]; then
+    for i in "${!o_names[@]}"; do
+      nm="${o_names[$i]}"
+      o_rec="${o_recs[$i]}"
+      if ! ti="$(_mf_index_in "$nm" ${t_names[@]+"${t_names[@]}"})"; then
+        lines+=("repo '$nm': present here, absent on origin")
+        continue
+      fi
+      t_rec="${t_recs[$ti]}"
+      for f in 1:url 3:mode 4:description 5:parent 7:upstream 8:remotes; do
+        fname="${f#*:}"
+        if [ "$(_mf_field "$o_rec" "${f%%:*}")" != "$(_mf_field "$t_rec" "${f%%:*}")" ]; then
+          lines+=("$fname of '$nm': '$(_mf_field "$o_rec" "${f%%:*}")' here, '$(_mf_field "$t_rec" "${f%%:*}")' on origin")
+        fi
+      done
+    done
+  fi
+  if [ "${#t_names[@]}" -gt 0 ]; then
+    for i in "${!t_names[@]}"; do
+      nm="${t_names[$i]}"
+      _mf_index_in "$nm" ${o_names[@]+"${o_names[@]}"} >/dev/null && continue
+      lines+=("repo '$nm': on origin, absent here")
+    done
+  fi
+
+  [ "${#lines[@]}" -gt 0 ] || return 0
+  for i in "${!lines[@]}"; do
+    [ "$i" -lt "$limit" ] || { printf '... and %d more\n' "$((${#lines[@]} - limit))"; break; }
+    printf '%s\n' "${lines[$i]}"
+  done
+}
+
+# Build the agent-prompt context for stash-pop conflicts: the typed file list
+# per repo. Without it the prompt names repos only, so the agent has to spend a
+# round-trip rediscovering what one 'git status' already showed.
+# Args: <name|dir> entries, the same form print_agent_recovery_prompt takes.
+_stash_conflict_context() {
+  local entry name dir files out=""
+  for entry in "$@"; do
+    name="${entry%%|*}"
+    dir="${entry#*|}"
+    files="$(_conflicted_files_typed "$dir" 2>/dev/null || true)"
+    [ -n "$files" ] || continue
+    out="$out$name: conflicted files (kind and path):
+$(printf '%s' "$files" | sed 's/^/  /')
+"
+  done
+  printf '%s' "$out"
 }
 
 # When mcrepo's own files are among the conflicts, name the version on each
@@ -5955,11 +6086,12 @@ _pull_one_rebase() {
   esac
   if [ "$stashed" -eq 1 ]; then
     if ! git -C "$rd" stash pop --quiet 2>/dev/null; then
-      _mark_stash_applied "$rd"
-      warn "Stash pop conflict in '$rn'. Stash preserved — have the files resolved and staged, then re-run 'mcrepo pull' (it drops the already-applied stash)."
-      stash_conflict_repos+=("$rn")
-      stash_conflict_entries+=("$rn|$rd")
-      return 0
+      if ! _settle_stash_pop_conflict "$rd" "$rn"; then
+        warn "  Stash preserved — have the files resolved and staged, then re-run 'mcrepo pull' (it drops the already-applied stash)."
+        stash_conflict_repos+=("$rn")
+        stash_conflict_entries+=("$rn|$rd")
+        return 0
+      fi
     fi
   fi
   if [ "$class" = "remote-work" ]; then
@@ -6057,11 +6189,12 @@ _pull_from_location() {
       continue
     fi
     if [ "$stashed" -eq 1 ] && ! git -C "$repo_dir" stash pop --quiet; then
-      _mark_stash_applied "$repo_dir"
-      conflicts+=("${REPO_NAMES[$i]}")
-      conflict_entries+=("${REPO_NAMES[$i]}|$repo_dir")
-      warn "  Stash pop conflict in '${REPO_NAMES[$i]}'. Have the files resolved and staged, then re-run 'mcrepo pull $loc'."
-      continue
+      if ! _settle_stash_pop_conflict "$repo_dir" "${REPO_NAMES[$i]}"; then
+        conflicts+=("${REPO_NAMES[$i]}")
+        conflict_entries+=("${REPO_NAMES[$i]}|$repo_dir")
+        warn "  Stash preserved — have the files resolved and staged, then re-run 'mcrepo pull $loc'."
+        continue
+      fi
     fi
     updated+=("${REPO_NAMES[$i]}")
   done
@@ -6179,6 +6312,10 @@ cmd_pull() {
   local pull_mode="rebase"
   local assume_yes=0
   local location=""
+  # What to do with uncommitted changes. Empty = ask when interactive, and fall
+  # back to 'carry' otherwise, which is exactly the historical behavior — so
+  # every existing unattended pull keeps working unchanged.
+  local dirty_action_flag=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --ff-only) pull_mode="ffonly" ;;
@@ -6188,6 +6325,14 @@ cmd_pull() {
         ;;
       --reset) pull_mode="reset" ;;
       --yes|-y) assume_yes=1 ;;
+      --dirty)
+        shift
+        [ "$#" -gt 0 ] || die "--dirty needs an action: abort, carry or discard."
+        case "$1" in
+          abort|carry|discard) dirty_action_flag="$1" ;;
+          *) die "Unknown --dirty action: $1 (expected abort, carry or discard)." ;;
+        esac
+        ;;
       -*) die "Unknown pull option: $1" ;;
       *)
         [ -z "$location" ] || die "Unexpected argument: $1 (location already given: '$location')"
@@ -6198,7 +6343,7 @@ cmd_pull() {
   done
 
   if [ -n "$location" ]; then
-    { [ "$pull_mode" = "rebase" ] && [ "$assume_yes" -eq 0 ]; } || die "--ff-only/--reset/--yes are not supported with a named location."
+    { [ "$pull_mode" = "rebase" ] && [ "$assume_yes" -eq 0 ] && [ -z "$dirty_action_flag" ]; } || die "--ff-only/--reset/--yes/--dirty are not supported with a named location."
     load_repos
     _pull_from_location "$location"
     return $?
@@ -6256,6 +6401,17 @@ cmd_pull() {
   if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     meta_dir="."
     meta_branch="$(repo_branch ".")"
+
+    # Take mcrepo.yaml out of the pull before the dirty state is measured, so a
+    # meta-context whose ONLY change is the manifest counts as clean: the plan
+    # table stops threatening a stash it will not need, and Phase 3b stops
+    # asking about state the reconciler already settles on its own.
+    if [ "$pull_mode" = "reset" ]; then
+      _manifest_clear .
+    else
+      _manifest_capture . || true
+    fi
+
     meta_dirty="$(repo_dirty_state ".")"
     if git -C . rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
       meta_has_upstream=1
@@ -6293,7 +6449,90 @@ cmd_pull() {
     fi
   fi
 
-  # --- Phase 3: Plan display ---
+  # --- Phase 3: Decide what happens to uncommitted changes ---
+  #
+  # Dirty repos used to be stashed unconditionally, and a stash pop that then
+  # conflicted stopped the pull dead. On a machine that only consumes code the
+  # local changes are usually build output nobody wants to keep, so make it a
+  # choice — one of which is always "discard and take origin's state fresh".
+  # Same --dirty vocabulary and letters as 'mcrepo branch', with one deliberate
+  # difference: no answer + no TTY means 'carry', the historical behavior, so
+  # existing unattended pulls are unaffected.
+  local -a discarded_repos=()
+  if [ "$pull_mode" != "reset" ]; then
+    local -a q_names=() q_dirs=() q_idx=()
+    for i in "${!pull_dirs[@]}"; do
+      [ "${pull_dirty[$i]}" = "dirty" ] || continue
+      q_names+=("${pull_names[$i]}")
+      q_dirs+=("${pull_dirs[$i]}")
+      q_idx+=("$i")
+    done
+    if [ -n "$meta_dir" ] && [ "$meta_dirty" = "dirty" ]; then
+      q_names+=("(meta-context)")
+      q_dirs+=(".")
+      q_idx+=("-1")
+    fi
+
+    if [ "${#q_names[@]}" -gt 0 ]; then
+      local dirty_all="" qi d_name d_dir d_choice d_action
+      for qi in "${!q_names[@]}"; do
+        d_name="${q_names[$qi]}"
+        d_dir="${q_dirs[$qi]}"
+        if [ -n "$dirty_action_flag" ]; then
+          d_action="$dirty_action_flag"
+        elif [ -n "$dirty_all" ]; then
+          d_action="$dirty_all"
+        elif [ -t 0 ] && [ -t 1 ]; then
+          log ""
+          warn "$d_name has uncommitted changes:"
+          _dirty_files_preview "$d_dir"
+          printf '  [a] Abort        - stop the pull, change nothing\n' >&2
+          printf '  [r] Carry        - stash, pull, restore afterwards (current behavior)\n' >&2
+          printf '  [d] Discard      - throw them away and take origin'\''s state\n' >&2
+          printf '  [R] Carry   ALL  - and every remaining dirty repo\n' >&2
+          printf '  [D] Discard ALL  - and every remaining dirty repo\n' >&2
+          printf 'Choice [a/r/d/R/D]: ' >&2
+          IFS= read -r d_choice || d_choice=""
+          case "$d_choice" in
+            d) d_action="discard" ;;
+            D) d_action="discard"; dirty_all="discard" ;;
+            r) d_action="carry" ;;
+            R) d_action="carry"; dirty_all="carry" ;;
+            *) d_action="abort" ;;
+          esac
+        else
+          d_action="carry"
+        fi
+
+        case "$d_action" in
+          abort)
+            # Nothing has been modified yet — but the manifest is already parked
+            # from Phase 1, so put it back before leaving.
+            [ -n "$meta_dir" ] && _manifest_settle .
+            die "Aborted: '$d_name' has uncommitted changes. Commit them with 'mcrepo commit', or re-run with 'mcrepo pull --dirty carry' (stash and restore) or 'mcrepo pull --dirty discard' (throw them away)."
+            ;;
+          discard)
+            git -C "$d_dir" checkout -- . 2>/dev/null || true
+            git -C "$d_dir" clean -fd >/dev/null 2>&1 || true
+            discarded_repos+=("$d_name")
+            log "  Discarded uncommitted changes in $d_name."
+            # Now clean, so execution takes the no-stash path below.
+            if [ "${q_idx[$qi]}" -lt 0 ]; then
+              meta_dirty="$(repo_dirty_state ".")"
+            else
+              pull_dirty[${q_idx[$qi]}]="$(repo_dirty_state "$d_dir")"
+            fi
+            ;;
+        esac
+      done
+      [ "${#discarded_repos[@]}" -gt 0 ] && log ""
+    fi
+  fi
+
+  # --- Phase 3b: Plan display ---
+  # Printed AFTER the dirty decision so the table describes what will actually
+  # happen: a repo whose changes were just discarded shows as clean, not as a
+  # stash it no longer needs.
   log "=== Pull ==="
   for i in "${!pull_dirs[@]}"; do
     local action
@@ -6442,16 +6681,6 @@ cmd_pull() {
     meta_pull_parent="$(parent_map_get "$META_PARENT" "$meta_branch")"
     [ -n "$meta_pull_parent" ] || meta_pull_parent="$(detect_default_branch ".")"
 
-    # mcrepo.yaml is mcrepo's own coordination state, not user content: take it
-    # out of the pull here and merge it field by field afterwards, so it never
-    # enters the auto-stash and can never produce a textual conflict. With it
-    # gone the meta-context is often clean, dropping the stash round trip too.
-    if [ "$pull_mode" = "reset" ]; then
-      _manifest_clear .
-    elif _manifest_capture .; then
-      meta_dirty="$(repo_dirty_state ".")"
-    fi
-
     if ! git -C . fetch origin --prune 2>/dev/null; then
       warn "Fetch failed for (meta-context)"
       _hint_credential_helper "."
@@ -6482,9 +6711,9 @@ cmd_pull() {
       fi
       if run_with_repo_prefix "(meta-context)" _local_ff .; then
         if [ "$meta_stashed" -eq 1 ]; then
-          if ! git -C . stash pop --quiet 2>/dev/null; then
-            _mark_stash_applied "."
-            warn "Stash pop conflict in (meta-context). Resolve, 'git add', then re-run 'mcrepo pull'."
+          if ! git -C . stash pop --quiet 2>/dev/null && \
+             ! _settle_stash_pop_conflict "." "(meta-context)"; then
+            warn "  Stash preserved — resolve, 'git add', then re-run 'mcrepo pull'."
             stash_conflict_repos+=("(meta-context)")
             stash_conflict_entries+=("(meta-context)|.")
           else
@@ -6528,6 +6757,9 @@ cmd_pull() {
   fi
   if [ "${#fetch_only_repos[@]}" -gt 0 ]; then
     log "  Fetch only:       ${fetch_only_repos[*]}"
+  fi
+  if [ "${#discarded_repos[@]}" -gt 0 ]; then
+    log "  Discarded local:  ${discarded_repos[*]}"
   fi
   if [ "${#rebased_onto_origin[@]}" -gt 0 ]; then
     log "  Rebased onto origin: ${rebased_onto_origin[*]}"
@@ -6618,7 +6850,9 @@ cmd_pull() {
   fi
 
   if [ "${#stash_conflict_entries[@]}" -gt 0 ]; then
+    MCREPO_RECOVERY_CONTEXT="$(_stash_conflict_context "${stash_conflict_entries[@]}")"
     print_agent_recovery_prompt stash-conflict "${stash_conflict_entries[@]}"
+    MCREPO_RECOVERY_CONTEXT=""
   fi
 
   if [ "${#rebased_onto_origin[@]}" -gt 0 ] && [ "${#rebase_conflict_repos[@]}" -eq 0 ] && [ "${#stash_conflict_repos[@]}" -eq 0 ] && [ "${#failed_repos[@]}" -eq 0 ]; then
@@ -10919,7 +11153,9 @@ _rebase_run() {
         3)
           stash_conflict_repos+=("$repo_name")
           stash_conflict_entries+=("$repo_name|$repo_dir")
-          warn "  Stash pop conflicts. Have the files resolved and staged, then re-run 'mcrepo rebase' (it drops the already-applied stash)."
+          warn "  '$repo_name': restoring auto-stashed changes conflicted:"
+          _conflicted_files_typed "$repo_dir" | sed 's/^/      /' >&2
+          warn "  Have the files resolved and staged, then re-run 'mcrepo rebase' (it drops the already-applied stash)."
           continue
           ;;
       esac
@@ -10944,11 +11180,12 @@ _rebase_run() {
     # Pop stash
     if [ "$did_stash" -eq 1 ]; then
       if ! git -C "$repo_dir" stash pop --quiet; then
-        _mark_stash_applied "$repo_dir"
-        stash_conflict_repos+=("$repo_name")
-        stash_conflict_entries+=("$repo_name|$repo_dir")
-        warn "  Stash pop conflicts. Have the files resolved and staged, then re-run 'mcrepo rebase' (it drops the already-applied stash)."
-        continue
+        if ! _settle_stash_pop_conflict "$repo_dir" "$repo_name"; then
+          stash_conflict_repos+=("$repo_name")
+          stash_conflict_entries+=("$repo_name|$repo_dir")
+          warn "  Stash preserved — have the files resolved and staged, then re-run 'mcrepo rebase' (it drops the already-applied stash)."
+          continue
+        fi
       fi
     fi
 
@@ -11007,7 +11244,9 @@ $vline"
     print_agent_recovery_prompt rebase-conflict "${merge_conflict_entries[@]}"
   fi
   if [ "${#stash_conflict_entries[@]}" -gt 0 ]; then
+    MCREPO_RECOVERY_CONTEXT="$(_stash_conflict_context "${stash_conflict_entries[@]}")"
     print_agent_recovery_prompt stash-conflict "${stash_conflict_entries[@]}"
+    MCREPO_RECOVERY_CONTEXT=""
   fi
 
   REBASE_CONFLICTS=$(( ${#merge_conflict_repos[@]} + ${#stash_conflict_repos[@]} ))
